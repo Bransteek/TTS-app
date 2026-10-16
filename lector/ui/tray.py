@@ -8,6 +8,7 @@ decisiones pendientes salen como globo de la bandeja (único lugar que llama a
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -19,6 +20,7 @@ from lector.errors import LectorError
 from lector.services.reading_controller import SessionState
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.ui.main_window import MainWindow
+from lector.tts.engine_manager import EDGE_LABEL, PIPER_LABEL
 from lector.ui.open_flow import PLAYING_STATES
 
 log = logging.getLogger(__name__)
@@ -27,6 +29,11 @@ STILL_READING = "Sigo leyendo en la bandeja del sistema"
 CHOICE_PENDING = "Hay que elegir el capítulo siguiente. Abre la ventana para decidir."
 APP_NAME = "Lector"
 SHUTDOWN_TIMEOUT_S = 5.0
+WORKER_STOP_TIMEOUT_S = 2.0  # peor caso al salir: 5 s de cierre + 2 s aquí
+MAX_PENDING = 20
+BALLOON_REPEAT_S = 30.0
+
+_ENGINE_NAMES = {"edge": EDGE_LABEL, "piper": PIPER_LABEL}
 
 _LEVEL_ICONS = {
     "info": QSystemTrayIcon.MessageIcon.Information,
@@ -75,6 +82,7 @@ class TrayController(QObject):
         tray: Any = None,
         quit_app: Callable[[], None] | None = None,
         shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
+        clock: Callable[[], float] = time.monotonic,
     ):
         super().__init__(window)
         self._window = window
@@ -90,6 +98,8 @@ class TrayController(QObject):
         self._engine = ""
         self._told_still_reading = False
         self._quitting = False
+        self._clock = clock
+        self._last_balloon: dict[str, float] = {}
         self.pending_attention: list[tuple[str, object]] = []
 
         self.tray = tray if tray is not None else QSystemTrayIcon(self)
@@ -132,6 +142,9 @@ class TrayController(QObject):
         self.tray.setContextMenu(self.menu)
 
     def _run(self, coro) -> None:
+        if self._quitting:
+            coro.close()
+            return
         try:
             future = self._worker.submit(coro)
         except RuntimeError:
@@ -159,12 +172,9 @@ class TrayController(QObject):
         paused = self._state is SessionState.PAUSED
         self.toggle_action.setText("Reanudar" if paused else "Pausar")
         self.tray.setIcon(self._paused_icon if paused else self._icon)
-        if self._title or self._chapter:
-            tip = f"{self._title} — {self._chapter}"
-            if self._engine:
-                tip += f" · {self._engine}"
-        else:
-            tip = APP_NAME
+        where = " — ".join(part for part in (self._title, self._chapter) if part)
+        engine = _ENGINE_NAMES.get(self._engine, self._engine)
+        tip = " · ".join(part for part in (where, engine) if part) or APP_NAME
         self.tray.setToolTip(tip)
 
     @Slot(str)
@@ -197,6 +207,14 @@ class TrayController(QObject):
 
     def notify(self, level: str, message: str) -> None:
         """Globo de la bandeja. No toca la ventana ni abre diálogos."""
+        now = self._clock()
+        last = self._last_balloon.get(message)
+        if last is not None and now - last < BALLOON_REPEAT_S:
+            return  # el mismo globo salió hace poco: no se repite
+        self._last_balloon[message] = now
+        if len(self._last_balloon) > 4 * MAX_PENDING:
+            self._last_balloon = {m: t for m, t in self._last_balloon.items()
+                                  if now - t < BALLOON_REPEAT_S}
         icon = _LEVEL_ICONS.get(level, QSystemTrayIcon.MessageIcon.Information)
         self.tray.showMessage(APP_NAME, message, icon)
 
@@ -204,14 +222,21 @@ class TrayController(QObject):
     def _on_notice(self, level: str, message: str) -> None:
         if self._window.user_present():
             return  # ya lo muestra la ventana
-        self.pending_attention.append(("notice", (level, message)))
+        self._add_pending("notice", (level, message))
         self.notify(level, message)
+
+    def _add_pending(self, kind: str, payload: object) -> None:
+        entry = (kind, payload)
+        if self.pending_attention and self.pending_attention[-1] == entry:
+            return
+        self.pending_attention.append(entry)
+        del self.pending_attention[:-MAX_PENDING]
 
     @Slot(object)
     def _on_needs_choice(self, candidates) -> None:
         if self._window.user_present():
             return
-        self.pending_attention.append(("choice", list(candidates)))
+        self._add_pending("choice", list(candidates))
         self.notify("info", CHOICE_PENDING)
 
     @Slot()
@@ -261,7 +286,7 @@ class TrayController(QObject):
         self._window.allow_close()
         self._shutdown_controller()
         try:
-            self._worker.stop()
+            self._worker.stop(timeout=WORKER_STOP_TIMEOUT_S)
         except Exception:
             log.exception("No se pudo detener el trabajador al salir")
         self.tray.hide()
