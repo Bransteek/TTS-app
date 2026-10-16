@@ -241,3 +241,11 @@ def test_quarantine_moves_wal_and_shm(tmp_path):
     assert not path.exists()
     assert len(list(tmp_path.glob("lector.db.corrupt-*-wal"))) == 1
     assert len(list(tmp_path.glob("lector.db.corrupt-*-shm"))) == 1
+
+
+def test_chapter_title_lookup(conn):
+    ch = make_chapter()
+    repo = ChapterRepo(conn)
+    repo.save("doc1", ch, False)  # el título se guarda aunque no se guarde el texto
+    assert repo.title("doc1", ch.ref.locator) == "Uno"
+    assert repo.title("doc1", "otro") is None

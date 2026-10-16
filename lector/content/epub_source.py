@@ -255,6 +255,7 @@ class EpubSource(ContentSource):
             work_prefix=None,
             file_hash=file_hash,
             chapters=list(index),
+            adapter="epub",
         )
         return document, await self.load_chapter(index[0])
 

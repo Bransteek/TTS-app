@@ -173,3 +173,9 @@ async def test_all_spine_items_unreadable_is_damaged(make_epub):
                 dst.writestr(info.filename, src.read(info.filename))
     with pytest.raises(DamagedDocument):
         await EpubSource().open(str(out))
+
+
+async def test_open_reports_epub_adapter(make_epub):
+    path = make_epub(chapters=[("a.xhtml", para("Primero"))])
+    doc, _ = await EpubSource().open(str(path))
+    assert doc.adapter == "epub" and doc.index_page is False

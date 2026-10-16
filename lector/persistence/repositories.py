@@ -248,6 +248,13 @@ class ChapterRepo(_Repo):
             next_ref=ref_for(next_loc), prev_ref=ref_for(prev_loc),
         )
 
+    def title(self, doc_id: str, locator: str) -> str | None:
+        """Título guardado del capítulo (se guarda aunque no se guarde el texto)."""
+        row = self._run(lambda c: c.execute(
+            "SELECT title FROM chapters WHERE doc_id=? AND locator=?", (doc_id, locator)
+        ).fetchone())
+        return row[0] if row and row[0] else None
+
     def purge_text(self, doc_id: str) -> None:
         self._run(lambda c: c.execute(
             "UPDATE chapters SET text=NULL, paragraphs_json=NULL WHERE doc_id=?", (doc_id,)))

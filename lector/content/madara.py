@@ -57,7 +57,7 @@ class MadaraSource(ContentSource):
             tree = lxml.html.fromstring(result.text)
             chapter = self._parse(tree, result.url)
             title = self._breadcrumb_work_title(tree) or chapter.title
-            return self._document(locator, title, chapters), chapter
+            return self._document(locator, title, chapters, index_page=True), chapter
         html, url = await self._page(locator, prefetched_html)
         tree = lxml.html.fromstring(html)
         work_url = self._find_work_url(tree, url)
@@ -102,7 +102,9 @@ class MadaraSource(ContentSource):
         result = await self._fetcher.get(url)
         return result.text, result.url
 
-    def _document(self, work_url: str, title: str, chapters: list[ChapterRef]) -> Document:
+    def _document(
+        self, work_url: str, title: str, chapters: list[ChapterRef], index_page: bool = False
+    ) -> Document:
         return Document(
             doc_id=doc_id_for_url(work_url),
             kind=SourceKind.URL,
@@ -112,6 +114,8 @@ class MadaraSource(ContentSource):
             work_prefix=work_url,
             file_hash=None,
             chapters=chapters,
+            adapter="madara",
+            index_page=index_page,
         )
 
     @staticmethod

@@ -211,3 +211,20 @@ async def test_chosen_next_chapter_is_remembered(controller_rig, tmp_path):
 
     assert later.events.heard_at == [("Cap 1", 0), ("Cap 1", 1), ("Cap 3", 0)]
     assert later.events.choices == []  # no vuelve a preguntar
+
+
+async def test_deferred_open_from_history_applies_prefix_overrides(controller_rig, tmp_path):
+    """La corrección del prefijo también vale al reabrir la web desde el historial."""
+    db = tmp_path / "lector.db"
+    first = story_rig(controller_rig, db_path=db, prefetch_ahead=0)
+    await first.start(story_ref(1).locator)  # solo el capítulo 1 queda guardado
+    await first.stop()
+
+    later = story_rig(controller_rig, db_path=db, prefetch_ahead=0)
+    later.settings.set("work_prefix_overrides", {"novela.example": "/obra/"})
+    await later.play(STORY_ID, Position(2, story_ref(2).locator, 0, 0, 0, None))
+    await later.hear(1)  # el capítulo 2 no estaba guardado: se abrió la fuente real
+
+    assert later.network["opens"] == [
+        (story_ref(2).locator, {"prefix_overrides": {"novela.example": "/obra/"}}),
+    ]

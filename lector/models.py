@@ -60,6 +60,10 @@ class Document:
     work_prefix: str | None
     file_hash: str | None
     chapters: list[ChapterRef]
+    # Adaptador que lo abrió: "madara", "generic", "pdf" o "epub" (None si viene de la base de datos).
+    adapter: str | None = field(default=None, compare=False)
+    # True si se abrió desde la página de la obra (su índice) y no desde un capítulo.
+    index_page: bool = field(default=False, compare=False)
 
 
 def make_chunk_id(

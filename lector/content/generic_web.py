@@ -208,6 +208,7 @@ class GenericWebSource(ContentSource):
             work_prefix=work_url,
             file_hash=None,
             chapters=[],
+            adapter="generic",
         )
         return document, chapter
 

@@ -244,6 +244,7 @@ class PdfSource(ContentSource):
             work_prefix=None,
             file_hash=file_hash,
             chapters=list(self._index),
+            adapter="pdf",
         )
         return document, await self.load_chapter(self._index[0])
 

@@ -855,3 +855,28 @@ async def test_locate_page_finds_first_sentence_of_that_page(controller_rig, mak
     await rig.hear(1)
     assert rig.events.sentences[0][1] == first_on_2.text
     assert await asyncio.wait_for(rig.ctl.locate_page("otro-doc", 2), WAIT_S) is None
+
+
+async def test_open_applies_saved_prefix_override_for_the_host(controller_rig):
+    """§5.2: la corrección del prefijo se recuerda para ese host y se aplica al abrir."""
+    from tests.test_chapter_navigation import HOST, PAGE_URL, make_handler, page
+    from tests.test_chapter_navigation import resolver as generic_resolver
+
+    html = page('<a href="/novela/x/capitulo-6/">Siguiente</a>')
+    fetcher = SafeFetcher(resolver=generic_resolver,
+                          transport=httpx.MockTransport(make_handler({PAGE_URL: html})))
+    try:
+        rig = controller_rig(fetcher=fetcher)
+        doc, _, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
+        assert doc.work_prefix == HOST + "/novela/x/"
+        host = HOST.split("://", 1)[1]
+        rig.settings.set("work_prefix_overrides", {host: "/novela/z/"})
+
+        doc, chapter, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
+
+        assert doc.work_prefix == HOST + "/novela/z/"
+        assert doc.doc_id == doc_id_for_url(host + "/novela/z/")
+        assert chapter.next_ref is None  # el «siguiente» queda fuera del prefijo corregido
+        await rig.close()
+    finally:
+        await fetcher.aclose()

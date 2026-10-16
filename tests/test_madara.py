@@ -161,3 +161,12 @@ async def test_open_chapter_survives_ajax_failure():
     assert doc.chapters == []
     assert chapter.ref.index is None
     assert chapter.next_ref.locator.endswith("/capitulo-100/")
+
+
+async def test_open_reports_adapter_and_index_page(source):
+    """§4: abrir la página de la obra (índice) se distingue de abrir un capítulo."""
+    work_doc, _ = await source.open(WORK)
+    chapter_doc, _ = await source.open(WORK + "capitulo-99/")
+    assert work_doc.adapter == chapter_doc.adapter == "madara"
+    assert work_doc.index_page is True
+    assert chapter_doc.index_page is False

@@ -70,9 +70,14 @@ def story_document(chapters: dict[str, Chapter]) -> Document:
 
 
 def fake_opener(source: FakeSource, document: Document, network: dict | None = None):
-    """Abre la fuente en memoria; con `network["online"]` a False falla como sin red."""
+    """Abre la fuente en memoria; con `network["online"]` a False falla como sin red.
 
-    async def opener(locator: str, fetcher):
+    Anota cada apertura en `network["opens"]` como (locator, argumentos con nombre).
+    """
+
+    async def opener(locator: str, fetcher, **kwargs):
+        if network is not None:
+            network.setdefault("opens", []).append((locator, kwargs))
         if network is not None and not network["online"]:
             raise PageUnreachable()
         return source, document, source.chapters[locator]

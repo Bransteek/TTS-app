@@ -152,3 +152,9 @@ async def test_doc_id_and_hash(make_pdf):
     assert file_doc_id(path) == (digest[:16], digest)
     doc, _ = await PdfSource().open(str(path))
     assert (doc.doc_id, doc.file_hash) == (digest[:16], digest)
+
+
+async def test_open_reports_pdf_adapter(make_pdf):
+    path = make_pdf(pages=[[(prose("Uno"), BODY)]])
+    doc, _ = await PdfSource().open(str(path))
+    assert doc.adapter == "pdf" and doc.index_page is False

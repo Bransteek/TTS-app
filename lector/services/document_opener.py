@@ -23,7 +23,8 @@ from lector.persistence.repositories import ChapterRepo, DocumentRepo
 
 log = logging.getLogger(__name__)
 
-SourceOpener = Callable[[str, Any], Awaitable[tuple[ContentSource, Document, Chapter]]]
+# Se llama como `opener(locator, fetcher)` o con `prefix_overrides={host: "/ruta/"}`.
+SourceOpener = Callable[..., Awaitable[tuple[ContentSource, Document, Chapter]]]
 
 
 def store_opened(
@@ -101,3 +102,4 @@ class DeferredSource:
         doc.work_prefix = opened.work_prefix or doc.work_prefix
         if opened.chapters:
             doc.chapters = list(opened.chapters)
+        doc.adapter = opened.adapter or doc.adapter

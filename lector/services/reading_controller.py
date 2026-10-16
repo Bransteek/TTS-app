@@ -307,7 +307,7 @@ class ReadingController:
     async def open(self, locator: str) -> tuple[Document, Chapter, ProgressRecord | None]:
         """Vista previa: abre la fuente y guarda el documento, pero no reproduce."""
         settings = await self._ensure_settings()
-        source, doc, chapter = await self._deps.source_opener(locator, self._deps.fetcher)
+        source, doc, chapter = await self._open_source(locator)
         await asyncio.to_thread(
             store_opened, self._repos.documents, self._repos.chapters, doc, chapter,
             settings.store_text,
@@ -1018,10 +1018,12 @@ class ReadingController:
                 raise LectorError(UNKNOWN_DOCUMENT)
             if doc.kind is SourceKind.URL:
                 # Sin red: el texto guardado basta y la fuente real se abre al necesitarla.
-                source = DeferredSource(self._deps.source_opener, self._deps.fetcher, doc)
+                source = DeferredSource(
+                    lambda locator, _fetcher: self._open_source(locator), self._deps.fetcher, doc
+                )
             else:
                 await check_file(doc)
-                source, opened, first = await self._deps.source_opener(doc.origin, self._deps.fetcher)
+                source, opened, first = await self._open_source(doc.origin)
                 if opened.doc_id != doc_id:
                     log.warning("La fuente devolvió otro id (%s); se conserva %s", opened.doc_id, doc_id)
                 doc = replace(opened, doc_id=doc_id)
@@ -1034,6 +1036,17 @@ class ReadingController:
         self._preview = None
         self._session = _Session(doc, source, nav, first)
         return self._session
+
+    async def _open_source(self, locator: str):
+        """Abre la fuente aplicando el prefijo de obra que el usuario corrigió para ese host."""
+        try:
+            overrides = await asyncio.to_thread(self._deps.settings.get, "work_prefix_overrides")
+        except Exception:
+            log.warning("No se pudieron leer los prefijos corregidos", exc_info=True)
+            overrides = None
+        return await self._deps.source_opener(
+            locator, self._deps.fetcher, prefix_overrides=overrides or {}
+        )
 
     def _make_navigator(self, source: ContentSource, doc: Document) -> ChapterNavigator:
         if self._deps.navigator_factory is not None:

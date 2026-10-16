@@ -86,3 +86,14 @@ async def test_missing_file_message(name, tmp_path):
     with pytest.raises(LectorError) as info:
         await open_source(str(tmp_path / name), FakeFetcher(PLAIN))
     assert info.value.user_message == "No se encontró el archivo. Comprueba que sigue en su sitio."
+
+
+async def test_generic_source_gets_prefix_override_for_its_host(stub_adapters):
+    overrides = {"example.com": "/obras/x/", "otra.example": "/no/"}
+    source, _, _ = await open_source(
+        "https://Example.com/c/1", FakeFetcher(PLAIN), prefix_overrides=overrides
+    )
+    assert isinstance(source, GenericWebSource)
+    assert source._override == "/obras/x/"
+    source, _, _ = await open_source("https://example.com/c/1", FakeFetcher(PLAIN))
+    assert source._override is None

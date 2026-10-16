@@ -270,3 +270,13 @@ async def test_load_chapter_and_empty_index():
         await fetcher.aclose()
     assert loaded.ref.locator == nxt
     assert loaded.next_ref is None
+
+
+async def test_open_reports_generic_adapter():
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
+    try:
+        doc, _ = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert doc.adapter == "generic"
+    assert doc.index_page is False
