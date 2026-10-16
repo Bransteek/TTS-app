@@ -1,6 +1,7 @@
 """Apertura de la base SQLite, esquema y recuperación ante corrupción."""
 from __future__ import annotations
 
+import errno
 import sqlite3
 import threading
 import time
@@ -63,7 +64,7 @@ def _connect(path: Path) -> LectorConnection:
         conn.executescript(SCHEMA)
         row = conn.execute("PRAGMA quick_check").fetchone()
         if not row or row[0] != "ok":
-            raise sqlite3.DatabaseError("quick_check failed")
+            raise _QuickCheckFailed("quick_check failed")
     except BaseException:
         conn.close()
         raise
@@ -84,6 +85,20 @@ def _quarantine(path: Path) -> None:
             side.rename(target.with_name(target.name + suffix))
 
 
+_CORRUPTION_MARKERS = ("file is not a database", "malformed")
+
+
+class _QuickCheckFailed(sqlite3.DatabaseError):
+    pass
+
+
+def _is_corruption(exc: sqlite3.Error) -> bool:
+    if isinstance(exc, _QuickCheckFailed):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _CORRUPTION_MARKERS)
+
+
 def open_database(path: Path) -> LectorConnection:
     path = Path(path)
     try:
@@ -92,7 +107,17 @@ def open_database(path: Path) -> LectorConnection:
         mapped = map_operational_error(exc)
         if mapped is not None:
             raise mapped from exc
+        if not _is_corruption(exc):
+            # Error ajeno a la integridad (solo lectura, E/S...): no se toca el archivo.
+            raise DatabaseCorrupt(
+                "No se pudo abrir la base de datos guardada. Revisa los permisos y el espacio en disco.",
+                recoverable=False,
+            ) from exc
         first = exc
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise ResourceExhausted() from exc
+        raise
     try:
         _quarantine(path)
         conn = _connect(path)

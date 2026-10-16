@@ -112,6 +112,8 @@ def test_settings_defaults(conn):
     assert s.get("edge_retries") == 3
     assert s.get("preferred_engine") == "edge" and s.get("first_run_done") is False
     assert s.get("work_prefix_overrides") == {}
+    assert s.get("piper_voice") == "es_ES-sharvard-medium" and s.get("piper_speaker") == "F"
+    assert s.get("language") == "es-MX"
     s.set("speed", 1.5)
     s.set("work_prefix_overrides", {"a": "b"})
     assert s.get("speed") == 1.5 and s.get("work_prefix_overrides") == {"a": "b"}
@@ -168,3 +170,74 @@ def test_locked_retries_then_raises(monkeypatch):
     with pytest.raises(DatabaseLocked):
         SettingsRepo(fake).set("speed", 2.0)
     assert sleeps == [0.2, 0.4, 0.8] and fake.calls == 4
+
+
+def test_progress_roundtrip_page_none(conn):
+    DocumentRepo(conn).upsert(make_doc(), None, None, None)
+    rec = make_record(position=Position(0, "https://x/1", 0, 0, 0, None))
+    ProgressRepo(conn).save(rec)
+    assert ProgressRepo(conn).get("doc1") == rec
+
+
+def test_unopenable_db_is_not_quarantined(tmp_path):
+    from lector.errors import DatabaseCorrupt
+    path = tmp_path / "missing_dir" / "lector.db"
+    with pytest.raises(DatabaseCorrupt) as ei:
+        open_database(path)
+    assert ei.value.recoverable is False
+    assert not list(tmp_path.rglob("*corrupt*"))
+
+
+def test_readonly_db_is_not_quarantined(tmp_path):
+    import os
+    path = tmp_path / "lector.db"
+    c = open_database(path)
+    DocumentRepo(c).upsert(make_doc(), None, None, None)
+    c.close()
+    for f in tmp_path.iterdir():
+        os.chmod(f, 0o444)
+    os.chmod(tmp_path, 0o555)
+    try:
+        try:
+            c2 = open_database(path)
+            c2.close()
+        except Exception:
+            pass
+        assert not list(tmp_path.glob("*corrupt*"))
+        assert path.exists()
+    finally:
+        os.chmod(tmp_path, 0o755)
+
+
+def test_malformed_db_with_valid_header_is_quarantined(tmp_path):
+    path = tmp_path / "lector.db"
+    c = open_database(path)
+    for i in range(300):
+        DocumentRepo(c).upsert(
+            Document(f"d{i}", SourceKind.URL, "o" * 200, "t" * 200, None, None, None, []),
+            None, None, None)
+    c.close()
+    data = bytearray(path.read_bytes())
+    assert len(data) > 8192
+    data[4096:] = b"\xff" * (len(data) - 4096)
+    path.write_bytes(bytes(data))
+    (tmp_path / "lector.db-wal").write_bytes(b"")
+    (tmp_path / "lector.db-shm").write_bytes(b"")
+    c2 = open_database(path)
+    try:
+        assert c2.recovered_from_corruption is True
+        assert list(tmp_path.glob("lector.db.corrupt-*"))
+        assert c2.execute("SELECT count(*) FROM documents").fetchone()[0] == 0
+    finally:
+        c2.close()
+
+
+def test_quarantine_moves_wal_and_shm(tmp_path):
+    from lector.persistence.database import _quarantine
+    path = tmp_path / "lector.db"
+    for suffix in ("", "-wal", "-shm"):
+        (tmp_path / f"lector.db{suffix}").write_bytes(b"x")
+    _quarantine(path)
+    assert not path.exists()
+    assert len(list(tmp_path.glob("lector.db.corrupt-*-wal"))) == 1
+    assert len(list(tmp_path.glob("lector.db.corrupt-*-shm"))) == 1
