@@ -1,10 +1,13 @@
 """Dobles de prueba compartidos (otras tareas añaden más aquí)."""
 from __future__ import annotations
 
+import asyncio
 import types
 from collections.abc import Callable
 
 import numpy as np
+
+from lector.tts.base import AudioClip
 
 # Valor de relleno del búfer antes de llamar al callback: si el reproductor
 # deja alguna muestra sin escribir, la prueba lo ve en lugar de ver ceros.
@@ -124,3 +127,91 @@ class FakePiperVoice:
         self.calls.append((text, syn_config))
         n = 0 if text in self.silent else len(text) * self.per_char
         yield FakeAudioChunk(np.full(n, 1000, dtype=np.int16), self.sample_rate)
+
+
+class FakeClock:
+    """Reloj falso: `sleep` no espera de verdad, avanza el tiempo y anota la duración.
+
+    Cede una vez el bucle de eventos (`asyncio.sleep(0)`) para que las tareas se
+    puedan cancelar mientras "esperan".
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.t = start
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.t += seconds
+        await asyncio.sleep(0)
+
+
+class _FakeEngine:
+    """Motor TTS falso.
+
+    Cada `synthesize` toma el siguiente resultado de `errors` (una excepción o
+    `None` para éxito); cuando la cola se vacía usa `error` (None = éxito).
+    `health_check` devuelve `healthy` o, si es None, `error is None`.
+    Registra `calls` como (chunk_id, voz, velocidad, instante) y `probes` como
+    (voz, instante), con el instante de `clock` si se da.
+    """
+
+    name = ""
+
+    def __init__(
+        self,
+        *,
+        error: type[BaseException] | BaseException | None = None,
+        errors: list | tuple = (),
+        healthy: bool | None = None,
+        clock: FakeClock | None = None,
+    ):
+        self.error = error
+        self.errors = list(errors)
+        self.healthy = healthy
+        self.clock = clock
+        self.calls: list[tuple[str, str, float, float | None]] = []
+        self.probes: list[tuple[str, float | None]] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    def _now(self) -> float | None:
+        return self.clock.now() if self.clock else None
+
+    async def synthesize(self, chunk, voice: str, speed: float) -> AudioClip:
+        self.calls.append((chunk.chunk_id, voice, speed, self._now()))
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+            outcome = self.errors.pop(0) if self.errors else self.error
+            if outcome is not None:
+                raise outcome
+            return AudioClip(
+                pcm=np.full(240, 1000, dtype=np.int16),
+                marks=[(0, chunk.sentences[0].index)],
+            )
+        finally:
+            self.in_flight -= 1
+
+    async def health_check(self, voice: str) -> bool:
+        self.probes.append((voice, self._now()))
+        await asyncio.sleep(0)
+        return self.error is None if self.healthy is None else self.healthy
+
+    async def list_voices(self) -> list[dict]:
+        return []
+
+
+class FakeEdge(_FakeEngine):
+    name = "edge"
+
+
+class FakePiper(_FakeEngine):
+    name = "piper"
