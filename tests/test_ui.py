@@ -12,11 +12,11 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
 from lector.content.base import doc_id_for_url
-from lector.errors import FileMovedOrChanged, PageUnreachable
+from lector.errors import DatabaseLocked, FileMovedOrChanged, PageUnreachable
 from lector.models import Chapter, ChapterRef, Document, Paragraph, Position, Sentence, SourceKind
 from lector.persistence.database import open_database
 from lector.persistence.repositories import (
@@ -1478,8 +1478,6 @@ def test_pause_allowed_while_play_is_pending(qtbot, make_window, ctl):
 def test_window_losing_activation_to_another_app_auto_confirms(qtbot, make_window, ctl,
                                                                monkeypatch):
     """Sin aviso de la app (p. ej. algunas plataformas): basta con que la ventana pierda el foco."""
-    from PySide6.QtCore import QEvent
-
     ctl.open_result = (generic_doc(), make_chapter(), None)
     window = make_window(show=True)
     read(qtbot, window)
@@ -1490,3 +1488,209 @@ def test_window_losing_activation_to_another_app_auto_confirms(qtbot, make_windo
 
     wait_call(qtbot, ctl, "play", "doc-g", None)
     assert window.notice_label.text() == STARTED_TEXT
+
+
+# --- Fix round 3: diálogos nativos propios, borrado y capítulo elegido ---------------------------
+
+
+def spin(ms: int) -> None:
+    """Deja correr el bucle de eventos (como hace un diálogo nativo mientras está abierto)."""
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+def native_file_dialog(window, monkeypatch, *, comes_back: bool = True, browse_ms: int = 800):
+    """«Abrir PDF/EPUB…» nativo: Qt no ve ninguna ventana activa mientras está abierto."""
+    from lector.ui import main_window as mw
+
+    app = QApplication.instance()
+
+    def browse(away) -> None:
+        away.setattr(window, "isActiveWindow", lambda: False)
+        away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+        app.applicationStateChanged.emit(Qt.ApplicationState.ApplicationInactive)
+        spin(browse_ms)  # el usuario busca el archivo
+
+    def dialog(*_args, **_kwargs):
+        if comes_back:
+            with monkeypatch.context() as away:
+                browse(away)
+            app.applicationStateChanged.emit(Qt.ApplicationState.ApplicationActive)
+        else:
+            browse(monkeypatch)  # sigue fuera (se deshace al acabar la prueba)
+        return "", ""  # cancelado
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(dialog))
+
+
+def test_native_file_dialog_is_not_leaving_while_confirmation_pending(qtbot, make_window, ctl,
+                                                                       monkeypatch):
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    native_file_dialog(window, monkeypatch, browse_ms=1500)
+
+    window.open_file_button.click()
+    qtbot.wait(500)
+
+    assert [c[0] for c in ctl.calls] == ["open"]
+    assert window.preview.needs_confirmation()
+    assert window.notice_label.text() != STARTED_TEXT
+
+
+def test_native_file_dialog_keeps_the_resume_dialog(qtbot, make_window, ctl, monkeypatch):
+    doc = make_doc()
+    ctl.open_result = (doc, make_chapter(), make_progress(doc))
+    window = make_window(show=True)
+    read(qtbot, window)
+    dialog = wait_dialog(qtbot, window)
+    native_file_dialog(window, monkeypatch)
+
+    window.open_file_button.click()
+    qtbot.wait(500)
+
+    assert [c[0] for c in ctl.calls] == ["open"]
+    assert dialog.isVisible()
+
+
+def test_still_away_after_the_native_dialog_closes_is_leaving(qtbot, make_window, ctl, monkeypatch):
+    """Al cerrarse el diálogo se mira el estado real: si el usuario sigue fuera, se fue."""
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    native_file_dialog(window, monkeypatch, comes_back=False, browse_ms=100)
+
+    window.open_file_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-g", None)
+    assert window.notice_label.text() == STARTED_TEXT
+
+
+def test_own_native_dialog_suppression_nests(qtbot, make_window, ctl, monkeypatch):
+    """T17 y T18 envuelven sus diálogos nativos con el mismo gestor (puede anidarse)."""
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+
+    with window.own_native_dialog():
+        with window.own_native_dialog():
+            pass
+        with monkeypatch.context() as away:
+            away.setattr(window, "isActiveWindow", lambda: False)
+            away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+            QApplication.instance().applicationStateChanged.emit(
+                Qt.ApplicationState.ApplicationInactive
+            )
+            spin(500)
+            window.hide()  # tampoco cuenta mientras el diálogo propio está abierto
+            assert window.preview.needs_confirmation()
+            window.show()
+
+    qtbot.wait(200)
+    assert [c[0] for c in ctl.calls] == ["open"]
+    assert window.notice_label.text() != STARTED_TEXT
+
+
+def test_failed_delete_of_wrong_document_does_not_block_reading(qtbot, make_window, ctl, conn,
+                                                               caplog):
+    class LockedDocs(DocumentRepo):
+        def delete_if_unread(self, doc_id):
+            raise DatabaseLocked()
+
+    corrected = generic_doc("doc-corregido", "https://example.com/")
+    ctl.open_result = [(generic_doc(), make_chapter(), None), (corrected, make_chapter(), None)]
+    window = make_window(show=True)
+    window._documents = LockedDocs(conn)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    with caplog.at_level(logging.WARNING, logger="lector.ui.main_window"):
+        window.preview.prefix_edit.setText("https://example.com/")
+        window.read_button.click()
+        wait_call(qtbot, ctl, "play", "doc-corregido", None)
+
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": ["/"]}
+    assert window.notice_label.isHidden()
+    assert any("doc-g" in r.getMessage() for r in caplog.records)
+
+
+def pick_third_chapter_then_fail(qtbot, window, ctl) -> Position:
+    read(qtbot, window, "https://example.com/novela/")
+    qtbot.waitUntil(lambda: window.preview.chapter_list.isVisible(), timeout=WAIT_MS)
+    window.preview.chapter_list.setCurrentRow(2)
+    window.read_button.click()
+    _, _, start = wait_call(qtbot, ctl, "play")
+    assert start == Position(2, URL3, 0, 0, 0, None)
+    window.test_bridge.session_state_sig.emit("error")  # falló antes de cargar el capítulo
+    ctl.calls.clear()
+    return start
+
+
+@pytest.mark.parametrize("retry", ["leer", "play_pause"])
+def test_chosen_chapter_kept_when_reading_fails_before_loading(qtbot, make_window, ctl, retry):
+    ctl.open_result = (make_doc(index_page=True), make_chapter(), None)
+    window = make_window(show=True)
+    start = pick_third_chapter_then_fail(qtbot, window, ctl)
+
+    button = window.read_button if retry == "leer" else window.controls.play_pause_button
+    button.click()
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", start)
+
+
+def test_chosen_chapter_dropped_once_reading_loads_it(qtbot, make_window, ctl):
+    doc = make_doc(index_page=True)
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+    pick_third_chapter_then_fail(qtbot, window, ctl)
+    window.read_button.click()
+    wait_call(qtbot, ctl, "play")
+    window.test_bridge.document_sig.emit(doc, make_chapter(URL3, "Capítulo 3"))  # ya cargó
+    window.test_bridge.session_state_sig.emit("reading")
+    window.test_bridge.session_state_sig.emit("stopped")
+    ctl.calls.clear()
+
+    window.read_button.click()
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)  # sigue donde iba
+
+
+def test_reopening_the_work_lets_the_user_pick_again(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(index_page=True), make_chapter(), None)
+    window = make_window(show=True)
+    pick_third_chapter_then_fail(qtbot, window, ctl)
+
+    read(qtbot, window, "https://example.com/novela")  # la vuelve a escribir: se abre de nuevo
+    qtbot.waitUntil(lambda: window.preview.chapter_list.isVisible(), timeout=WAIT_MS)
+    window.preview.chapter_list.setCurrentRow(1)
+    window.read_button.click()
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", Position(1, URL2, 0, 0, 0, None))
+
+
+def test_continue_after_reopening_ignores_the_old_chosen_chapter(qtbot, make_window, ctl):
+    doc = make_doc(index_page=True)
+    ctl.open_result = [(doc, make_chapter(), None), (doc, make_chapter(), make_progress(doc))]
+    window = make_window(show=True)
+    pick_third_chapter_then_fail(qtbot, window, ctl)
+
+    read(qtbot, window, "https://example.com/novela")  # ahora la obra tiene progreso
+    wait_dialog(qtbot, window).continue_button.click()
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)  # continúa lo guardado
+
+
+def test_history_pick_ignores_the_old_chosen_chapter(qtbot, make_window, ctl):
+    doc = make_doc(index_page=True)
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+    pick_third_chapter_then_fail(qtbot, window, ctl)
+
+    window._open_from_history(doc, None, None)
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)

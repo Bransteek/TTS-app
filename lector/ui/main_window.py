@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -151,6 +152,9 @@ class MainWindow(QMainWindow):
         self._open_gen = 0  # cada apertura nueva deja caducas las respuestas de las anteriores
         self._play_pending = False  # un play() en vuelo: no se manda otro
         self._confirm_after_leer = False  # «Leer» pidió leer y la vista previa espera confirmar
+        # Posición elegida (capítulo, «empezar», …) que aún no cargó: un reintento vuelve a ella.
+        self._pending_start: tuple[str, Position] | None = None
+        self._own_dialogs = 0  # diálogos nativos propios abiertos (no cuentan como irse)
         self._preferred = "edge"
         self._engine_seen = False
         self._highlight = True
@@ -413,9 +417,11 @@ class MainWindow(QMainWindow):
                 return
             if self._state is SessionState.PAUSED:
                 self._run(self._ctl.resume())
-            else:
+                return
+            if not self.preview.needs_confirmation():
                 self._play(doc.doc_id, None)
-            return
+                return
+            # Se volvió a abrir y la vista previa espera confirmar: vale lo que se elija ahora.
         edited = self.preview.edited_prefix()
         if edited is not None:
             self._reopen_with_prefix(preview, edited)
@@ -424,9 +430,10 @@ class MainWindow(QMainWindow):
         self._play(doc.doc_id, _chapter_start(*picked) if picked else None)
 
     def _on_open_file_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Abrir PDF o EPUB", "", "Libros PDF o EPUB (*.pdf *.epub)"
-        )
+        with self.own_native_dialog():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Abrir PDF o EPUB", "", "Libros PDF o EPUB (*.pdf *.epub)"
+            )
         if path:
             self.url_edit.setText(path)
             self._open(path, autoplay=False)
@@ -457,7 +464,12 @@ class MainWindow(QMainWindow):
             result = await ctl.open(locator)
             if result[0].doc_id != doc.doc_id:
                 # El documento del prefijo equivocado no queda en el historial si no se leyó.
-                await asyncio.to_thread(documents.delete_if_unread, doc.doc_id)
+                # Es limpieza: si falla, se avisa en el registro y se lee igual.
+                try:
+                    await asyncio.to_thread(documents.delete_if_unread, doc.doc_id)
+                except Exception:
+                    log.warning("No se pudo borrar el documento sin leer %s", doc.doc_id,
+                                exc_info=True)
             return result
 
         self._start_open(locator, save_and_open(), autoplay=True, confirmed=True)
@@ -467,6 +479,7 @@ class MainWindow(QMainWindow):
         self._clear_choice()
         self._resume.cancel()
         self._confirm_after_leer = False
+        self._pending_start = None
         self._open_gen += 1
         gen = self._open_gen
         self._set_opening(True)
@@ -513,6 +526,11 @@ class MainWindow(QMainWindow):
             self.statusBar().clearMessage()
 
     def _play(self, doc_id: str, start: Position | None) -> None:
+        """Lee `doc_id` desde `start`; sin `start`, desde la posición elegida que no llegó a cargar."""
+        if start is not None:
+            self._pending_start = (doc_id, start)
+        elif self._pending_start is not None and self._pending_start[0] == doc_id:
+            start = self._pending_start[1]
         self._play_job(doc_id, self._ctl.play(doc_id, start))
 
     def _play_job(self, doc_id: str, job: Coroutine) -> None:
@@ -577,7 +595,7 @@ class MainWindow(QMainWindow):
 
     def _user_left(self, hidden: bool) -> None:
         """El usuario se fue al juego: oculta o minimizada (`hidden`) o la app sin foco."""
-        if self._quitting:
+        if self._quitting or self._own_dialogs:
             return
         self._auto_confirm()
         if hidden:
@@ -595,8 +613,30 @@ class MainWindow(QMainWindow):
             self._leave_timer.start()
 
     def _check_user_left(self) -> None:
+        if self._own_dialogs:
+            return
         if self.isVisible() and not self.user_present():
             self._user_left(hidden=self.isMinimized())
+
+    @contextmanager
+    def own_native_dialog(self) -> Iterator[None]:
+        """Envuelve un diálogo nativo de la app (p. ej. `QFileDialog.getOpenFileName`).
+
+        Mientras está abierto, Qt no ve ninguna ventana activa y la app queda inactiva:
+        eso no es irse al juego. Al cerrarse se mira solo el estado real (si el usuario
+        sigue fuera, la comprobación diferida lo detecta). Puede anidarse; T17 y T18
+        deben usarlo con sus propios diálogos nativos.
+        """
+        self._own_dialogs += 1
+        self._leave_timer.stop()
+        try:
+            yield
+        finally:
+            self._own_dialogs -= 1
+            if not self._own_dialogs:
+                self._leave_timer.stop()
+                if self.isVisible() and not self.user_present():
+                    self._leave_timer.start()
 
     def offer_resume(self, doc: Document, progress: ProgressRecord, *,
                      chapter_title: str | None = None,
@@ -659,6 +699,7 @@ class MainWindow(QMainWindow):
         self._clear_choice()
         self._resume.cancel()
         self._confirm_after_leer = False
+        self._pending_start = None
         self._open_gen += 1  # lo que se estuviera abriendo ya no vale: manda el historial
         self._set_opening(False)
         self.url_edit.setText(doc.origin)
@@ -710,6 +751,7 @@ class MainWindow(QMainWindow):
     def _on_document(self, doc, chapter) -> None:
         self._session_doc = doc.doc_id
         self._session_chapter = chapter.ref.locator
+        self._pending_start = None  # la lectura ya tiene posición: la guarda el controlador
         if self._choice_tag is not None and self._choice_tag != (doc.doc_id, chapter.ref.locator):
             self._clear_choice()  # los candidatos eran de otro documento o capítulo
         self.doc_title_label.setText(doc.title)
