@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 class QueuedClip:
     chunk: Chunk
     pcm: np.ndarray  # int16 mono a OUTPUT_RATE
-    marks: list[tuple[int, int]]  # (muestra_inicial, sentence_index), crecientes, marks[0][0] == 0
+    marks: list[tuple[int, int]]  # (muestra_inicial, sentence_index): 0, estrictamente crecientes, < len(pcm)
     engine: str
 
     def __post_init__(self) -> None:
@@ -40,8 +40,10 @@ class QueuedClip:
             raise ValueError("pcm must be a 1-D int16 array")
         if not self.marks or self.marks[0][0] != 0:
             raise ValueError("marks must start at sample 0")
-        if any(b[0] < a[0] for a, b in zip(self.marks, self.marks[1:])):
-            raise ValueError("marks must be in increasing sample order")
+        if any(b[0] <= a[0] for a, b in zip(self.marks, self.marks[1:])):
+            raise ValueError("mark offsets must be strictly increasing")
+        if self.marks[-1][0] >= len(self.pcm):
+            raise ValueError("every mark must fall inside pcm")
 
 
 class PlayerEvents(Protocol):
@@ -139,6 +141,17 @@ class SoundDeviceOutput:
 
 
 class AudioPlayer:
+    """Reproductor con cola limitada.
+
+    Ciclo de vida de la salida:
+    - El primer `enqueue` arranca la salida (un solo intento).
+    - Si la salida falla, se para y se avisa una vez con `on_output_error`. La cola se
+      conserva y **solo** `resume()` (lo llama el controlador) vuelve a arrancarla.
+    - `close()` es definitivo: para la salida, descarta el audio y desde entonces
+      `enqueue` lanza `AudioOutputError(recoverable=False)` (también a quien estaba
+      esperando) y `resume()` no hace nada.
+    """
+
     def __init__(
         self,
         output: AudioOutput,
@@ -159,55 +172,86 @@ class AudioPlayer:
         self._current: QueuedClip | None = None
         self._pos = 0  # siguiente muestra de _current que se copiará
         self._next_mark = 0  # índice en _current.marks de la próxima marca por cruzar
-        self._sentence = 0  # sentence_index de la última marca cruzada
+        self._sentence = 0  # frase de _current que suena (o la primera, si aún no empezó)
         self._pending_samples = 0  # muestras de _current + _queue (clips completos)
         self._paused = False
-        self._generation = 0  # cambia en clear()/close(): invalida eventos sin entregar
+        self._generation = 0  # cambia en clear()/close(): invalida eventos y enqueues previos
 
         # Solo en el bucle asyncio.
         self._cond: asyncio.Condition | None = None
         self._waiters = 0
         self._notify_tasks: set[asyncio.Task] = set()
+        self._closed = False
         self._output_running = False
+        self._start_attempted = False
+        self._output_gen = 0  # cambia en cada arranque, fallo atendido o close()
 
     # --- API del bucle -------------------------------------------------------------
 
-    async def enqueue(self, clip: QueuedClip) -> None:
+    async def enqueue(self, clip: QueuedClip) -> bool:
         """Encola el clip; espera si ya hay `max_ahead` clips además del que suena,
-        o si con este se superarían `max_seconds` (salvo que no haya nada pendiente)."""
+        o si con este se superarían `max_seconds` (salvo que no haya nada pendiente).
+
+        Devuelve `False` (sin encolar) si un `clear()` ocurrió mientras esperaba: el
+        clip pertenece a una posición ya descartada. Lanza `AudioOutputError` con
+        `recoverable=False` si el reproductor está cerrado o se cierra mientras espera.
+        """
+        if self._closed:
+            raise AudioOutputError(recoverable=False)
         if self._cond is None:
             self._cond = asyncio.Condition()
+        generation = self._generation
+        samples = len(clip.pcm)
         async with self._cond:
             self._waiters += 1
             try:
-                await self._cond.wait_for(lambda: self._has_room(len(clip.pcm)))
+                await self._cond.wait_for(
+                    lambda: self._closed
+                    or self._generation != generation
+                    or self._has_room(samples)
+                )
             finally:
                 self._waiters -= 1
+            if self._closed:
+                raise AudioOutputError(recoverable=False)
+            if self._generation != generation:
+                return False
             with self._lock:
                 self._queue.append(clip)
-                self._pending_samples += len(clip.pcm)
-        self._ensure_output()
+                self._pending_samples += samples
+                self._promote_locked()
+        if not self._start_attempted:
+            self._start_output()
+        return True
 
     def pause(self) -> None:
         with self._lock:
             self._paused = True
 
     def resume(self) -> None:
+        """Reanuda y, si la salida estaba parada por un fallo, la vuelve a arrancar."""
         with self._lock:
             self._paused = False
-        self._ensure_output()
+        self._start_output()
 
     def clear(self) -> Chunk | None:
         """Vacía la cola y el clip actual; devuelve el `Chunk` que sonaba.
 
-        Los eventos de los clips descartados que aún no se hayan entregado se descartan.
+        Los eventos de los clips descartados que aún no se hayan entregado se descartan,
+        y los `enqueue` que estaban esperando devuelven `False` sin encolar.
         """
-        with self._lock:
-            chunk = self._drop_all()
+        chunk, dropped = self._drop_all()
+        del dropped  # los arrays se liberan aquí, fuera del candado
         self._post(self._wake_waiters)
         return chunk
 
     def current(self) -> tuple[Chunk, int] | None:
+        """`(chunk, sentence_index)` de lo que el callback está entregando a la salida.
+
+        Puede ir por delante de lo que realmente se oye como mucho un bloque
+        (`blocksize`) más la latencia de la salida. Solo es `None` si no hay audio
+        pendiente.
+        """
         with self._lock:
             if self._current is None:
                 return None
@@ -219,9 +263,11 @@ class AudioPlayer:
             return len(self._queue) + (self._current is not None)
 
     def close(self) -> None:
-        """Para la salida y descarta el audio. Un `enqueue`/`resume` posterior la reabre."""
-        with self._lock:
-            self._drop_all()
+        """Cierre definitivo: para la salida y descarta el audio (ver docstring de clase)."""
+        self._closed = True
+        _, dropped = self._drop_all()
+        del dropped
+        self._output_gen += 1  # un fallo que llegue tarde ya no es de nadie
         if self._output_running:
             self._output_running = False
             self._stop_output()
@@ -230,47 +276,48 @@ class AudioPlayer:
     # --- Hilo de audio ---------------------------------------------------------------
 
     def _fill(self, out: np.ndarray) -> None:
-        """Callback de audio: rellena `out` (int16, `frames` muestras) sin bloquear."""
+        """Callback de audio: rellena `out` (int16, `frames` muestras) sin bloquear.
+
+        Nunca libera arrays con el candado tomado: los clips terminados se sueltan
+        al final, ya fuera del candado.
+        """
         frames = len(out)
         written = 0
+        finished: list[QueuedClip] | None = None
         with self._lock:
-            if not self._paused:
-                while written < frames:
+            clip = None if self._paused else self._current
+            while clip is not None and written < frames:
+                marks = clip.marks
+                while self._next_mark < len(marks) and marks[self._next_mark][0] <= self._pos:
+                    self._sentence = marks[self._next_mark][1]
+                    self._next_mark += 1
+                    self._emit(self._events.on_sentence_started, clip.chunk, self._sentence)
+                end = len(clip.pcm)
+                if self._next_mark < len(marks):
+                    end = marks[self._next_mark][0]
+                take = min(frames - written, end - self._pos)
+                out[written:written + take] = clip.pcm[self._pos:self._pos + take]
+                written += take
+                self._pos += take
+                if self._pos >= len(clip.pcm):
+                    self._pending_samples -= len(clip.pcm)
+                    self._emit(self._events.on_chunk_finished, clip.chunk)
+                    self._post(self._wake_waiters)
+                    if finished is None:
+                        finished = []
+                    finished.append(clip)
+                    self._current = None
+                    self._promote_locked()
                     clip = self._current
-                    if clip is None:
-                        if not self._queue:
-                            break
-                        clip = self._current = self._queue.popleft()
-                        self._pos = 0
-                        self._next_mark = 0
-                    marks = clip.marks
-                    while self._next_mark < len(marks) and marks[self._next_mark][0] <= self._pos:
-                        self._sentence = marks[self._next_mark][1]
-                        self._next_mark += 1
-                        self._emit(self._events.on_sentence_started, clip.chunk, self._sentence)
-                    end = len(clip.pcm)
-                    if self._next_mark < len(marks):
-                        end = min(end, marks[self._next_mark][0])
-                    take = min(frames - written, end - self._pos)
-                    out[written:written + take] = clip.pcm[self._pos:self._pos + take]
-                    written += take
-                    self._pos += take
-                    if self._pos >= len(clip.pcm):
-                        self._current = None  # suelta la referencia al array
-                        self._pending_samples -= len(clip.pcm)
-                        self._emit(self._events.on_chunk_finished, clip.chunk)
-                        self._post(self._wake_waiters)
+            clip = None
         if written < frames:
             out[written:] = 0
+        finished = None  # última referencia a los clips terminados: se liberan aquí
 
     def _emit(self, handler: Callable, *args) -> None:
         # Se llama con _lock tomado: así un clear() posterior siempre ve una
         # generación más nueva que la de cualquier evento ya emitido.
         self._post(self._deliver, self._generation, handler, *args)
-
-    def _report_output_failure(self, exc: Exception) -> None:
-        """Puede llamarse desde cualquier hilo (p. ej. el de PortAudio)."""
-        self._post(self._handle_output_failure, exc)
 
     # --- Internos ------------------------------------------------------------------
 
@@ -280,14 +327,29 @@ class AudioPlayer:
         except RuntimeError:  # bucle cerrado: ya no hay a quién avisar
             pass
 
-    def _drop_all(self) -> Chunk | None:
-        chunk = self._current.chunk if self._current is not None else None
-        self._current = None
-        self._queue.clear()
-        self._pos = self._next_mark = 0
-        self._pending_samples = 0
-        self._generation += 1
-        return chunk
+    def _promote_locked(self) -> None:
+        """Con _lock tomado: si no hay clip actual, el siguiente de la cola pasa a serlo.
+
+        Su primera marca se emite cuando el callback escribe sus primeras muestras.
+        """
+        if self._current is None and self._queue:
+            clip = self._current = self._queue.popleft()
+            self._pos = 0
+            self._next_mark = 0
+            self._sentence = clip.marks[0][1]
+
+    def _drop_all(self) -> tuple[Chunk | None, tuple]:
+        """Separa todo el audio bajo el candado; quien llama lo suelta fuera de él."""
+        fresh: deque[QueuedClip] = deque()
+        with self._lock:
+            current, queue = self._current, self._queue
+            self._current = None
+            self._queue = fresh
+            self._pos = self._next_mark = 0
+            self._pending_samples = 0
+            self._generation += 1
+        chunk = current.chunk if current is not None else None
+        return chunk, (current, queue)
 
     def _has_room(self, samples: int) -> bool:
         with self._lock:
@@ -313,17 +375,27 @@ class AudioPlayer:
         async with self._cond:
             self._cond.notify_all()
 
-    def _ensure_output(self) -> None:
-        if self._output_running:
+    def _start_output(self) -> None:
+        if self._closed or self._output_running:
             return
+        self._start_attempted = True
+        self._output_gen += 1
+        gen = self._output_gen
+
+        def on_error(exc: Exception) -> None:  # cualquier hilo (p. ej. el de PortAudio)
+            self._post(self._handle_output_failure, gen, exc)
+
         try:
-            self._output.start(self._fill, on_error=self._report_output_failure)
+            self._output.start(self._fill, on_error=on_error)
         except Exception as exc:
-            self._report_output_failure(exc)
+            self._post(self._handle_output_failure, gen, exc)
             return
         self._output_running = True
 
-    def _handle_output_failure(self, exc: Exception) -> None:
+    def _handle_output_failure(self, gen: int, exc: Exception) -> None:
+        if gen != self._output_gen:
+            return  # fallo de una salida anterior: no toca la actual
+        self._output_gen += 1  # cada arranque avisa como mucho una vez
         if self._output_running:
             self._output_running = False
             self._stop_output()

@@ -21,7 +21,8 @@ class FakeOutput:
         self.start_error = start_error
         self.callback: Callable[[np.ndarray], None] | None = None
         self.on_error: Callable[[Exception], None] | None = None
-        self.starts = 0
+        self.attempts = 0  # llamadas a start(), incluidas las que fallan
+        self.starts = 0  # arranques con éxito
         self.stops = 0
 
     @property
@@ -33,6 +34,7 @@ class FakeOutput:
         callback: Callable[[np.ndarray], None],
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
+        self.attempts += 1
         if self.start_error is not None:
             raise self.start_error
         self.callback = callback

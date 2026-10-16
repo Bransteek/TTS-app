@@ -197,15 +197,57 @@ async def test_clear_drops_events_not_yet_delivered(rig):
     assert rec.events == []
 
 
-async def test_clear_wakes_blocked_enqueue(rig):
+async def test_clear_drops_blocked_enqueue(rig):
     player, out, rec = rig(max_ahead=0)
-    await player.enqueue(make_clip(0, 1000))
+    assert await player.enqueue(make_clip(0, 1000)) is True
     pending = asyncio.ensure_future(player.enqueue(make_clip(1, 1000)))
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(asyncio.shield(pending), 0.05)
     player.clear()
-    await asyncio.wait_for(pending, 1)
-    assert player.queued_count() == 1
+    assert await asyncio.wait_for(pending, 1) is False  # era de la posición descartada
+    assert player.queued_count() == 0
+    assert player.current() is None
+    assert await asyncio.wait_for(player.enqueue(make_clip(2, 1000)), 0.05) is True
+    assert player.current()[0].chunk_id == "doc:0:0:2"
+
+
+async def test_cleared_clips_are_released(rig):
+    player, out, rec = rig()
+    clips = [make_clip(n, 1000) for n in range(3)]
+    refs = [weakref.ref(c.pcm) for c in clips]
+    for clip in clips:
+        await player.enqueue(clip)
+    del clip, clips
+    out.pull(10)
+    player.clear()
+    gc.collect()
+    assert [r for r in refs if r() is not None] == []
+
+
+async def test_next_clip_becomes_current_without_gap(rig):
+    player, out, rec = rig()
+    a = make_clip(0, 100, [(0, 0)])
+    b = make_clip(1, 100, [(0, 1), (50, 2)])
+    await player.enqueue(a)
+    assert player.current() == (a.chunk, 0)  # encolado = actual, antes de sonar
+    await player.enqueue(b)
+    out.pull(100)  # A termina justo al final del bloque
+    await settle()
+    assert player.current() == (b.chunk, 1)
+    assert player.clear() == b.chunk
+    assert ("sentence", "doc:0:0:1", 1) not in rec.events  # aún no se escribió ninguna muestra de B
+
+
+async def test_first_mark_of_next_clip_emitted_when_written(rig):
+    player, out, rec = rig()
+    await player.enqueue(make_clip(0, 100, [(0, 0)]))
+    await player.enqueue(make_clip(1, 100, [(0, 1)]))
+    out.pull(100)
+    await settle()
+    assert rec.events == [("sentence", "doc:0:0:0", 0), ("finished", "doc:0:0:0")]
+    out.pull(1)
+    await settle()
+    assert rec.events[-1] == ("sentence", "doc:0:0:1", 1)
 
 
 async def test_played_clips_are_released(rig):
@@ -268,9 +310,45 @@ async def test_output_failure_reported_on_loop_and_output_reopens(rig):
     assert rec.threads == {threading.get_ident()}
     assert not out.running
 
-    player.resume()  # reabrir la salida conserva lo que había en cola
-    assert out.starts == 2
-    assert player.queued_count() == 1
+    await player.enqueue(make_clip(1, 1000))  # enqueue no reintenta abrir la salida
+    assert out.attempts == 1 and not out.running
+
+    player.resume()  # solo el controlador reabre; la cola se conserva
+    assert out.starts == 2 and out.running
+    assert player.queued_count() == 2
+
+
+async def test_enqueue_does_not_retry_failed_device(rig):
+    out = FakeOutput(start_error=OSError("no device"))
+    rec = Recorder()
+    player = AudioPlayer(out, asyncio.get_running_loop(), rec)
+    for n in range(3):
+        await player.enqueue(make_clip(n, 100))
+    await settle()
+    assert out.attempts == 1
+    assert len([e for e in rec.events if e[0] == "error"]) == 1
+    player.resume()
+    await settle()
+    assert out.attempts == 2
+    assert len([e for e in rec.events if e[0] == "error"]) == 2
+    assert player.queued_count() == 3
+
+
+async def test_stale_output_error_is_ignored(rig):
+    player, out, rec = rig()
+    await player.enqueue(make_clip(0, 1000))
+    old_on_error = out.on_error
+    out.fail(RuntimeError("device lost"))
+    old_on_error(RuntimeError("same failure reported twice"))
+    await settle()
+    assert len([e for e in rec.events if e[0] == "error"]) == 1
+
+    player.resume()
+    assert out.running
+    old_on_error(RuntimeError("late failure from the old stream"))
+    await settle()
+    assert out.running and out.stops == 1  # la salida nueva sigue intacta
+    assert len([e for e in rec.events if e[0] == "error"]) == 1
 
 
 async def test_output_start_failure_is_reported_not_raised(rig):
@@ -293,6 +371,27 @@ async def test_close_stops_output_and_drops_audio(rig):
     assert player.queued_count() == 0
 
 
+async def test_close_is_terminal(rig):
+    player, out, rec = rig(max_ahead=0)
+    await player.enqueue(make_clip(0, 1000))
+    blocked = asyncio.ensure_future(player.enqueue(make_clip(1, 1000)))
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(blocked), 0.05)
+
+    player.close()
+    with pytest.raises(AudioOutputError) as woken:
+        await asyncio.wait_for(blocked, 1)
+    assert woken.value.recoverable is False
+    with pytest.raises(AudioOutputError):
+        await player.enqueue(make_clip(2, 1000))
+    player.resume()
+    out.fail(RuntimeError("late failure after close"))
+    await settle()
+    assert out.starts == 1 and not out.running
+    assert player.queued_count() == 0
+    assert [e for e in rec.events if e[0] == "error"] == []
+
+
 def test_queued_clip_validates_marks():
     pcm = np.zeros(10, np.int16)
     with pytest.raises(ValueError):
@@ -302,7 +401,14 @@ def test_queued_clip_validates_marks():
     with pytest.raises(ValueError):
         QueuedClip(make_chunk(0), pcm, [(0, 0), (8, 1), (4, 2)], "edge")
     with pytest.raises(ValueError):
+        QueuedClip(make_chunk(0), pcm, [(0, 0), (4, 1), (4, 2)], "edge")  # no estrictamente creciente
+    with pytest.raises(ValueError):
+        QueuedClip(make_chunk(0), pcm, [(0, 0), (10, 1)], "edge")  # marca fuera del pcm
+    with pytest.raises(ValueError):
+        QueuedClip(make_chunk(0), np.zeros(0, np.int16), [(0, 0)], "edge")
+    with pytest.raises(ValueError):
         QueuedClip(make_chunk(0), pcm.astype(np.float32), [(0, 0)], "edge")
+    QueuedClip(make_chunk(0), pcm, [(0, 0), (9, 1)], "edge")  # válido
 
 
 def test_decode_mp3_roundtrip():
