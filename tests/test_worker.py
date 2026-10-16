@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
+import time
 
 import pytest
 from PySide6.QtCore import QObject, QThread, QTimer, Slot
@@ -77,7 +79,7 @@ def test_all_signals_carry_plain_values(qtbot):
     }
 
 
-def test_bridge_is_accepted_as_controller_events():
+def test_bridge_is_accepted_as_controller_events(qtbot):
     def takes(events: ControllerEvents) -> ControllerEvents:
         return events
 
@@ -90,23 +92,153 @@ def test_bridge_is_accepted_as_controller_events():
         assert callable(getattr(bridge, name))
 
 
+class BlockingEdge(FakeEdge):
+    """Como FakeEdge, pero la síntesis BLOQUEA el bucle del trabajador (time.sleep directo)."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.thread_id = None
+
+    async def synthesize(self, chunk, voice, speed):
+        self.thread_id = threading.get_ident()
+        self.started.set()
+        time.sleep(2)
+        return await super().synthesize(chunk, voice, speed)
+
+
 def test_ui_stays_responsive_during_slow_synthesis(qtbot, worker):
+    edge = BlockingEdge()
     ticks = []
     timer = QTimer()
     timer.setInterval(50)
-    timer.timeout.connect(lambda: ticks.append(1))
+    timer.timeout.connect(lambda: ticks.append(edge.started.is_set()))
     timer.start()
 
-    async def slow():
-        edge = FakeEdge()
-        await asyncio.sleep(2)  # síntesis lenta simulada en el hilo de trabajo
-        return edge.name
-
-    fut = worker.submit(slow())
-    qtbot.waitUntil(lambda: len(ticks) >= 20, timeout=3000)
-    assert not fut.done()
-    fut.cancel()
+    fut = worker.submit(edge.synthesize(None, "v", 1.0))
+    qtbot.waitUntil(lambda: len(ticks) >= 20, timeout=1900)
     timer.stop()
+    assert not fut.done()  # el bloqueo seguía en curso
+    assert edge.started.is_set()
+    assert sum(ticks) >= 15  # los ticks se contaron con el trabajo bloqueante en marcha
+    assert edge.thread_id != threading.get_ident()
+    # parada limpia: el fixture espera a que termine el bloqueo (<= 5 s)
+
+
+def test_bridge_created_in_worker_is_ui_thread_affine(qtbot, worker):
+    async def make():
+        return QtEventBridge()
+
+    bridge = worker.submit(make()).result(timeout=2)
+    assert bridge.thread() is QThread.currentThread()
+    out = []
+    bridge.session_state_sig.connect(lambda x: out.append(QThread.currentThread()))
+
+    async def emit():
+        bridge.on_session_state(SessionState.READING)
+
+    worker.submit(emit()).result(timeout=2)
+    qtbot.waitUntil(lambda: bool(out), timeout=2000)
+    assert out == [QThread.currentThread()]
+
+
+def test_stop_cancels_futures_of_tasks_that_swallow_cancellation(qtbot):
+    w = AsyncWorker()
+    w.start()
+    started = threading.Event()
+
+    async def stubborn():
+        started.set()
+        while True:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                pass
+
+    fut = w.submit(stubborn())
+    out = []
+    call_ui(fut, lambda r: out.append("ok"), lambda e: out.append(e))
+    assert started.wait(2)
+    t0 = time.monotonic()
+    w.stop(timeout=1)
+    assert time.monotonic() - t0 < 2.5
+    assert fut.cancelled()
+    qtbot.waitUntil(lambda: bool(out), timeout=2000)
+    qtbot.wait(200)
+    assert len(out) == 1 and isinstance(out[0], BaseException)
+
+
+def test_stop_cancels_tasks_spawned_while_cancelling():
+    w = AsyncWorker()
+    w.start()
+    spawned = []
+
+    async def parent():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            async def child():
+                await asyncio.sleep(60)
+            spawned.append(asyncio.get_running_loop().create_task(child()))
+            await asyncio.sleep(0)
+
+    w.submit(parent())
+    time.sleep(0.1)
+    w.stop()
+    assert spawned and spawned[0].cancelled()
+
+
+def test_stop_from_loop_thread_raises(worker):
+    async def inside():
+        worker.stop()
+
+    with pytest.raises(RuntimeError):
+        worker.submit(inside()).result(timeout=2)
+
+
+def test_concurrent_start_waits_until_ready():
+    w = AsyncWorker()
+    results = []
+
+    def starter():
+        w.start()
+        try:
+            results.append(w.loop.is_running() or w._ready.is_set())
+        except RuntimeError:
+            results.append(False)
+
+    ts = [threading.Thread(target=starter) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    w.stop()
+    assert results == [True] * 6
+
+
+def test_call_ui_off_ui_thread_raises(qtbot):
+    errs = []
+
+    def other():
+        try:
+            call_ui(concurrent.futures.Future(), lambda r: None, lambda e: None)
+        except RuntimeError as e:
+            errs.append(e)
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join()
+    assert len(errs) == 1
+
+
+def test_call_ui_already_done_future(qtbot):
+    f = concurrent.futures.Future()
+    f.set_result(5)
+    out = []
+    call_ui(f, lambda r: out.append(("ok", r)), lambda e: out.append(("err", e)))
+    qtbot.waitUntil(lambda: bool(out), timeout=2000)
+    qtbot.wait(200)
+    assert out == [("ok", 5)]
 
 
 def test_call_ui_ok_on_ui_thread(qtbot, worker):
@@ -118,6 +250,7 @@ def test_call_ui_ok_on_ui_thread(qtbot, worker):
     call_ui(worker.submit(val()), lambda r: out.append((r, QThread.currentThread())),
             lambda e: out.append(("err", e)))
     qtbot.waitUntil(lambda: bool(out), timeout=2000)
+    qtbot.wait(200)
     assert out == [(42, QThread.currentThread())]
 
 
@@ -158,7 +291,8 @@ def test_call_ui_callback_that_raises_is_logged(qtbot, worker, caplog):
 
     with caplog.at_level(logging.ERROR, logger="lector.services.worker"):
         call_ui(worker.submit(val()), bad, lambda e: None)
-        qtbot.waitUntil(lambda: any("callback roto" in (r.exc_text or "") or r.exc_info
+        qtbot.waitUntil(lambda: any("callback roto" in r.getMessage()
+                                    or (r.exc_info and isinstance(r.exc_info[1], RuntimeError))
                                     for r in caplog.records), timeout=2000)
     # la aplicación sigue viva y atiende otro callback
     call_ui(worker.submit(val()), out.append, lambda e: None)
@@ -201,4 +335,4 @@ def test_loop_exceptions_are_logged(worker, caplog):
 
     with caplog.at_level(logging.ERROR, logger="lector.services.worker"):
         worker.submit(leak()).result(timeout=2)
-    assert any("ZeroDivisionError" in r.getMessage() or r.exc_info for r in caplog.records)
+    assert any(r.exc_info and isinstance(r.exc_info[1], ZeroDivisionError) for r in caplog.records)
