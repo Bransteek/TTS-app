@@ -75,12 +75,24 @@ def relocate(doc: Document, new_path: str | os.PathLike) -> Document:
     return replace(doc, origin=str(path))
 
 
+def relocate_and_store(repos, doc: Document, new_path: str | os.PathLike) -> Document:
+    """`relocate` y persiste el nuevo origen con el (tamaño, mtime) actual del archivo.
+
+    Si el archivo no es el mismo lanza `FileMovedOrChanged` sin tocar la base de datos.
+    Síncrona: llamar con `asyncio.to_thread`.
+    """
+    moved = relocate(doc, new_path)
+    try:
+        stat = Path(new_path).stat()
+    except OSError as exc:
+        raise FileMovedOrChanged(doc.doc_id) from exc
+    repos.documents.update_origin(doc.doc_id, moved.origin, stat.st_size, stat.st_mtime)
+    return moved
+
+
 def last_session(repos) -> ProgressRecord | None:
     """Registro de progreso más reciente, o None si nunca se leyó nada.
 
     Síncrona: llamar con `asyncio.to_thread`.
     """
-    for _doc, progress in repos.documents.list_recent(limit=50):
-        if progress is not None:
-            return progress
-    return None
+    return repos.progress.latest()

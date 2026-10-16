@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -111,3 +112,132 @@ def test_update_origin_and_file_stat_persist(tmp_path):
     assert documents.get("a").origin == "/y/a.pdf"
     assert documents.file_stat("a") == (7, 3.5)
     assert progress.get("a").origin == "/y/a.pdf"
+
+
+def test_same_mtime_but_changed_size_and_content_is_detected(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = _doc(f, b"contenido")
+    st = f.stat()
+    stored = (st.st_size, st.st_mtime)
+    f.write_bytes(b"contenido mucho mas largo")
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))  # misma fecha, otro tamaño
+    assert f.stat().st_mtime == st.st_mtime
+    with pytest.raises(FileMovedOrChanged):
+        recovery.check_file(doc, str(f), stored)
+
+
+def test_same_size_but_changed_mtime_with_same_content_is_accepted(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = _doc(f, b"contenido")
+    st = f.stat()
+    stored = (st.st_size, st.st_mtime)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    assert f.stat().st_size == st.st_size
+    assert recovery.check_file(doc, str(f), stored) == f
+
+
+def test_same_size_changed_mtime_and_different_content_is_detected(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = _doc(f, b"contenido")
+    st = f.stat()
+    f.write_bytes(b"CONTENIDO")  # mismo tamaño
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    with pytest.raises(FileMovedOrChanged):
+        recovery.check_file(doc, str(f), (st.st_size, st.st_mtime))
+
+
+def test_empty_file_hash_passes_when_file_exists(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = replace(_doc(f, b"contenido"), file_hash="")
+    st = f.stat()
+    f.write_bytes(b"otro contenido")
+    assert recovery.check_file(doc, str(f), (st.st_size, st.st_mtime)) == f
+    assert recovery.check_file(doc, str(f)) == f
+    with pytest.raises(FileMovedOrChanged):
+        recovery.check_file(doc, str(tmp_path / "no-existe.pdf"))
+
+
+def test_last_session_with_more_than_fifty_newer_unread_documents(tmp_path):
+    conn = open_database(tmp_path / "lector.db")
+    documents, progress = DocumentRepo(conn), ProgressRepo(conn)
+    repos = SimpleNamespace(documents=documents, progress=progress)
+    documents.upsert(Document("leido", SourceKind.PDF, "/x/l.pdf", "l", None, None, "h", []),
+                     None, 1, 1.0)
+    progress.save(_record("leido", 1.0))
+    for i in range(60):
+        documents.upsert(Document(f"u{i}", SourceKind.PDF, f"/x/u{i}.pdf", "u", None, None,
+                                  "h", []), None, 1, 1.0)
+    assert progress.latest().doc_id == "leido"
+    assert recovery.last_session(repos).doc_id == "leido"
+
+
+def test_latest_is_none_without_progress(tmp_path):
+    assert ProgressRepo(open_database(tmp_path / "lector.db")).latest() is None
+
+
+def test_relocate_and_store_persists_origin_and_stat(tmp_path):
+    conn = open_database(tmp_path / "lector.db")
+    documents, progress = DocumentRepo(conn), ProgressRepo(conn)
+    repos = SimpleNamespace(documents=documents, progress=progress)
+    doc = _doc(tmp_path / "a.pdf", b"contenido")
+    documents.upsert(doc, None, 1, 1.0)
+    progress.save(_record("d1", 1.0))
+    new = tmp_path / "sub" / "b.pdf"
+    new.parent.mkdir()
+    new.write_bytes(b"contenido")
+    moved = recovery.relocate_and_store(repos, doc, new)
+    st = new.stat()
+    assert moved.origin == str(new)
+    assert documents.get("d1").origin == str(new)
+    assert documents.file_stat("d1") == (st.st_size, st.st_mtime)
+    assert progress.get("d1").origin == str(new)
+
+
+def test_relocate_and_store_rejects_different_file_without_persisting(tmp_path):
+    conn = open_database(tmp_path / "lector.db")
+    repos = SimpleNamespace(documents=DocumentRepo(conn), progress=ProgressRepo(conn))
+    old = tmp_path / "a.pdf"
+    doc = _doc(old, b"contenido")
+    repos.documents.upsert(doc, None, 1, 1.0)
+    other = tmp_path / "otro.pdf"
+    other.write_bytes(b"otra cosa")
+    with pytest.raises(FileMovedOrChanged):
+        recovery.relocate_and_store(repos, doc, other)
+    assert repos.documents.get("d1").origin == str(old)
+    assert repos.documents.file_stat("d1") == (1, 1.0)
+
+
+async def test_slow_path_success_refreshes_stored_stat(tmp_path):
+    from lector.services import document_opener
+
+    conn = open_database(tmp_path / "lector.db")
+    documents = DocumentRepo(conn)
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = _doc(f, b"contenido")
+    st = f.stat()
+    documents.upsert(doc, None, st.st_size, st.st_mtime)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    new = f.stat()
+    await document_opener.check_file(doc, documents.file_stat("d1"), documents)
+    assert documents.file_stat("d1") == (new.st_size, new.st_mtime)
+
+
+async def test_failed_check_does_not_refresh_stored_stat(tmp_path):
+    from lector.services import document_opener
+
+    conn = open_database(tmp_path / "lector.db")
+    documents = DocumentRepo(conn)
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"contenido")
+    doc = _doc(f, b"contenido")
+    st = f.stat()
+    documents.upsert(doc, None, st.st_size, st.st_mtime)
+    f.write_bytes(b"cambiado del todo")
+    with pytest.raises(FileMovedOrChanged):
+        await document_opener.check_file(doc, documents.file_stat("d1"), documents)
+    assert documents.file_stat("d1") == (st.st_size, st.st_mtime)

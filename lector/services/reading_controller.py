@@ -1023,7 +1023,7 @@ class ReadingController:
                 )
             else:
                 stat = await asyncio.to_thread(self._repos.documents.file_stat, doc_id)
-                await check_file(doc, stat)
+                await check_file(doc, stat, self._repos.documents)
                 source, opened, first = await self._open_source(doc.origin)
                 if opened.doc_id != doc_id:
                     log.warning("La fuente devolvió otro id (%s); se conserva %s", opened.doc_id, doc_id)

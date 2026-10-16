@@ -46,12 +46,25 @@ def store_opened(
         log.warning("No se pudo guardar el capítulo abierto: %s", exc)
 
 
-async def check_file(doc: Document, stored_stat: tuple[int, float] | None = None) -> None:
+async def check_file(
+    doc: Document, stored_stat: tuple[int, float] | None = None, documents: DocumentRepo | None = None
+) -> None:
     """Lanza `FileMovedOrChanged` si el archivo ya no existe o su contenido cambió.
 
-    Delega en `recovery.check_file` (única implementación) en un hilo.
+    Delega en `recovery.check_file` (única implementación) en un hilo. Si pasa y el
+    (tamaño, mtime) actual difiere del guardado, y se da `documents`, lo refresca para
+    que la próxima apertura tome la vía rápida.
     """
-    await asyncio.to_thread(recovery.check_file, doc, doc.origin, stored_stat)
+    path = await asyncio.to_thread(recovery.check_file, doc, doc.origin, stored_stat)
+    if documents is None:
+        return
+    try:
+        stat = await asyncio.to_thread(path.stat)
+        if (stat.st_size, stat.st_mtime) != (tuple(stored_stat) if stored_stat else None):
+            await asyncio.to_thread(
+                documents.update_file_stat, doc.doc_id, stat.st_size, stat.st_mtime)
+    except Exception as exc:  # refrescar es una optimización: nunca debe impedir abrir
+        log.warning("No se pudo refrescar el estado del archivo: %s", exc)
 
 
 class DeferredSource:

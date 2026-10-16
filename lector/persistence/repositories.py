@@ -166,6 +166,13 @@ class DocumentRepo(_Repo):
             return None
         return row[0], row[1]
 
+    def update_file_stat(self, doc_id: str, file_size: int | None,
+                         file_mtime: float | None) -> None:
+        """Refresca (tamaño, mtime) guardados tras verificar que el contenido no cambió."""
+        self._run(lambda c: c.execute(
+            "UPDATE documents SET file_size=?, file_mtime=? WHERE doc_id=?",
+            (file_size, file_mtime, doc_id)))
+
     def update_origin(self, doc_id: str, origin: str, file_size: int | None,
                       file_mtime: float | None) -> None:
         """Nueva ubicación del archivo (documento y progreso)."""
@@ -310,6 +317,13 @@ class ProgressRepo(_Repo):
     def get(self, doc_id: str) -> ProgressRecord | None:
         row = self._run(lambda c: c.execute(
             f"SELECT {_PROGRESS_FIELDS} FROM progress WHERE doc_id=?", (doc_id,)).fetchone())
+        return _row_to_progress(row) if row else None
+
+    def latest(self) -> ProgressRecord | None:
+        """Registro de progreso más reciente por `last_read_at`, o None si no hay ninguno."""
+        row = self._run(lambda c: c.execute(
+            f"SELECT {_PROGRESS_FIELDS} FROM progress ORDER BY last_read_at DESC LIMIT 1"
+        ).fetchone())
         return _row_to_progress(row) if row else None
 
 
