@@ -1,10 +1,14 @@
 """Fixtures compartidas: PDF de prueba generados con pymupdf (sin binarios en el repo)."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pymupdf
 import pytest
+
+# Qt sin pantalla: debe fijarse antes de que se cree cualquier QApplication.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 PAGE_W, PAGE_H = 595, 842
 
