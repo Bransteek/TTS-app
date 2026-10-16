@@ -203,12 +203,16 @@ def _build_index(extracted: _Extracted) -> list[ChapterRef]:
     if not starts:
         return [ChapterRef(0, _WHOLE_DOCUMENT, f"pages:1-{total}")]
     starts.sort(key=lambda item: item[1])  # estable: conserva el orden del índice
+    unique: list[tuple[str, int]] = []
+    for title, first in starts:
+        if not unique or unique[-1][1] != first:  # misma página: gana la primera entrada
+            unique.append((title, first))
     refs = []
-    for i, (title, first) in enumerate(starts):
+    for i, (title, first) in enumerate(unique):
         if i == 0:
             first = 1  # el texto previo al primer encabezado se conserva
-        last = starts[i + 1][1] - 1 if i + 1 < len(starts) else total
-        refs.append(ChapterRef(i, title, f"pages:{first}-{max(first, last)}"))
+        last = unique[i + 1][1] - 1 if i + 1 < len(unique) else total
+        refs.append(ChapterRef(i, title, f"pages:{first}-{last}"))
     return refs
 
 
@@ -248,15 +252,20 @@ class PdfSource(ContentSource):
         if not self._index or not match:
             raise DamagedDocument("Primero hay que abrir un PDF.", recoverable=False)
         first, last = int(match.group(1)), int(match.group(2))
-        index = next((r.index for r in self._index if r.locator == ref.locator), ref.index)
-        entry = self._index[index] if index is not None else ref
+        index = ref.index
+        if index is None or not 0 <= index < len(self._index):
+            index = next((r.index for r in self._index if r.locator == ref.locator), None)
+        if index is None:
+            raise DamagedDocument("No se encontró ese capítulo en el PDF.", recoverable=False)
+        entry = self._index[index]
+        first, last = (int(g) for g in _LOCATOR.match(entry.locator).groups())
         paragraphs = [
             (_join_lines(block), page.number)
             for page in self._pages[first - 1 : last]
             for block in page.blocks
         ]
         text, paras, sentences = build_chapter_text(paragraphs)
-        has_next = index is not None and index + 1 < len(self._index)
+        has_next = index + 1 < len(self._index)
         return Chapter(
             ref=entry,
             title=entry.title,

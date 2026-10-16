@@ -104,8 +104,37 @@ async def test_encrypted_pdf_is_damaged(tmp_path):
     path = tmp_path / "cifrado.pdf"
     doc.save(path, encryption=pymupdf.PDF_ENCRYPT_AES_256, user_pw="clave", owner_pw="dueno")
     doc.close()
-    with pytest.raises(DamagedDocument):
+    with pytest.raises(DamagedDocument) as err:
         await PdfSource().open(str(path))
+    assert "contraseña" in err.value.user_message
+
+
+async def test_same_page_toc_entries_do_not_duplicate(make_pdf):
+    path = make_pdf(
+        pages=[[(prose(n), BODY)] for n in ("Uno", "Dos", "Tres")],
+        toc=[[1, "A", 1], [1, "B", 2], [1, "C", 2], [1, "D", 3]],
+    )
+    source = PdfSource()
+    doc, _ = await source.open(str(path))
+    assert [(c.title, c.locator) for c in doc.chapters] == [
+        ("A", "pages:1-1"), ("B", "pages:2-2"), ("D", "pages:3-3"),
+    ]
+    seen = []
+    for ref in doc.chapters:
+        chapter = await source.load_chapter(ref)
+        assert (chapter.ref.index, chapter.title) == (ref.index, ref.title)
+        seen += [p.text for p in chapter.paragraphs]
+    assert len(seen) == len(set(seen)) == 3
+
+
+async def test_load_chapter_unknown_ref(make_pdf):
+    from lector.models import ChapterRef
+
+    path = make_pdf(pages=[[(prose("Uno"), BODY)]])
+    source = PdfSource()
+    await source.open(str(path))
+    with pytest.raises(DamagedDocument):
+        await source.load_chapter(ChapterRef(9, "x", "pages:5-6"))
 
 
 async def test_hyphen_rejoin(make_pdf):
