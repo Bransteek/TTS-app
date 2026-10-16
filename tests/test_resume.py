@@ -221,10 +221,10 @@ async def test_deferred_open_from_history_applies_prefix_overrides(controller_ri
     await first.stop()
 
     later = story_rig(controller_rig, db_path=db, prefetch_ahead=0)
-    later.settings.set("work_prefix_overrides", {"novela.example": "/obra/"})
+    later.settings.set("work_prefix_overrides", {"novela.example": ["/obra/"]})
     await later.play(STORY_ID, Position(2, story_ref(2).locator, 0, 0, 0, None))
     await later.hear(1)  # el capítulo 2 no estaba guardado: se abrió la fuente real
 
     assert later.network["opens"] == [
-        (story_ref(2).locator, {"prefix_overrides": {"novela.example": "/obra/"}}),
+        (story_ref(2).locator, {"prefix_overrides": {"novela.example": ["/obra/"]}}),
     ]

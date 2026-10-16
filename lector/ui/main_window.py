@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QEvent, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QHideEvent, QPalette, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from lector.content.generic_web import set_prefix_override
 from lector.errors import LectorError
 from lector.models import Chapter, ChapterRef, Document, Position
 from lector.persistence.repositories import (
@@ -62,6 +63,8 @@ GENERIC_ERROR = (
 SETTINGS_LOAD_FAILED = "No se pudo cargar la configuración. Se usan los valores por defecto."
 NOTHING_TO_READ = "Pega la dirección de un capítulo o abre un archivo PDF o EPUB."
 CONTINUING = "Se sigue leyendo donde lo dejaste."
+STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
+LEAVE_CHECK_MS = 300  # la app sin foco tanto tiempo: el usuario se fue (no es un parpadeo)
 WAITING_TEXT = "Esperando conexión…"
 EDGE_TEXT = {
     EngineState.EDGE_ACTIVE: "Conectado",
@@ -103,10 +106,12 @@ def _read_state(settings: SettingsRepo, voices: VoicesCacheRepo,
     return _Loaded(values, edge_voices, piper)
 
 
-def _save_override(settings: SettingsRepo, host: str, path: str) -> None:
-    """Recuerda el prefijo corregido para ese host (en el hilo de trabajo)."""
-    overrides = dict(settings.get("work_prefix_overrides") or {})
-    overrides[host] = path
+def _store_override(settings: SettingsRepo, chapter_url: str, path: str | None) -> None:
+    """Recuerda el prefijo corregido de la obra de `chapter_url` (None: lo olvida).
+
+    En el hilo de trabajo.
+    """
+    overrides = set_prefix_override(settings.get("work_prefix_overrides"), chapter_url, path)
     settings.set("work_prefix_overrides", overrides)
 
 
@@ -143,7 +148,9 @@ class MainWindow(QMainWindow):
         self._session_chapter: str | None = None  # capítulo que suena (document_sig)
         self._preview: _Preview | None = None
         self._opening = False
+        self._open_gen = 0  # cada apertura nueva deja caducas las respuestas de las anteriores
         self._play_pending = False  # un play() en vuelo: no se manda otro
+        self._confirm_after_leer = False  # «Leer» pidió leer y la vista previa espera confirmar
         self._preferred = "edge"
         self._engine_seen = False
         self._highlight = True
@@ -155,6 +162,10 @@ class MainWindow(QMainWindow):
         self._choice_tag: tuple[str | None, str | None] | None = None  # (doc, capítulo)
         self._quitting = False
         self._resume = ResumeOffer(self, self._apply_resume, lambda: self.show_notice(CONTINUING))
+        self._leave_timer = QTimer(self)
+        self._leave_timer.setSingleShot(True)
+        self._leave_timer.setInterval(LEAVE_CHECK_MS)
+        self._leave_timer.timeout.connect(self._check_user_left)
 
         self.setWindowTitle("Lector")
         self._build()
@@ -264,6 +275,9 @@ class MainWindow(QMainWindow):
         self.settings_action.triggered.connect(self.settings_requested.emit)
         self.piper_label.linkActivated.connect(lambda _link: self.settings_requested.emit())
         self.choice_panel.chosen.connect(self._on_choice_chosen)
+        app = QApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_app_state)
 
         c, ctl = self.controls, self._ctl
         c.play_pause_button.clicked.connect(self._on_play_pause)
@@ -392,10 +406,15 @@ class MainWindow(QMainWindow):
             self._open(locator, autoplay=True)
             return
         doc = preview.doc
-        if self._session_doc == doc.doc_id and self._state in _PLAYING_STATES:
-            return  # ya se está leyendo: «Leer» no lo reinicia
-        if self._session_doc == doc.doc_id and self._state is SessionState.PAUSED:
-            self._run(self._ctl.resume())
+        if self._session_doc == doc.doc_id:
+            # Ya se empezó a leer este documento: «Leer» no lo reinicia ni vuelve al
+            # capítulo elegido al principio; sigue donde iba.
+            if self._state in _PLAYING_STATES:
+                return
+            if self._state is SessionState.PAUSED:
+                self._run(self._ctl.resume())
+            else:
+                self._play(doc.doc_id, None)
             return
         edited = self.preview.edited_prefix()
         if edited is not None:
@@ -416,17 +435,30 @@ class MainWindow(QMainWindow):
         self._start_open(locator, self._ctl.open(locator), autoplay, confirmed=False)
 
     def _reopen_with_prefix(self, preview: _Preview, typed: str) -> None:
-        """Guarda el prefijo corregido para el host y vuelve a abrir con él antes de leer."""
-        path, error = validate_prefix(typed, preview.doc.origin)
-        if error is not None:
-            self.preview.show_prefix_error(error)
-            return
-        host = urlsplit(preview.doc.origin).netloc.lower()
-        settings, ctl, locator = self._settings, self._ctl, preview.locator
+        """Guarda el prefijo corregido de la obra y vuelve a abrir con él antes de leer.
+
+        Un campo vacío olvida la corrección guardada (vuelve a la detección). El mismo
+        prefijo (con o sin «/» final) no cambia nada: se lee lo ya abierto.
+        """
+        doc, chapter_url = preview.doc, preview.chapter.ref.locator
+        path: str | None = None
+        if typed:
+            path, error = validate_prefix(typed, doc.origin, chapter_url)
+            if error is not None:
+                self.preview.show_prefix_error(error)
+                return
+            if path == urlsplit(doc.work_prefix or "").path.rstrip("/") + "/":
+                self._play(doc.doc_id, None)
+                return
+        settings, documents, ctl, locator = self._settings, self._documents, self._ctl, preview.locator
 
         async def save_and_open():
-            await asyncio.to_thread(_save_override, settings, host, path)
-            return await ctl.open(locator)
+            await asyncio.to_thread(_store_override, settings, chapter_url, path)
+            result = await ctl.open(locator)
+            if result[0].doc_id != doc.doc_id:
+                # El documento del prefijo equivocado no queda en el historial si no se leyó.
+                await asyncio.to_thread(documents.delete_if_unread, doc.doc_id)
+            return result
 
         self._start_open(locator, save_and_open(), autoplay=True, confirmed=True)
 
@@ -434,9 +466,14 @@ class MainWindow(QMainWindow):
         self._clear_notice()
         self._clear_choice()
         self._resume.cancel()
+        self._confirm_after_leer = False
+        self._open_gen += 1
+        gen = self._open_gen
         self._set_opening(True)
 
         def opened(result) -> None:
+            if gen != self._open_gen:
+                return  # caducada: después se abrió otra cosa (p. ej. desde el historial)
             self._set_opening(False)
             doc, chapter, progress = result
             self._preview = _Preview(locator, doc, chapter)
@@ -452,8 +489,14 @@ class MainWindow(QMainWindow):
                 self.offer_resume(doc, progress, chapter_title=known)
             elif autoplay and not self.preview.needs_confirmation():
                 self._play(doc.doc_id, None)
+            elif autoplay:
+                self._confirm_after_leer = True
+                if not self.user_present():
+                    self._auto_confirm()  # se fue mientras se abría: no espera a nadie
 
         def failed(exc: BaseException) -> None:
+            if gen != self._open_gen:
+                return
             self._set_opening(False)
             self._on_error(exc)
 
@@ -480,6 +523,8 @@ class MainWindow(QMainWindow):
         """
         self._session_doc = doc_id
         self._clear_choice()  # una elección pendiente era de la lectura anterior
+        self._confirm_after_leer = False
+        self.preview.settle()  # ya no se espera confirmar el prefijo ni el capítulo
 
         def done(_result=None) -> None:
             self._play_pending = False
@@ -491,12 +536,13 @@ class MainWindow(QMainWindow):
         self._play_pending = self._run(job, done, failed)
 
     def _on_play_pause(self) -> None:
-        if self._play_pending or self._opening:
-            return
+        # Pausar y seguir valen aunque haya un play() en vuelo; solo no se manda otro play.
         if self._state in _PLAYING_STATES:
             self._run(self._ctl.pause())
         elif self._state is SessionState.PAUSED:
             self._run(self._ctl.resume())
+        elif self._play_pending or self._opening:
+            return
         elif self._session_doc is not None:
             self._play(self._session_doc, None)
         else:
@@ -509,6 +555,48 @@ class MainWindow(QMainWindow):
         if not self.isVisible() or self.isMinimized():
             return False
         return self.isActiveWindow() or QApplication.activeWindow() is not None
+
+    def _auto_confirm(self) -> None:
+        """Sin el usuario delante tras «Leer»: empieza con lo detectado, sin esperar.
+
+        Prefijo detectado en una web genérica; capítulo 1 al abrir desde el índice. Lo que
+        el usuario hubiera escrito o elegido sin confirmar no cuenta.
+        """
+        preview = self._preview
+        if not self._confirm_after_leer or preview is None:
+            return
+        self._confirm_after_leer = False
+        if not self.preview.needs_confirmation():
+            return
+        doc = preview.doc
+        start = None
+        if not self.preview.chapter_list.isHidden() and doc.chapters:
+            start = _chapter_start(0, doc.chapters[0])
+        self._play(doc.doc_id, start)
+        self.show_notice(STARTED_TEXT)
+
+    def _user_left(self, hidden: bool) -> None:
+        """El usuario se fue al juego: oculta o minimizada (`hidden`) o la app sin foco."""
+        if self._quitting:
+            return
+        self._auto_confirm()
+        if hidden:
+            self._resume.window_hidden()
+        else:
+            self._resume.window_deactivated()
+
+    @Slot(Qt.ApplicationState)
+    def _on_app_state(self, state: Qt.ApplicationState) -> None:
+        # Un diálogo de la propia app con el foco no deja la app inactiva. Se espera un poco
+        # antes de decidir: un parpadeo del foco no cuenta como irse.
+        if state == Qt.ApplicationState.ApplicationActive:
+            self._leave_timer.stop()
+        elif self.isVisible():  # oculta: ya se trató al ocultarla
+            self._leave_timer.start()
+
+    def _check_user_left(self) -> None:
+        if self.isVisible() and not self.user_present():
+            self._user_left(hidden=self.isMinimized())
 
     def offer_resume(self, doc: Document, progress: ProgressRecord, *,
                      chapter_title: str | None = None,
@@ -570,6 +658,9 @@ class MainWindow(QMainWindow):
         self._clear_notice()
         self._clear_choice()
         self._resume.cancel()
+        self._confirm_after_leer = False
+        self._open_gen += 1  # lo que se estuviera abriendo ya no vale: manda el historial
+        self._set_opening(False)
         self.url_edit.setText(doc.origin)
         self.preview.hide()
         self._preview = None
@@ -677,15 +768,21 @@ class MainWindow(QMainWindow):
 
     def hideEvent(self, event: QHideEvent) -> None:
         super().hideEvent(event)
-        self._resume.window_hidden()
+        self._user_left(hidden=True)
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             if self.isMinimized():
-                self._resume.window_hidden()
+                self._user_left(hidden=True)
             elif self.isVisible():
                 self._resume.window_shown()
+        elif event.type() == QEvent.Type.ActivationChange:
+            # Igual que la app sin foco: un diálogo propio con el foco no cuenta (user_present).
+            if self.isActiveWindow():
+                self._leave_timer.stop()
+            elif self.isVisible():
+                self._leave_timer.start()
 
     def allow_close(self) -> None:
         """Al salir de verdad (menú «Salir» de la bandeja, T19): cerrar ya no oculta."""

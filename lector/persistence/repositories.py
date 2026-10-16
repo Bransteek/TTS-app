@@ -158,6 +158,17 @@ class DocumentRepo(_Repo):
         row = self._run(op)
         return self._row_to_doc(row) if row else None
 
+    def delete_if_unread(self, doc_id: str) -> bool:
+        """Borra el documento y sus capítulos si nunca se leyó (sin progreso). True si lo borró."""
+
+        def op(c: sqlite3.Connection) -> bool:
+            if c.execute("SELECT 1 FROM progress WHERE doc_id=?", (doc_id,)).fetchone():
+                return False
+            c.execute("DELETE FROM chapters WHERE doc_id=?", (doc_id,))
+            return c.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,)).rowcount > 0
+
+        return self._run(op)
+
     def list_recent(self, limit: int = 50) -> list[tuple[Document, ProgressRecord | None]]:
         def op(c: sqlite3.Connection):
             return c.execute(

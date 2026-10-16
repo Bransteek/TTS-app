@@ -12,7 +12,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
 from lector.content.base import doc_id_for_url
@@ -773,6 +773,7 @@ def test_prefix_field_hidden_for_madara_without_index(qtbot, make_window, ctl):
         ("obras/mi-novela/", "dirección completa"),
         ("ftp://example.com/obras/", "dirección completa"),
         ("https://otra-web.com/obras/", "misma web"),
+        ("https://example.com/obras/mi-novela/", "no está dentro"),
     ],
 )
 def test_invalid_prefix_is_rejected_inline(qtbot, make_window, ctl, conn, typed, message):
@@ -792,22 +793,26 @@ def test_invalid_prefix_is_rejected_inline(qtbot, make_window, ctl, conn, typed,
 
 
 def test_edited_prefix_is_saved_then_reopened_before_reading(qtbot, make_window, ctl, conn):
-    corrected = generic_doc("doc-corregido", "https://example.com/obras/mi-novela/")
-    ctl.open_result = [(generic_doc(), make_chapter(), None), (corrected, make_chapter(), None)]
+    wrong = generic_doc()
+    corrected = generic_doc("doc-corregido", "https://example.com/")
+    DocumentRepo(conn).upsert(wrong, None, None, None)  # lo guardó la primera apertura
+    ctl.open_result = [(wrong, make_chapter(), None), (corrected, make_chapter(), None)]
     settings = SpySettings(conn)
     window = make_window(show=True, settings=settings)
     read(qtbot, window)
     qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
 
-    window.preview.prefix_edit.setText("https://example.com/obras/mi-novela")
+    window.preview.prefix_edit.setText("https://example.com")
     window.read_button.click()
 
     wait_call(qtbot, ctl, "play", "doc-corregido", None)
     assert [c[0] for c in ctl.calls] == ["open", "open", "play"]
     assert ctl.calls[1] == ("open", URL)  # se vuelve a abrir con la corrección
-    assert SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": "/obras/mi-novela/"}
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": ["/"]}
     assert threading.main_thread() not in settings.threads
     assert window.preview.prefix_error_label.isHidden()
+    # El documento con el prefijo equivocado no tenía progreso: no queda en el historial.
+    qtbot.waitUntil(lambda: DocumentRepo(conn).get("doc-g") is None, timeout=WAIT_MS)
 
 
 @pytest.fixture
@@ -821,12 +826,13 @@ def real_rig(worker, tmp_path):
     from tests.test_chapter_navigation import PAGE_URL, make_handler, page
     from tests.test_chapter_navigation import resolver as generic_resolver
 
-    html = page('<a href="/novela/x/capitulo-6/">Siguiente</a>')
+    pages = {PAGE_URL: page('<a href="/novela/x/capitulo-6/">Siguiente</a>'),
+             OTHER_WORK_URL: page('<a href="/otra/y/capitulo-2/">Siguiente</a>')}
     holder = {}
 
     async def build():
         fetcher = SafeFetcher(resolver=generic_resolver,
-                              transport=httpx.MockTransport(make_handler({PAGE_URL: html})))
+                              transport=httpx.MockTransport(make_handler(pages)))
         holder["fetcher"] = fetcher
         return ControllerRig(tmp_path / "real.db", fetcher=fetcher, opener=open_source)
 
@@ -840,6 +846,9 @@ def real_rig(worker, tmp_path):
             await holder["fetcher"].aclose()
 
     worker.submit(close()).result(timeout=3)
+
+
+OTHER_WORK_URL = "https://lector.example/otra/y/capitulo-1/"  # otra obra del mismo host
 
 
 def test_prefix_correction_end_to_end_with_real_controller(qtbot, worker, real_rig, tmp_path):
@@ -857,19 +866,26 @@ def test_prefix_correction_end_to_end_with_real_controller(qtbot, worker, real_r
     assert window.preview.prefix_edit.text() == HOST + "/novela/x/"
     assert real_rig.ctl.state is SessionState.IDLE  # espera la confirmación
 
-    window.preview.prefix_edit.setText(HOST + "/novela/z/")
+    window.preview.prefix_edit.setText(HOST + "/novela")
     window.read_button.click()
 
     qtbot.waitUntil(lambda: bool(real_rig.edge.calls), timeout=WAIT_MS)  # ya lee
     host = HOST.split("://", 1)[1]
-    assert real_rig.settings.get("work_prefix_overrides") == {host: "/novela/z/"}
-    doc_id = doc_id_for_url(host + "/novela/z/")
-    assert real_rig.repos.documents.get(doc_id).work_prefix == HOST + "/novela/z/"
-    assert window.preview.next_label.text() == "Siguiente detectado: ninguno"
+    assert real_rig.settings.get("work_prefix_overrides") == {host: ["/novela/"]}
+    doc_id = doc_id_for_url(host + "/novela/")
+    assert real_rig.repos.documents.get(doc_id).work_prefix == HOST + "/novela/"
+    assert window.preview.next_label.text() == (
+        "Siguiente detectado: https://lector.example/novela/x/capitulo-6/"
+    )
+    wrong_id = doc_id_for_url(host + "/novela/x/")
+    qtbot.waitUntil(lambda: real_rig.repos.documents.get(wrong_id) is None, timeout=WAIT_MS)
 
-    # La corrección se usa en la siguiente apertura de esa web.
+    # La corrección se usa en la siguiente apertura de esa obra...
     doc, _, _ = worker.submit(real_rig.ctl.open(PAGE_URL)).result(timeout=2)
-    assert doc.work_prefix == HOST + "/novela/z/" and doc.doc_id == doc_id
+    assert doc.work_prefix == HOST + "/novela/" and doc.doc_id == doc_id
+    # ...pero no en otra obra del mismo host.
+    other, _, _ = worker.submit(real_rig.ctl.open(OTHER_WORK_URL)).result(timeout=2)
+    assert other.work_prefix == HOST + "/otra/y/"
 
 
 # --- Fix round 1: novela abierta desde su índice (§4) -------------------------------------------
@@ -1180,3 +1196,296 @@ def test_choice_panel_cleared_when_opening_even_without_reading(qtbot, make_wind
     qtbot.waitUntil(lambda: window.preview.isVisible(), timeout=WAIT_MS)
     assert window.choice_panel.isHidden()
     assert not any(c[0] == "play" for c in ctl.calls)
+
+
+# --- Fix round 2: «Leer» y el usuario se va (sin confirmar) -------------------------------------
+
+STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
+
+
+def leave(window, monkeypatch, how: str) -> None:
+    """El usuario se va al juego: a la bandeja, minimiza o la app pierde el foco."""
+    if how == "hidden":
+        window.close()
+    elif how == "minimized":
+        window.showMinimized()
+    else:
+        monkeypatch.setattr(window, "isActiveWindow", lambda: False)
+        monkeypatch.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        QApplication.instance().applicationStateChanged.emit(Qt.ApplicationState.ApplicationInactive)
+
+
+def detected_start(kind: str):
+    return None if kind == "generic" else Position(0, URL, 0, 0, 0, None)
+
+
+def open_for(kind: str):
+    if kind == "generic":
+        return generic_doc(), URL
+    return make_doc(index_page=True), "https://example.com/novela/"
+
+
+@pytest.mark.parametrize("how", ["hidden", "inactive", "minimized"])
+@pytest.mark.parametrize("kind", ["generic", "work_page"])
+def test_leer_then_user_leaves_before_open_returns(qtbot, make_window, ctl, monkeypatch, how, kind):
+    doc, locator = open_for(kind)
+    ctl.open_result = (doc, make_chapter(), None)
+    ctl.open_block_s = 0.3
+    window = make_window(show=True)
+
+    read(qtbot, window, locator)
+    leave(window, monkeypatch, how)
+
+    _, doc_id, start = wait_call(qtbot, ctl, "play")
+    assert (doc_id, start) == (doc.doc_id, detected_start(kind))
+    assert window.notice_label.text() == STARTED_TEXT
+    assert not window.preview.needs_confirmation()
+
+
+@pytest.mark.parametrize("how", ["hidden", "inactive", "minimized"])
+@pytest.mark.parametrize("kind", ["generic", "work_page"])
+def test_pending_confirmation_auto_confirms_when_user_leaves(qtbot, make_window, ctl, monkeypatch,
+                                                              how, kind):
+    doc, locator = open_for(kind)
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window, locator)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    if kind == "work_page":
+        window.preview.chapter_list.setCurrentRow(2)  # lo detectado manda: el capítulo 1
+    else:
+        window.preview.prefix_edit.setText("https://example.com/")  # lo detectado manda
+
+    leave(window, monkeypatch, how)
+
+    _, doc_id, start = wait_call(qtbot, ctl, "play")
+    assert (doc_id, start) == (doc.doc_id, detected_start(kind))
+    assert [c[0] for c in ctl.calls] == ["open", "play"]
+    assert window.notice_label.text() == STARTED_TEXT
+
+
+def test_own_dialog_taking_focus_is_not_leaving(qtbot, make_window, ctl, monkeypatch):
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    window.history_action.trigger()  # el historial (de la app) toma el foco
+    monkeypatch.setattr(window, "isActiveWindow", lambda: False)
+    monkeypatch.setattr(QApplication, "activeWindow", staticmethod(lambda: window.history_dialog))
+    QApplication.instance().applicationStateChanged.emit(Qt.ApplicationState.ApplicationInactive)
+
+    qtbot.wait(600)
+
+    assert [c[0] for c in ctl.calls] == ["open"]
+    assert window.preview.needs_confirmation()
+
+
+def test_open_file_without_leer_never_auto_confirms(qtbot, make_window, ctl, monkeypatch):
+    """Solo «Leer» pide leer: abrir un archivo para verlo no empieza aunque el usuario se vaya."""
+    from lector.ui import main_window as mw
+
+    ctl.open_result = (make_doc(index_page=True), make_chapter(), None)
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: ("/tmp/libro.epub", "")))
+    window = make_window(show=True)
+    window.open_file_button.click()
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+
+    window.close()
+
+    qtbot.wait(300)
+    assert [c[0] for c in ctl.calls] == ["open"]
+
+
+def test_resume_dialog_continues_when_app_loses_focus(qtbot, make_window, ctl, monkeypatch):
+    doc = make_doc()
+    ctl.open_result = (doc, make_chapter(), make_progress(doc))
+    window = make_window(show=True)
+    read(qtbot, window)
+    dialog = wait_dialog(qtbot, window)
+
+    leave(window, monkeypatch, "inactive")  # alt-tab al juego, sin minimizar
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert not dialog.isVisible()
+    assert window.notice_label.text() == "Se sigue leyendo donde lo dejaste."
+
+
+def test_resume_dialog_without_auto_continue_stays_when_app_loses_focus(qtbot, make_window, ctl,
+                                                                        monkeypatch):
+    doc = make_doc()
+    window = make_window(show=True)
+    window.offer_resume(doc, make_progress(doc), auto_continue_when_hidden=False)
+    dialog = wait_dialog(qtbot, window)
+
+    leave(window, monkeypatch, "inactive")
+
+    qtbot.wait(600)
+    assert ctl.calls == [] and dialog.isVisible()
+
+
+def test_app_focus_back_before_the_check_is_not_leaving(qtbot, make_window, ctl, monkeypatch):
+    """Un parpadeo del foco (inactiva y activa enseguida) no cuenta como irse."""
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    app = QApplication.instance()
+    with monkeypatch.context() as away:  # sin foco solo un instante
+        away.setattr(window, "isActiveWindow", lambda: False)
+        away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        app.applicationStateChanged.emit(Qt.ApplicationState.ApplicationInactive)
+    app.applicationStateChanged.emit(Qt.ApplicationState.ApplicationActive)
+
+    qtbot.wait(600)
+
+    assert [c[0] for c in ctl.calls] == ["open"]
+
+
+# --- Fix round 2: prefijo (normalización y borrado) ----------------------------------------------
+
+
+def test_same_prefix_without_slash_is_a_no_op(qtbot, make_window, ctl, conn):
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText("https://example.com/novela")
+    window.read_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-g", None)
+    assert [c[0] for c in ctl.calls] == ["open", "play"]  # sin reabrir
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {}
+
+
+def test_clearing_the_prefix_removes_the_override_for_that_work(qtbot, make_window, ctl, conn):
+    SettingsRepo(conn).set("work_prefix_overrides", {"example.com": ["/novela/", "/otra/"]})
+    detected = generic_doc("doc-detectado", "https://example.com/novela/capitulo-1/")
+    ctl.open_result = [(generic_doc(), make_chapter(), None), (detected, make_chapter(), None)]
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText("")
+    window.read_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-detectado", None)
+    assert [c[0] for c in ctl.calls] == ["open", "open", "play"]
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": ["/otra/"]}
+
+
+def test_corrected_prefix_keeps_wrong_document_if_it_has_progress(qtbot, make_window, ctl, conn):
+    wrong = generic_doc()
+    DocumentRepo(conn).upsert(wrong, None, None, None)
+    record = make_progress(make_doc())
+    record.doc_id = wrong.doc_id
+    ProgressRepo(conn).save(record)
+    corrected = generic_doc("doc-corregido", "https://example.com/")
+    ctl.open_result = [(wrong, make_chapter(), None), (corrected, make_chapter(), None)]
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText("https://example.com/")
+    window.read_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-corregido", None)
+    qtbot.wait(200)
+    assert DocumentRepo(conn).get("doc-g") is not None
+
+
+def test_clearing_prefix_without_saved_override_keeps_the_same_document(qtbot, make_window, ctl,
+                                                                       conn):
+    doc = generic_doc()
+    DocumentRepo(conn).upsert(doc, None, None, None)
+    ctl.open_result = (doc, make_chapter(), None)  # sin corrección guardada: lo mismo
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText("")
+    window.read_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-g", None)
+    qtbot.wait(200)
+    assert DocumentRepo(conn).get("doc-g") is not None  # es el que se lee: no se borra
+
+
+# --- Fix round 2: índice tras parar, reapertura caducada y pausa ---------------------------------
+
+
+@pytest.mark.parametrize("ended", ["stopped", "completed", "needs_attention", "error"])
+def test_leer_on_work_page_after_session_ends_continues(qtbot, make_window, ctl, ended):
+    doc = make_doc(index_page=True)
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window, "https://example.com/novela/")
+    qtbot.waitUntil(lambda: window.preview.chapter_list.isVisible(), timeout=WAIT_MS)
+    window.read_button.click()
+    wait_call(qtbot, ctl, "play", "doc-1", Position(0, URL, 0, 0, 0, None))
+    assert not window.preview.needs_confirmation()
+    assert window.preview.chapter_list.isHidden()
+    bridge = window.test_bridge
+    bridge.document_sig.emit(doc, make_chapter(URL3, "Capítulo 3"))  # ya va por el capítulo 3
+    bridge.session_state_sig.emit("reading")
+    bridge.session_state_sig.emit(ended)
+    ctl.calls.clear()
+
+    window.read_button.click()  # misma URL en el campo
+
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)  # sigue donde iba
+
+
+def test_history_pick_wins_over_prefix_reopen_in_flight(qtbot, make_window, ctl):
+    corrected = generic_doc("doc-corregido", "https://example.com/")
+    ctl.open_result = [(generic_doc(), make_chapter(), None), (corrected, make_chapter(), None)]
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+    ctl.open_block_s = 0.4
+    window.preview.prefix_edit.setText("https://example.com/")
+    window.read_button.click()
+    wait_call(qtbot, ctl, "open")
+    qtbot.waitUntil(lambda: len([c for c in ctl.calls if c[0] == "open"]) == 2, timeout=WAIT_MS)
+
+    window._open_from_history(make_doc(doc_id="hist", kind=SourceKind.EPUB), None, None)
+
+    wait_call(qtbot, ctl, "play", "hist", None)
+    qtbot.wait(700)  # la reapertura termina después: se descarta
+    assert [c for c in ctl.calls if c[0] == "play"] == [("play", "hist", None)]
+    assert window.read_button.isEnabled()
+
+
+def test_pause_allowed_while_play_is_pending(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(), make_chapter(), None)
+    ctl.play_gate = threading.Event()
+    window = make_window(show=True)
+    try:
+        read(qtbot, window)
+        wait_call(qtbot, ctl, "play")
+        window.test_bridge.session_state_sig.emit("loading")
+        window.controls.play_pause_button.click()
+        wait_call(qtbot, ctl, "pause")
+        window.read_button.click()  # un segundo play sigue bloqueado
+        qtbot.wait(100)
+        assert [c[0] for c in ctl.calls].count("play") == 1
+    finally:
+        ctl.play_gate.set()
+
+
+def test_window_losing_activation_to_another_app_auto_confirms(qtbot, make_window, ctl,
+                                                               monkeypatch):
+    """Sin aviso de la app (p. ej. algunas plataformas): basta con que la ventana pierda el foco."""
+    from PySide6.QtCore import QEvent
+
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.needs_confirmation(), timeout=WAIT_MS)
+    monkeypatch.setattr(window, "isActiveWindow", lambda: False)
+    monkeypatch.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+
+    wait_call(qtbot, ctl, "play", "doc-g", None)
+    assert window.notice_label.text() == STARTED_TEXT

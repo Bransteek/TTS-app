@@ -4,11 +4,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import Any
 
 from lector.content.base import ContentSource
 from lector.content.epub_source import EpubSource
-from lector.content.generic_web import GenericWebSource
+from lector.content.generic_web import GenericWebSource, prefix_override_for
 from lector.content.madara import MadaraSource, is_madara
 from lector.content.pdf_source import PdfSource
 from lector.errors import DamagedDocument
@@ -27,12 +27,13 @@ def _require_file(locator: str) -> None:
 
 
 async def open_source(
-    locator: str, fetcher: SafeFetcher, *, prefix_overrides: Mapping[str, str] | None = None
+    locator: str, fetcher: SafeFetcher, *, prefix_overrides: Mapping[str, Any] | None = None
 ) -> tuple[ContentSource, Document, Chapter]:
     """Abre `locator` con el adaptador que le toca.
 
-    `prefix_overrides` ({host: "/ruta/"}) es el prefijo de obra corregido por el
-    usuario para webs genéricas (§5.2); Madara, PDF y EPUB lo ignoran.
+    `prefix_overrides` ({host: ["/ruta/", …]}) son los prefijos de obra corregidos por
+    el usuario para webs genéricas (§5.2): se aplica el que contiene la URL. Madara,
+    PDF y EPUB los ignoran.
     """
     lowered = locator.strip().lower()
     source: ContentSource
@@ -51,8 +52,7 @@ async def open_source(
         if is_madara(result.text):
             source = MadaraSource(fetcher)
         else:
-            host = urlsplit(url).netloc.lower()
-            override = (prefix_overrides or {}).get(host)
+            override = prefix_override_for(prefix_overrides, url)
             source = GenericWebSource(fetcher, work_prefix_override=override)
         document, chapter = await source.open(url, prefetched_html=result.text)
     return source, document, chapter

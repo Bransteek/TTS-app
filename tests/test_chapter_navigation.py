@@ -280,3 +280,53 @@ async def test_open_reports_generic_adapter():
         await fetcher.aclose()
     assert doc.adapter == "generic"
     assert doc.index_page is False
+
+
+# --- prefijos corregidos por el usuario (§5.2), por obra dentro de un host ---------------
+
+
+def test_prefix_override_applies_only_under_its_prefix():
+    from lector.content.generic_web import prefix_override_for
+
+    overrides = {"lector.example": ["/novela/", "/novela/x/"], "otra.example": ["/a/"]}
+    assert prefix_override_for(overrides, f"{HOST}/novela/x/capitulo-5/") == "/novela/x/"  # la más larga
+    assert prefix_override_for(overrides, f"{HOST}/novela/y/capitulo-1/") == "/novela/"
+    assert prefix_override_for(overrides, f"{HOST}/otra/z/capitulo-1/") is None  # otra obra
+    assert prefix_override_for(overrides, "https://LECTOR.example/novela/x/") == "/novela/x/"
+    assert prefix_override_for({}, PAGE_URL) is None
+    assert prefix_override_for(None, PAGE_URL) is None
+
+
+def test_prefix_override_reads_old_single_string_format():
+    from lector.content.generic_web import prefix_override_for, set_prefix_override
+
+    old = {"lector.example": "/novela/x/"}
+    assert prefix_override_for(old, PAGE_URL) == "/novela/x/"
+    assert prefix_override_for(old, f"{HOST}/otra/capitulo-1/") is None
+    assert set_prefix_override(old, f"{HOST}/otra/capitulo-1/", "/otra/") == {
+        "lector.example": ["/novela/x/", "/otra/"],
+    }
+
+
+def test_set_prefix_override_replaces_the_one_for_that_work_and_clears():
+    from lector.content.generic_web import set_prefix_override
+
+    start = {"lector.example": ["/novela/", "/otra/"]}
+    changed = set_prefix_override(start, PAGE_URL, "/novela/x/")
+    assert changed == {"lector.example": ["/otra/", "/novela/x/"]}  # la de esta obra se sustituye
+    assert start == {"lector.example": ["/novela/", "/otra/"]}  # no muta la entrada
+    assert set_prefix_override(changed, PAGE_URL, "/novela/x/") == changed  # sin duplicados
+    cleared = set_prefix_override(changed, PAGE_URL, None)
+    assert cleared == {"lector.example": ["/otra/"]}
+    assert set_prefix_override(cleared, f"{HOST}/otra/c-1/", None) == {}  # host sin prefijos
+
+
+async def test_doc_id_ignores_host_case():
+    fetcher, source = await make_source({})
+    try:
+        upper = PAGE_URL.replace("lector.example", "Lector.EXAMPLE")
+        doc, _ = await source.open(upper, prefetched_html=read("text_next.html"))
+    finally:
+        await fetcher.aclose()
+    assert doc.doc_id == doc_id_for_url("lector.example/novela/x/")
+    assert doc.work_prefix == HOST + PREFIX

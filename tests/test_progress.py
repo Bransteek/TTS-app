@@ -249,3 +249,25 @@ def test_chapter_title_lookup(conn):
     repo.save("doc1", ch, False)  # el título se guarda aunque no se guarde el texto
     assert repo.title("doc1", ch.ref.locator) == "Uno"
     assert repo.title("doc1", "otro") is None
+
+
+def test_delete_if_unread_removes_document_and_chapters(conn):
+    docs, chapters, progress = DocumentRepo(conn), ChapterRepo(conn), ProgressRepo(conn)
+    doc = make_doc()
+    docs.upsert(doc, None, None, None)
+    chapters.save(doc.doc_id, make_chapter(), True)
+
+    assert docs.delete_if_unread(doc.doc_id) is True
+
+    assert docs.get(doc.doc_id) is None
+    assert chapters.title(doc.doc_id, make_chapter().ref.locator) is None
+
+
+def test_delete_if_unread_keeps_documents_with_progress(conn):
+    docs, progress = DocumentRepo(conn), ProgressRepo(conn)
+    doc = make_doc()
+    docs.upsert(doc, None, None, None)
+    progress.save(make_record(doc_id=doc.doc_id))
+
+    assert docs.delete_if_unread(doc.doc_id) is False
+    assert docs.get(doc.doc_id) is not None

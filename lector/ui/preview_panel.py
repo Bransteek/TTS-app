@@ -24,12 +24,17 @@ HINT_PREFIX = "Revisa el prefijo de la obra y pulsa «Leer» para empezar."
 HINT_CHAPTER = "Elige el capítulo y pulsa «Leer» para empezar."
 PREFIX_NEEDS_URL = "Escribe el prefijo como una dirección completa, por ejemplo https://{host}/novela/."
 PREFIX_OTHER_HOST = "El prefijo tiene que ser de la misma web ({host})."
+PREFIX_NOT_ABOVE = (
+    "El capítulo abierto no está dentro de ese prefijo. Usa una parte del principio de su "
+    "dirección, por ejemplo {example}."
+)
 
 
-def validate_prefix(text: str, origin: str) -> tuple[str | None, str | None]:
+def validate_prefix(text: str, origin: str, chapter_url: str) -> tuple[str | None, str | None]:
     """Comprueba el prefijo escrito: devuelve (ruta «/…/», None) o (None, mensaje para el usuario).
 
-    Tiene que ser una dirección http(s) completa de la misma web que el documento.
+    Tiene que ser una dirección http(s) completa de la misma web que el documento, y el
+    capítulo abierto (`chapter_url`) tiene que estar dentro de ella.
     """
     host = urlsplit(origin).netloc.lower()
     parts = urlsplit(text.strip())
@@ -37,10 +42,20 @@ def validate_prefix(text: str, origin: str) -> tuple[str | None, str | None]:
         return None, PREFIX_NEEDS_URL.format(host=host)
     if parts.netloc.lower() != host:
         return None, PREFIX_OTHER_HOST.format(host=host)
-    path = parts.path or "/"
-    if not path.endswith("/"):
-        path += "/"
+    path = _with_slash(parts.path or "/")
+    chapter = urlsplit(chapter_url)
+    if not _with_slash(chapter.path or "/").startswith(path):
+        example = f"{chapter.scheme}://{host}{_parent(chapter.path)}"
+        return None, PREFIX_NOT_ABOVE.format(example=example)
     return path, None
+
+
+def _with_slash(path: str) -> str:
+    return path if path.endswith("/") else path + "/"
+
+
+def _parent(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[0] + "/"
 
 
 def next_text(chapter: Chapter) -> str:
@@ -167,6 +182,12 @@ class PreviewPanel(QFrame):
         if not 0 <= row < len(self._doc.chapters):
             return None
         return row, self._doc.chapters[row]
+
+    def settle(self) -> None:
+        """Ya se lee: quita el prefijo, la lista de capítulos, la pista y el error."""
+        for widget in (self.prefix_label, self.prefix_edit, self.prefix_error_label,
+                       self.chapter_list_label, self.chapter_list, self.hint_label):
+            widget.hide()
 
     def needs_confirmation(self) -> bool:
         """True mientras la vista previa espera que el usuario revise y pulse «Leer»."""

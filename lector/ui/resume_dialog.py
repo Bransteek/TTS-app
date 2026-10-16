@@ -178,6 +178,8 @@ class ResumeOffer(QObject):
       se continúa sin diálogo; sin él, la oferta queda pendiente hasta `window_shown()`.
     - Si la ventana se va con el diálogo abierto (`window_hidden()`), igual: se continúa
       o la oferta vuelve a quedar pendiente.
+    - Si la app pierde el foco con el diálogo abierto (`window_deactivated()`), se continúa
+      solo con `auto_continue`; si no, el diálogo se queda.
 
     `apply(doc, progress, choice)` hace la elección; `on_continued()` avisa de que se
     continuó sin preguntar.
@@ -223,6 +225,15 @@ class ResumeOffer(QObject):
             self._continue(offer)
         else:
             self._pending = offer
+
+    def window_deactivated(self) -> None:
+        """La app perdió el foco (p. ej. alt-tab al juego) con la ventana a la vista.
+
+        Con `auto_continue` se continúa como al ocultarla; sin él, el diálogo sigue ahí.
+        """
+        offer = self._showing
+        if offer is not None and offer.auto_continue:
+            self.window_hidden()
 
     def window_shown(self) -> None:
         if self._pending is not None:

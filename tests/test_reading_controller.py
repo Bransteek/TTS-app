@@ -857,26 +857,37 @@ async def test_locate_page_finds_first_sentence_of_that_page(controller_rig, mak
     assert await asyncio.wait_for(rig.ctl.locate_page("otro-doc", 2), WAIT_S) is None
 
 
-async def test_open_applies_saved_prefix_override_for_the_host(controller_rig):
-    """§5.2: la corrección del prefijo se recuerda para ese host y se aplica al abrir."""
+async def test_open_applies_saved_prefix_override_only_to_its_work(controller_rig):
+    """§5.2: la corrección se recuerda para esa obra del host; otra obra del mismo host no cambia."""
     from tests.test_chapter_navigation import HOST, PAGE_URL, make_handler, page
     from tests.test_chapter_navigation import resolver as generic_resolver
 
-    html = page('<a href="/novela/x/capitulo-6/">Siguiente</a>')
+    other = f"{HOST}/otra/y/capitulo-1/"
+    pages = {PAGE_URL: page('<a href="/novela/x/capitulo-6/">Siguiente</a>'),
+             other: page('<a href="/otra/y/capitulo-2/">Siguiente</a>')}
     fetcher = SafeFetcher(resolver=generic_resolver,
-                          transport=httpx.MockTransport(make_handler({PAGE_URL: html})))
+                          transport=httpx.MockTransport(make_handler(pages)))
     try:
         rig = controller_rig(fetcher=fetcher)
+        doc_y0, _, _ = await asyncio.wait_for(rig.ctl.open(other), WAIT_S)
         doc, _, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
         assert doc.work_prefix == HOST + "/novela/x/"
         host = HOST.split("://", 1)[1]
-        rig.settings.set("work_prefix_overrides", {host: "/novela/z/"})
+        rig.settings.set("work_prefix_overrides", {host: ["/novela/"]})
 
-        doc, chapter, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
+        doc_x, chapter_x, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
+        doc_y, chapter_y, _ = await asyncio.wait_for(rig.ctl.open(other), WAIT_S)
 
-        assert doc.work_prefix == HOST + "/novela/z/"
-        assert doc.doc_id == doc_id_for_url(host + "/novela/z/")
-        assert chapter.next_ref is None  # el «siguiente» queda fuera del prefijo corregido
+        assert doc_x.work_prefix == HOST + "/novela/"
+        assert doc_x.doc_id == doc_id_for_url(host + "/novela/")
+        assert chapter_x.next_ref.locator == f"{HOST}/novela/x/capitulo-6/"
+        assert (doc_y.doc_id, doc_y.work_prefix) == (doc_y0.doc_id, doc_y0.work_prefix)
+        assert doc_y.doc_id != doc_x.doc_id
+        assert chapter_y.next_ref.locator == f"{HOST}/otra/y/capitulo-2/"
+
+        rig.settings.set("work_prefix_overrides", {host: "/novela/"})  # formato antiguo
+        doc_old, _, _ = await asyncio.wait_for(rig.ctl.open(PAGE_URL), WAIT_S)
+        assert doc_old.work_prefix == HOST + "/novela/"
         await rig.close()
     finally:
         await fetcher.aclose()

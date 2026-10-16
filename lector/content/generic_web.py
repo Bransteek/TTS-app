@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 import lxml.html
@@ -81,6 +83,52 @@ def _without_chrome(html: str) -> str:
 
 def _with_slash(path: str) -> str:
     return path if path.endswith("/") else path + "/"
+
+
+# --- Prefijos de obra corregidos por el usuario (§5.2) ------------------------------------
+# Se guardan por host como lista de rutas: {"example.com": ["/novela/x/", "/otra/"]}.
+# Cada ruta es la corrección de una obra; el formato antiguo {host: "/ruta/"} se lee
+# como una lista de un elemento.
+
+
+def _host_prefixes(overrides: Mapping[str, Any] | None, host: str) -> list[str]:
+    value = (overrides or {}).get(host)
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [_with_slash(p) for p in value if isinstance(p, str) and p.startswith("/")]
+
+
+def _under(url_path: str, prefix: str) -> bool:
+    return _with_slash(url_path or "/").startswith(prefix)
+
+
+def prefix_override_for(overrides: Mapping[str, Any] | None, url: str) -> str | None:
+    """Prefijo corregido que corresponde a `url`: el más largo que la contiene, o None."""
+    parts = urlsplit(url)
+    matches = [p for p in _host_prefixes(overrides, parts.netloc.lower()) if _under(parts.path, p)]
+    return max(matches, key=len, default=None)
+
+
+def set_prefix_override(
+    overrides: Mapping[str, Any] | None, url: str, prefix: str | None
+) -> dict[str, list[str]]:
+    """Copia de `overrides` donde la obra de `url` usa `prefix` (None: vuelve a la detección).
+
+    Se quitan las correcciones anteriores que contenían `url` (eran de esta obra).
+    """
+    parts = urlsplit(url)
+    host = parts.netloc.lower()
+    out = {h: _host_prefixes(overrides, h) for h in (overrides or {})}
+    kept = [p for p in out.get(host, []) if not _under(parts.path, p)]
+    if prefix is not None and _with_slash(prefix) not in kept:
+        kept.append(_with_slash(prefix))
+    if kept:
+        out[host] = kept
+    else:
+        out.pop(host, None)
+    return out
 
 
 def _parent_path(url: str) -> str:
@@ -198,9 +246,10 @@ class GenericWebSource(ContentSource):
             html, url = result.text, result.url
         chapter = self._parse(html, url)
         parts = urlsplit(url)
-        work_url = f"{parts.scheme}://{parts.netloc}{self._prefix}"
+        host = parts.netloc.lower()  # «Example.com» y «example.com» son la misma obra
+        work_url = f"{parts.scheme}://{host}{self._prefix}"
         document = Document(
-            doc_id=doc_id_for_url(parts.netloc + self._prefix),
+            doc_id=doc_id_for_url(host + self._prefix),
             kind=SourceKind.URL,
             origin=work_url,
             title=chapter.title,

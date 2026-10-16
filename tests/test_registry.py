@@ -89,11 +89,23 @@ async def test_missing_file_message(name, tmp_path):
 
 
 async def test_generic_source_gets_prefix_override_for_its_host(stub_adapters):
-    overrides = {"example.com": "/obras/x/", "otra.example": "/no/"}
+    overrides = {"example.com": "/obras/x/", "otra.example": "/no/"}  # formato antiguo
     source, _, _ = await open_source(
-        "https://Example.com/c/1", FakeFetcher(PLAIN), prefix_overrides=overrides
+        "https://Example.com/obras/x/c/1", FakeFetcher(PLAIN), prefix_overrides=overrides
     )
     assert isinstance(source, GenericWebSource)
     assert source._override == "/obras/x/"
-    source, _, _ = await open_source("https://example.com/c/1", FakeFetcher(PLAIN))
+    source, _, _ = await open_source("https://example.com/obras/x/c/1", FakeFetcher(PLAIN))
     assert source._override is None
+
+
+async def test_prefix_override_only_for_the_work_it_belongs_to(stub_adapters):
+    overrides = {"example.com": ["/obras/x/"]}
+    source, _, _ = await open_source(
+        "https://example.com/obras/x/cap-1", FakeFetcher(PLAIN), prefix_overrides=overrides
+    )
+    assert source._override == "/obras/x/"
+    source, _, _ = await open_source(
+        "https://example.com/obras/y/cap-1", FakeFetcher(PLAIN), prefix_overrides=overrides
+    )
+    assert source._override is None  # otra obra del mismo host: detección normal
