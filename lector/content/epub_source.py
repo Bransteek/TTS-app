@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import posixpath
 import re
 import zipfile
 from dataclasses import dataclass
+from html.entities import name2codepoint
 from pathlib import Path
 from urllib.parse import unquote, urldefrag
 
@@ -24,7 +26,10 @@ _DROPPED = {"script", "style", "rt", "rp"}
 _BLOCKS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote"}
 _HEADINGS = ("h1", "h2", "h3")
 _CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+_HTML_TYPES = {"application/xhtml+xml", "text/html"}
 _NCX_MIME = "application/x-dtbncx+xml"
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,6 +79,12 @@ def _resolve(base_dir: str, href: str) -> str:
     return posixpath.normpath(posixpath.join(base_dir, path))
 
 
+def _entity_text(raw: str | None) -> str:
+    """«&nbsp;» -> carácter; las entidades desconocidas (p. ej. externas) se vuelven un espacio."""
+    code = name2codepoint.get((raw or "").strip("&;"))
+    return chr(code) if code is not None else " "
+
+
 def _own_text(element) -> str:
     """Texto del elemento sin rt/rp/script/style ni entidades sin resolver."""
     parts: list[str] = []
@@ -84,8 +95,12 @@ def _own_text(element) -> str:
         if node.text:
             parts.append(node.text)
         for child in node:
-            if isinstance(child.tag, str):  # ignora comentarios, PI y entidades
+            if isinstance(child.tag, str):
+                if _local(child) == "br":
+                    parts.append(" ")
                 walk(child)
+            elif child.tag is etree.Entity:
+                parts.append(_entity_text(child.text))
             if child.tail:
                 parts.append(child.tail)
 
@@ -187,13 +202,21 @@ def _read_epub(path: Path) -> tuple[str, list[_Section]]:
             elif name == "title" and not title:
                 title = _own_text(element)
 
+        names = set(archive.namelist())
         titles = _toc_titles(archive, opf_dir, manifest)
         sections: list[_Section] = []
         for idref in spine:
             item = manifest.get(idref)
-            if item is None:
+            if item is None or item["type"] not in _HTML_TYPES:
                 continue
-            root = _parse_xml(_read_member(archive, item["path"]))
+            if item["path"] not in names:
+                log.warning("EPUB: falta el miembro %s del spine; se omite", item["path"])
+                continue
+            try:
+                root = _parse_xml(_read_member(archive, item["path"]))
+            except DamagedDocument:
+                log.warning("EPUB: no se pudo leer %s; se omite", item["path"])
+                continue
             paragraphs = _paragraphs(root)
             if sum(len(p) for p in paragraphs) < _MIN_TEXT_CHARS:
                 continue  # páginas de ilustraciones

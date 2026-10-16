@@ -1,14 +1,27 @@
 """Selección automática del adaptador de contenido según la entrada."""
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from lector.content.base import ContentSource
 from lector.content.epub_source import EpubSource
 from lector.content.generic_web import GenericWebSource
 from lector.content.madara import MadaraSource, is_madara
 from lector.content.pdf_source import PdfSource
+from lector.errors import DamagedDocument
 from lector.models import Chapter, Document
 from lector.security.http_client import SafeFetcher
 from lector.security.url_validator import validate_url
+
+
+_HAS_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+_MISSING_FILE = "No se encontró el archivo. Comprueba que sigue en su sitio."
+
+
+def _require_file(locator: str) -> None:
+    if not Path(locator).expanduser().is_file():
+        raise DamagedDocument(_MISSING_FILE)
 
 
 async def open_source(
@@ -16,10 +29,13 @@ async def open_source(
 ) -> tuple[ContentSource, Document, Chapter]:
     lowered = locator.strip().lower()
     source: ContentSource
-    if lowered.endswith(".pdf"):
+    is_url = bool(_HAS_SCHEME.match(lowered))
+    if not is_url and lowered.endswith(".pdf"):
+        _require_file(locator.strip())
         source = PdfSource()
         document, chapter = await source.open(locator.strip())
-    elif lowered.endswith(".epub"):
+    elif not is_url and lowered.endswith(".epub"):
+        _require_file(locator.strip())
         source = EpubSource()
         document, chapter = await source.open(locator.strip())
     else:

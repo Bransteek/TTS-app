@@ -120,3 +120,56 @@ async def test_load_chapter_before_open(make_epub):
 
     with pytest.raises(DamagedDocument):
         await EpubSource().load_chapter(ChapterRef(0, "x", "spine:a"))
+
+
+XHTML_DTD = (
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+    '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+)
+
+
+@pytest.mark.parametrize("doctype", ["", XHTML_DTD])
+async def test_whitespace_and_named_entities(make_epub, doctype):
+    body = "<p>uno&nbsp;dos&mdash;tres<br/>cuatro&hellip; &iquest;qu&eacute;?</p>"
+    path = make_epub(chapters=[("a.xhtml", body + para("Pad"))], doctype=doctype)
+    _, chapter = await EpubSource().open(str(path))
+    assert chapter.paragraphs[0].text == "uno dos—tres cuatro… ¿qué?"
+
+
+async def test_bad_spine_items_skipped(make_epub, caplog):
+    import zipfile
+
+    path = make_epub(
+        chapters=[("a.xhtml", para("Uno")), ("gone.xhtml", para("X")), ("b.xhtml", para("Dos"))]
+    )
+    # Reescribe el zip sin gone.xhtml y con un item de imagen en el spine.
+    out = path.with_name("roto.epub")
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(out, "w") as dst:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename.endswith("gone.xhtml"):
+                continue
+            if info.filename.endswith("content.opf"):
+                data = data.replace(
+                    b'href="b.xhtml" media-type="application/xhtml+xml"',
+                    b'href="b.xhtml" media-type="application/xhtml+xml"/><item id="img" '
+                    b'href="i.png" media-type="image/png"',
+                ).replace(b"</spine>", b'<itemref idref="img"/></spine>')
+            dst.writestr(info.filename, data)
+    with caplog.at_level("WARNING"):
+        doc, _ = await EpubSource().open(str(out))
+    assert [c.title for c in doc.chapters] == ["Sección 1", "Sección 2"]
+    assert "gone.xhtml" in caplog.text
+
+
+async def test_all_spine_items_unreadable_is_damaged(make_epub):
+    import zipfile
+
+    path = make_epub(chapters=[("a.xhtml", para("Uno"))])
+    out = path.with_name("vacio.epub")
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(out, "w") as dst:
+        for info in src.infolist():
+            if not info.filename.endswith("a.xhtml"):
+                dst.writestr(info.filename, src.read(info.filename))
+    with pytest.raises(DamagedDocument):
+        await EpubSource().open(str(out))

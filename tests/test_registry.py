@@ -56,9 +56,11 @@ async def test_picks_generic_otherwise(stub_adapters):
 
 @pytest.mark.parametrize(
     "locator, cls",
-    [("/tmp/a.pdf", PdfSource), ("/tmp/a.PDF", PdfSource), ("/tmp/a.epub", EpubSource), ("C:/x/B.Epub", EpubSource)],
+    [("a.pdf", PdfSource), ("a.PDF", PdfSource), ("a.epub", EpubSource), ("B.Epub", EpubSource)],
 )
-async def test_picks_pdf_and_epub_by_extension(locator, cls, stub_adapters):
+async def test_picks_pdf_and_epub_by_extension(locator, cls, stub_adapters, tmp_path):
+    locator = str(tmp_path / locator)
+    (tmp_path / locator).write_bytes(b"x")
     fetcher = FakeFetcher(PLAIN)
     source, _, _ = await open_source(locator, fetcher)
     assert isinstance(source, cls)
@@ -69,3 +71,18 @@ async def test_picks_pdf_and_epub_by_extension(locator, cls, stub_adapters):
 async def test_invalid_url_raises(bad):
     with pytest.raises(InvalidUrl):
         await open_source(bad, FakeFetcher(PLAIN))
+
+
+async def test_url_ending_in_pdf_takes_web_path(stub_adapters):
+    fetcher = FakeFetcher(PLAIN)
+    source, _, _ = await open_source("https://example.com/libro.PDF", fetcher)
+    assert isinstance(source, GenericWebSource) and len(fetcher.calls) == 1
+
+
+@pytest.mark.parametrize("name", ["falta.pdf", "falta.epub"])
+async def test_missing_file_message(name, tmp_path):
+    from lector.errors import LectorError
+
+    with pytest.raises(LectorError) as info:
+        await open_source(str(tmp_path / name), FakeFetcher(PLAIN))
+    assert info.value.user_message == "No se encontró el archivo. Comprueba que sigue en su sitio."
