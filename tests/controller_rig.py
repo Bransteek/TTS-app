@@ -262,7 +262,9 @@ def story_rig(build, chapters: int = 3, sentences: int = 10, **kwargs):
     content = story(chapters, sentences)
     source = FakeSource(content)
     network = {"online": True}
-    rig = build(opener=fake_opener(source, story_document(content), network), **kwargs)
+    document = story_document(content)
+    rig = build(opener=fake_opener(source, document, network), **kwargs)
     rig.source = source
+    rig.document = document  # lo que devuelve el sitio al abrirlo
     rig.network = network
     return rig

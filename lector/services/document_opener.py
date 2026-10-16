@@ -59,12 +59,16 @@ async def check_file(doc: Document) -> None:
 
 
 class DeferredSource:
-    """Fuente web que se abre de verdad en la primera carga (ver docstring del módulo)."""
+    """Fuente web que se abre de verdad en la primera carga (ver docstring del módulo).
 
-    def __init__(self, opener: SourceOpener, fetcher: Any, origin: str):
+    Al abrirse actualiza `doc` en el sitio (título, URL canónica, lista de capítulos)
+    sin cambiar su identidad (`doc_id`, tipo y origen).
+    """
+
+    def __init__(self, opener: SourceOpener, fetcher: Any, doc: Document):
         self._opener = opener
         self._fetcher = fetcher
-        self._origin = origin
+        self._doc = doc
         self._real: ContentSource | None = None
         self._lock = asyncio.Lock()
 
@@ -75,8 +79,8 @@ class DeferredSource:
         async with self._lock:
             if self._real is None:
                 # Abrir por el capítulo pedido devuelve ese mismo capítulo: una sola descarga.
-                real, _, chapter = await self._opener(ref.locator, self._fetcher)
-                self._real = real
+                real, opened, chapter = await self._opener(ref.locator, self._fetcher)
+                self._opened(real, opened)
                 if ref.index is not None and chapter.ref.index is None:
                     chapter.ref = ChapterRef(ref.index, chapter.ref.title, chapter.ref.locator)
                 return chapter
@@ -85,5 +89,15 @@ class DeferredSource:
     async def list_chapters(self) -> list[ChapterRef]:
         async with self._lock:
             if self._real is None:
-                self._real, _, _ = await self._opener(self._origin, self._fetcher)
+                real, opened, _ = await self._opener(self._doc.origin, self._fetcher)
+                self._opened(real, opened)
         return await self._real.list_chapters()
+
+    def _opened(self, real: ContentSource, opened: Document) -> None:
+        self._real = real
+        doc = self._doc
+        doc.title = opened.title or doc.title
+        doc.canonical_url = opened.canonical_url or doc.canonical_url
+        doc.work_prefix = opened.work_prefix or doc.work_prefix
+        if opened.chapters:
+            doc.chapters = list(opened.chapters)

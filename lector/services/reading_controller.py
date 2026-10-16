@@ -332,10 +332,9 @@ class ReadingController:
                 self._set_state(SessionState.IDLE)
                 raise
             self._em.reset()  # el productor anterior ya está cancelado
-            if self._paused or self._output_failed:
+            if self._paused:
                 self._paused = False
-                self._output_failed = False
-                self._player.resume()  # quita la pausa y reabre la salida si falló
+                self._player.resume()  # quita la pausa (y reabre la salida si falló)
             self._output_retry_used = False
             self._shown_locator = None
             self._mark = None
@@ -601,6 +600,12 @@ class ReadingController:
     # --- Productor ----------------------------------------------------------------------
 
     def _launch(self, launch: _Launch) -> None:
+        if self._output_failed and not self._paused:
+            # La salida cayó sin sesión (COMPLETED, NEEDS_ATTENTION, ERROR…): todo lo
+            # que vuelve a leer la reabre. Si falla otra vez, sigue el camino normal
+            # de on_output_error (un reintento y luego pausa con aviso).
+            self._output_failed = False
+            self._player.resume()
         self._last_launch = launch
         self._next_unqueued = (launch.target, launch.sentence)
         self._end = None
@@ -967,7 +972,7 @@ class ReadingController:
                 raise LectorError(UNKNOWN_DOCUMENT)
             if doc.kind is SourceKind.URL:
                 # Sin red: el texto guardado basta y la fuente real se abre al necesitarla.
-                source = DeferredSource(self._deps.source_opener, self._deps.fetcher, doc.origin)
+                source = DeferredSource(self._deps.source_opener, self._deps.fetcher, doc)
             else:
                 await check_file(doc)
                 source, opened, first = await self._deps.source_opener(doc.origin, self._deps.fetcher)

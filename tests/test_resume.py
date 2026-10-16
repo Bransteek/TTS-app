@@ -60,7 +60,7 @@ async def test_pause_resume_keeps_progress(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(2)  # la 1 sonó entera pero la 2 aún no empezó
 
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     assert rig.ctl.state is S.PAUSED
     record = rig.repos.progress.get(STORY_ID)  # guardado al pausar
     assert record.position.sentence_index == 0
@@ -70,7 +70,7 @@ async def test_pause_resume_keeps_progress(controller_rig):
     assert not silence.any()
     assert rig.events.heard == [0, 1]
 
-    await rig.ctl.resume()
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
     assert rig.ctl.state is S.READING
     await rig.hear(1)
 
@@ -168,6 +168,22 @@ async def test_offline_resume_without_stored_text_waits_for_network(controller_r
     later.network["online"] = True  # vuelve la red
     await later.hear(1)
     assert later.events.heard_at == [("Cap 2", 0)]
+
+
+async def test_deferred_open_refreshes_document_from_site(controller_rig, tmp_path):
+    db = tmp_path / "lector.db"
+    first = story_rig(controller_rig, db_path=db, prefetch_ahead=0)
+    await first.start(story_ref(1).locator)  # solo el capítulo 1 queda guardado
+    await first.stop()
+
+    later = story_rig(controller_rig, db_path=db, prefetch_ahead=0)
+    later.document.title = "Novela (revisada)"  # el sitio cambió el título
+    await later.play(STORY_ID, Position(2, story_ref(2).locator, 0, 0, 0, None))
+    await later.hear(1)  # el capítulo 2 no estaba guardado: se abrió la fuente real
+    await later.stop()
+
+    assert later.stored().title == "Novela (revisada)"
+    assert later.stored().position.chapter_locator == story_ref(2).locator
 
 
 async def test_chosen_next_chapter_is_remembered(controller_rig, tmp_path):

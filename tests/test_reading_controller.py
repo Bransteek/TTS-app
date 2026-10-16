@@ -171,17 +171,17 @@ async def test_pause_during_fallback_has_single_audio_stream(controller_rig):
         peaks.append((rig.producers(), rig.player.queued_count()))
 
     await until(lambda: rig.manager.state is EngineState.EDGE_RETRYING)
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     check()
-    await rig.ctl.next_sentence()  # navegar mientras se cambia de motor
+    await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)  # navegar mientras se cambia de motor
     check()
-    await rig.ctl.resume()
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     rig.engine_gate.set()  # termina el cambio a Piper con la lectura en pausa
     await until(lambda: rig.player.queued_count() == 3)
     await settle()
     check()
-    await rig.ctl.resume()
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
     await rig.hear(4)
     check()
 
@@ -199,9 +199,9 @@ async def test_next_prev_sentence(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(3, partial=True)  # la 2 suena a medias
 
-    await rig.ctl.next_sentence()
+    await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)
     await rig.hear(1, partial=True)
-    await rig.ctl.prev_sentence()
+    await asyncio.wait_for(rig.ctl.prev_sentence(), WAIT_S)
     await rig.hear(1)
 
     assert rig.events.heard == [0, 1, 2, 3, 2]
@@ -221,11 +221,11 @@ async def test_skip_seconds_moves_by_estimated_duration(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(3, partial=True)  # suena la 2
 
-    await rig.ctl.skip_seconds(10)  # 2 frases de 5 s
+    await asyncio.wait_for(rig.ctl.skip_seconds(10), WAIT_S)  # 2 frases de 5 s
     await rig.hear(1, partial=True)
-    await rig.ctl.skip_seconds(-10)
+    await asyncio.wait_for(rig.ctl.skip_seconds(-10), WAIT_S)
     await rig.hear(1, partial=True)
-    await rig.ctl.skip_seconds(7)  # cubrir 7 s exige 2 frases
+    await asyncio.wait_for(rig.ctl.skip_seconds(7), WAIT_S)  # cubrir 7 s exige 2 frases
     await rig.hear(1)
 
     assert rig.events.heard == [0, 1, 2, 4, 2, 4]
@@ -236,7 +236,7 @@ async def test_restart_chapter(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(6)
 
-    await rig.ctl.restart_chapter()
+    await asyncio.wait_for(rig.ctl.restart_chapter(), WAIT_S)
     record = await rig.saved()
     assert record.position.chapter_locator == story_ref(1).locator
     assert resume_sentence(record.position) == 0
@@ -250,12 +250,12 @@ async def test_next_chapter_manual_updates_persisted_position(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(2)
 
-    await rig.ctl.next_chapter()
+    await asyncio.wait_for(rig.ctl.next_chapter(), WAIT_S)
     record = rig.repos.progress.get(STORY_ID)  # ya guardado al volver
     assert (record.position.chapter_locator, record.position.chapter_index) == (story_ref(2).locator, 2)
     assert resume_sentence(record.position) == 0
     await rig.hear(1)
-    await rig.ctl.prev_chapter()
+    await asyncio.wait_for(rig.ctl.prev_chapter(), WAIT_S)
     await rig.hear(1)
 
     assert rig.events.heard_at == [("Cap 1", 0), ("Cap 1", 1), ("Cap 2", 0), ("Cap 1", 0)]
@@ -271,7 +271,7 @@ async def test_speed_change_applies_to_next_unqueued_chunk(controller_rig):
     await rig.hear(2)  # suena [1-3]
     assert [c[2] for c in rig.edge.calls] == [1.0] * 5  # ya se generó también [10-12]
 
-    await rig.ctl.set_speed(1.5, apply_now=False)
+    await asyncio.wait_for(rig.ctl.set_speed(1.5, apply_now=False), WAIT_S)
     await rig.hear(18)
 
     assert rig.events.heard == list(range(20))  # sin cortes ni repeticiones
@@ -286,7 +286,7 @@ async def test_speed_change_applies_to_next_unqueued_chunk(controller_rig):
 async def test_speed_is_clamped_to_engine_range(controller_rig):
     rig = story_rig(controller_rig, chapters=1)
     await rig.start(story_ref(1).locator)
-    await rig.ctl.set_speed(3.0, apply_now=True)
+    await asyncio.wait_for(rig.ctl.set_speed(3.0, apply_now=True), WAIT_S)
     await rig.hear(1)
     assert rig.edge.calls[-1][2] == 2.0
     assert rig.events.notices[-1][0] == "info"
@@ -297,7 +297,7 @@ async def test_apply_now_restarts_current_sentence(controller_rig):
     await rig.start(story_ref(1).locator)
     await rig.hear(3, partial=True)  # la 2 (dentro de [1-3]) suena a medias
 
-    await rig.ctl.set_voice("es-ES-ElviraNeural", None, apply_now=True)
+    await asyncio.wait_for(rig.ctl.set_voice("es-ES-ElviraNeural", None, apply_now=True), WAIT_S)
     await rig.hear(2)
 
     assert rig.events.heard == [0, 1, 2, 2, 3]
@@ -308,7 +308,7 @@ async def test_apply_now_restarts_current_sentence(controller_rig):
 
 async def test_continuous_off_stops_at_chapter_end(controller_rig):
     rig = story_rig(controller_rig, chapters=2, sentences=3)
-    await rig.ctl.set_continuous(False)
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
     await rig.start(story_ref(1).locator)
     await rig.hear(2)
     await settle()
@@ -344,7 +344,7 @@ async def test_ambiguous_next_needs_choice_then_continues(controller_rig):
     await until(lambda: rig.ctl.state is S.NEEDS_ATTENTION)
     assert rig.events.choices == [[story_ref(2), story_ref(3)]]
 
-    await rig.ctl.choose_next(story_ref(3))
+    await asyncio.wait_for(rig.ctl.choose_next(story_ref(3)), WAIT_S)
     await rig.hear(1)
     assert rig.events.heard_at[-1] == ("Cap 3", 0)
     assert rig.ctl.state is S.READING
@@ -379,7 +379,7 @@ async def test_output_error_reopens_once_then_pauses(controller_rig):
     await until(lambda: rig.ctl.state is S.PAUSED)
     assert rig.events.notices[-1] == ("warn", AudioOutputError.user_message)
 
-    await rig.ctl.resume()  # el usuario reanuda: se reabre la salida
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)  # el usuario reanuda: se reabre la salida
     await rig.hear(1)
     assert rig.events.heard == [0, 1]
 
@@ -449,9 +449,9 @@ async def test_producer_failure_reports_error_after_tail(controller_rig):
 
     assert rig.ctl.state is S.READING  # aún suena el final del capítulo 1
     assert rig.player.queued_count() > 0
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     assert rig.ctl.state is S.PAUSED
-    await rig.ctl.resume()
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
     await rig.hear(9)
 
     await until(lambda: rig.ctl.state is S.ERROR)
@@ -524,7 +524,7 @@ async def test_stale_manual_jump_is_discarded(controller_rig):
     jump = asyncio.create_task(rig.ctl.next_chapter())  # espera al capítulo 2 sin red
     await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
 
-    await rig.ctl.restart_chapter()  # una orden más nueva gana
+    await asyncio.wait_for(rig.ctl.restart_chapter(), WAIT_S)  # una orden más nueva gana
     rig.source.failures = []
     await asyncio.wait_for(jump, WAIT_S)
     await rig.hear(1)
@@ -555,12 +555,12 @@ async def test_stop_cancels_dangling_navigation(controller_rig):
 
 async def test_continuous_on_during_tail_continues_reading(controller_rig):
     rig = story_rig(controller_rig, chapters=2, sentences=3)
-    await rig.ctl.set_continuous(False)
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
     await rig.start(story_ref(1).locator)
     await rig.hear(1)
     await until(lambda: rig.producers() == 0)  # el capítulo ya está todo en cola
 
-    await rig.ctl.set_continuous(True)
+    await asyncio.wait_for(rig.ctl.set_continuous(True), WAIT_S)
     await rig.hear(3)
 
     assert rig.events.heard_at == [("Cap 1", 0), ("Cap 1", 1), ("Cap 1", 2), ("Cap 2", 0)]
@@ -584,7 +584,7 @@ async def test_stop_while_paused_and_blocked(controller_rig):
     rig = story_rig(controller_rig, chapters=1, sentences=30)
     await rig.start(story_ref(1).locator)
     await rig.fill()
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     await rig.stop()
     assert lector_tasks() == []
     await rig.play(STORY_ID)
@@ -601,12 +601,210 @@ async def test_waiting_engine_pause_then_recover(controller_rig):
     rig.piper.error = PiperModelMissing
     await rig.hear(10)
     await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
-    await rig.ctl.pause()
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     assert rig.ctl.state is S.PAUSED
     rig.edge.error = None
     await until(lambda: rig.player.queued_count() > 0)
     await settle()
     assert rig.ctl.state is S.PAUSED  # se resolvió la espera, pero el usuario pausó
-    await rig.ctl.resume()
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
     await rig.hear(2)
     assert rig.events.heard == list(range(12))
+
+
+# --- salida caída fuera de sesión y órdenes que relanzan ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (lambda ctl: ctl.next_chapter(), ("Cap 2", 0)),
+        (lambda ctl: ctl.restart_chapter(), ("Cap 1", 0)),
+        (lambda ctl: ctl.prev_sentence(), ("Cap 1", 1)),
+        (lambda ctl: ctl.skip_seconds(-5), ("Cap 1", 0)),
+    ],
+    ids=["next_chapter", "restart_chapter", "prev_sentence", "skip_seconds"],
+)
+async def test_command_after_output_error_while_completed_reopens_output(
+    controller_rig, command, expected
+):
+    rig = story_rig(controller_rig, chapters=2, sentences=2)
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await until(lambda: rig.ctl.state is S.COMPLETED)
+    rig.out.fail(AudioOutputError())  # ignorado: no hay sesión
+    await settle()
+    assert not rig.out.running
+
+    await asyncio.wait_for(command(rig.ctl), WAIT_S)
+    assert rig.ctl.state is S.READING
+    await rig.hear(1)  # falla si la salida sigue parada
+
+    assert rig.out.running
+    assert rig.events.heard_at[-1] == expected
+    assert [n for n in rig.events.notices if n[0] == "warn"] == []
+
+
+async def test_choose_next_after_output_error_while_needing_attention_reopens_output(
+    controller_rig,
+):
+    rig = story_rig(controller_rig, chapters=3, sentences=2)
+    first = rig.source.chapters[story_ref(1).locator]
+    first.next_ref = None
+    first.next_candidates = [story_ref(2), story_ref(3)]
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await until(lambda: rig.ctl.state is S.NEEDS_ATTENTION)
+    rig.out.fail(AudioOutputError())
+    await settle()
+
+    await asyncio.wait_for(rig.ctl.choose_next(story_ref(3)), WAIT_S)
+    await rig.hear(1)
+
+    assert rig.out.running
+    assert rig.ctl.state is S.READING
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+
+
+async def test_failed_reopen_on_relaunch_follows_output_error_path(controller_rig):
+    rig = story_rig(controller_rig, chapters=2, sentences=2)
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await until(lambda: rig.ctl.state is S.COMPLETED)
+    rig.out.fail(AudioOutputError())
+    await settle()
+    rig.out.start_error = AudioOutputError()  # el dispositivo sigue sin responder
+
+    await asyncio.wait_for(rig.ctl.next_chapter(), WAIT_S)
+    await settle()
+    attempts = rig.out.attempts
+    assert rig.ctl.state is S.READING  # primer fallo: un reintento al cabo de 1 s
+    rig.save_clock.advance(1.0)
+    await until(lambda: rig.ctl.state is S.PAUSED)
+    assert rig.out.attempts == attempts + 1
+    assert rig.events.notices[-1] == ("warn", AudioOutputError.user_message)
+
+    rig.out.start_error = None
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+
+
+# --- marcas y saltos en el borde entre frases y capítulos ---------------------------
+
+
+async def test_stop_right_after_a_sentence_ends_does_not_repeat_it(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=4)
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await until(lambda: rig.producers() == 0)  # todo encolado: stop() no cede el turno
+    await rig.hear(2)
+    rig.out.pull(SAMPLES_PER_SENTENCE)  # la frase 1 termina y empieza la 2; aviso pendiente
+    async with asyncio.timeout(WAIT_S):  # sin wait_for: ni un turno antes de parar
+        await rig.ctl.stop()
+
+    assert resume_sentence(rig.stored().position) == 2
+
+
+async def test_restart_chapter_at_start_of_next_chapter_restarts_that_chapter(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=2)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(3, partial=True)  # la marca sigue en el capítulo 1
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+
+    await asyncio.wait_for(rig.ctl.restart_chapter(), WAIT_S)
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+
+
+async def test_next_sentence_at_start_of_next_chapter_stays_in_that_chapter(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=4)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(5, partial=True)
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+
+    await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 2", 1)
+
+
+# --- supervivientes de la ronda 1 ---------------------------------------------------
+
+
+async def test_speed_change_with_empty_queue_relaunches_producer(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.fill()
+    rig.edge.error = EdgeUnavailable
+    rig.piper.error = PiperModelMissing
+    await rig.hear(10)
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+    await until(lambda: rig.player.queued_count() == 0)
+
+    await asyncio.wait_for(rig.ctl.set_speed(1.5, apply_now=False), WAIT_S)
+    assert rig.producers() == 1  # nada que descartar, pero el productor sigue
+    rig.edge.error = None
+    rig.piper.error = None
+    await rig.hear(3)
+
+    assert rig.events.heard == list(range(13))
+    assert rig.edge.calls[-1][2] == 1.5
+
+
+async def test_cancelling_the_caller_of_a_navigation_propagates(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=30, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.source.failures = Outage(PageUnreachable())
+    task = asyncio.create_task(rig.ctl.next_chapter())
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    task.cancel()
+    await asyncio.wait({task}, timeout=WAIT_S)
+
+    assert task.cancelled()  # quien llamó ve su cancelación, no un retorno silencioso
+    await settle()
+    assert rig.ctl.state is S.READING
+
+
+async def test_stop_during_output_retry_cancels_it(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.out.fail(AudioOutputError())
+    await settle()
+
+    await rig.stop()
+
+    assert lector_tasks() == []
+    rig.save_clock.advance(1.0)
+    await settle()
+    assert not rig.out.running  # el reintento no reabre la salida de una sesión parada
+    await rig.play(STORY_ID)
+    await rig.hear(1)
+    assert rig.ctl.state is S.READING
+
+
+async def test_seek_while_paused_after_output_failure_stays_paused(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.out.fail(AudioOutputError())
+    await settle()
+    rig.save_clock.advance(1.0)
+    await until(lambda: rig.out.running)
+    rig.out.fail(AudioOutputError())  # segundo fallo: pausa con aviso
+    await until(lambda: rig.ctl.state is S.PAUSED)
+
+    await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)
+    await settle()
+    assert rig.ctl.state is S.PAUSED  # saltar no quita la pausa
+    assert not rig.out.running
+
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard[-1] == 2
