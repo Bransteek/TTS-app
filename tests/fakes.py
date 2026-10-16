@@ -1,6 +1,7 @@
 """Dobles de prueba compartidos (otras tareas añaden más aquí)."""
 from __future__ import annotations
 
+import types
 from collections.abc import Callable
 
 import numpy as np
@@ -84,3 +85,42 @@ class FakeCommunicate:
             raise self.script
         for chunk in self.script:
             yield chunk
+
+
+class FakeAudioChunk:
+    """Doble de `piper.AudioChunk`: solo lo que usa el motor."""
+
+    def __init__(self, samples: np.ndarray, sample_rate: int):
+        self.audio_int16_array = samples
+        self.sample_rate = sample_rate
+
+
+class FakePiperVoice:
+    """Doble de `piper.PiperVoice`.
+
+    Cada llamada a `synthesize` devuelve un chunk de 22050 Hz de `per_char`
+    muestras por carácter; registra `(texto, syn_config)` en `calls`.
+    Los textos en `silent` producen un chunk vacío.
+    """
+
+    def __init__(
+        self,
+        speaker_id_map: dict[str, int] | None = None,
+        sample_rate: int = 22050,
+        per_char: int = 100,
+        silent: tuple[str, ...] = (),
+    ):
+        self.config = types.SimpleNamespace(
+            speaker_id_map=speaker_id_map or {},
+            num_speakers=len(speaker_id_map or {}) or 1,
+            sample_rate=sample_rate,
+        )
+        self.sample_rate = sample_rate
+        self.per_char = per_char
+        self.silent = silent
+        self.calls: list[tuple[str, object]] = []
+
+    def synthesize(self, text, syn_config=None, include_alignments=False):
+        self.calls.append((text, syn_config))
+        n = 0 if text in self.silent else len(text) * self.per_char
+        yield FakeAudioChunk(np.full(n, 1000, dtype=np.int16), self.sample_rate)
