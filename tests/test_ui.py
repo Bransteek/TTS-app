@@ -1183,6 +1183,7 @@ def test_minimize_state_change_alone_continues(qtbot, make_window, ctl, monkeypa
     monkeypatch.setattr(window, "isMinimized", lambda: True)
     QApplication.sendEvent(window, QWindowStateChangeEvent(Qt.WindowState.WindowNoState))
 
+    assert not window.resume_dialog.isVisible()  # en el acto, sin esperar a otra comprobación
     wait_call(qtbot, ctl, "play", "doc-1", None)
 
 

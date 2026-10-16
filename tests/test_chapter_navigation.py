@@ -321,6 +321,15 @@ def test_set_prefix_override_replaces_the_one_for_that_work_and_clears():
     assert set_prefix_override(cleared, f"{HOST}/otra/c-1/", None) == {}  # host sin prefijos
 
 
+def test_set_prefix_override_stores_the_path_with_final_slash():
+    from lector.content.generic_web import prefix_override_for, set_prefix_override
+
+    stored = set_prefix_override({}, PAGE_URL, "/novela")
+    assert stored == {"lector.example": ["/novela/"]}
+    assert set_prefix_override(stored, PAGE_URL, "/novela") == stored  # mismo prefijo: igual
+    assert prefix_override_for(stored, f"{HOST}/novelas-otras/c-1/") is None  # no «/novela» a secas
+
+
 async def test_doc_id_ignores_host_case():
     fetcher, source = await make_source({})
     try:
