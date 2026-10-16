@@ -63,8 +63,12 @@ class MadaraSource(ContentSource):
         work_url = self._find_work_url(tree, url)
         if work_url != self._work_url:
             self._work_url, self._index = work_url, None
+        try:
+            chapters = await self.list_chapters()
+        except PageUnreachable:
+            chapters = []
         chapter = self._parse(tree, url)
-        return self._document(work_url, self._breadcrumb_work_title(tree) or "", []), chapter
+        return self._document(work_url, self._breadcrumb_work_title(tree) or "", chapters), chapter
 
     async def load_chapter(self, ref: ChapterRef) -> Chapter:
         result = await self._fetcher.get(ref.locator)
@@ -80,15 +84,13 @@ class MadaraSource(ContentSource):
             raise PageUnreachable("Primero hay que abrir una novela.", recoverable=False)
         result = await self._fetcher.post(f"{self._work_url}ajax/chapters/")
         tree = lxml.html.fromstring(result.text)
-        seen: set[str] = set()
-        refs: list[ChapterRef] = []
+        titles: dict[str, str] = {}
         for a in reversed(tree.cssselect("li.wp-manga-chapter a[href]")):
             href = urljoin(self._work_url, a.get("href").strip())
-            if href in seen:
-                continue
-            seen.add(href)
             title = re.sub(r"\s+", " ", a.text_content()).strip()
-            refs.append(ChapterRef(index=len(refs), title=title, locator=href))
+            if not titles.get(href):
+                titles[href] = title
+        refs = [ChapterRef(i, t, h) for i, (h, t) in enumerate(titles.items())]
         self._index = refs
         return list(refs)
 

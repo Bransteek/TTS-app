@@ -128,3 +128,36 @@ async def test_load_chapter_by_ref(source):
     chapter = await source.load_chapter(refs[98])
     assert chapter.ref.index == 98
     assert chapter.prev_ref.index == 97
+
+
+async def test_chapter_list_titles(source):
+    await source.open(WORK + "capitulo-99/")
+    chapters = await source.list_chapters()
+    assert all(c.title for c in chapters)
+    assert chapters[99].title == "Capítulo 100"
+    assert chapters[0].title == "Capítulo 1"
+
+
+async def test_open_chapter_loads_index():
+    fetcher = SafeFetcher(resolver=resolver, transport=httpx.MockTransport(handler))
+    src = MadaraSource(fetcher)
+    doc, chapter = await src.open(WORK + "capitulo-99/")
+    await fetcher.aclose()
+    assert len(doc.chapters) == 100
+    assert chapter.ref.index == 98
+    assert chapter.next_ref.index == 99
+    assert chapter.prev_ref.index == 97
+
+
+async def test_open_chapter_survives_ajax_failure():
+    def failing(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(503, text="x", headers=HTML)
+        return handler(request)
+
+    fetcher = SafeFetcher(resolver=resolver, transport=httpx.MockTransport(failing))
+    doc, chapter = await MadaraSource(fetcher).open(WORK + "capitulo-99/")
+    await fetcher.aclose()
+    assert doc.chapters == []
+    assert chapter.ref.index is None
+    assert chapter.next_ref.locator.endswith("/capitulo-100/")
