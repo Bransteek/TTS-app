@@ -62,8 +62,9 @@ class FakeCommunicate:
     """Doble de `edge_tts.Communicate`.
 
     `script` es una lista de chunks (dicts como los que emite `stream()`) o una
-    excepción que se lanza al empezar a iterar. Cada instancia registra en
-    `FakeCommunicate.instances` los argumentos con los que se construyó.
+    excepción que se lanza al empezar a iterar. `factory` hace de
+    `communicate_factory`: registra en `calls` los (args, kwargs) de cada
+    construcción y devuelve este mismo objeto.
     """
 
     def __init__(self, script: list[dict] | Exception):

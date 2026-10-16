@@ -7,7 +7,7 @@ import edge_tts.exceptions
 import pytest
 
 from lector.audio.pcm import OUTPUT_RATE
-from lector.errors import EdgeUnavailable, EdgeVoiceNotFound
+from lector.errors import EdgeUnavailable, EdgeVoiceNotFound, SynthesisFailed
 from lector.models import Chunk, Sentence
 from lector.tts.base import (
     EDGE_SPEED_RANGE,
@@ -65,7 +65,7 @@ async def test_default_voice_and_no_pitch_change():
     await EdgeEngine(fake.factory).synthesize(chunk_of(TEXTS[0]), VOICE, 1.5)
     (args, _) = fake.calls[-1]
     assert args == (TEXTS[0], VOICE)
-    assert fake.kwargs.get("pitch", "+0Hz") == "+0Hz"
+    assert "pitch" not in fake.kwargs
     assert fake.kwargs["rate"] == "+50%"
     assert fake.kwargs["boundary"] == "SentenceBoundary"
     assert fake.kwargs["connect_timeout"] == 10
@@ -186,3 +186,47 @@ async def test_health_check():
     assert ok.calls[-1][0][0] == "Hola."
     assert await EdgeEngine(FakeCommunicate(OSError()).factory).health_check(VOICE) is False
     assert await EdgeEngine(FakeCommunicate([]).factory).health_check(VOICE) is False
+
+
+async def test_malformed_voice_value_error_maps_to_voice_not_found():
+    exc = ValueError("Invalid voice 'x'")
+
+    def factory(*a, **k):
+        raise exc
+
+    with pytest.raises(EdgeVoiceNotFound) as info:
+        await EdgeEngine(factory).synthesize(chunk_of(TEXTS[0]), "x", 1.0)
+    assert info.value.__cause__ is exc
+
+
+async def test_unexpected_error_in_factory_maps_to_unavailable():
+    exc = RuntimeError("boom")
+
+    def factory(*a, **k):
+        raise exc
+
+    with pytest.raises(EdgeUnavailable) as info:
+        await EdgeEngine(factory).synthesize(chunk_of(TEXTS[0]), VOICE, 1.0)
+    assert info.value.__cause__ is exc
+
+
+async def test_unexpected_error_in_stream_maps_to_unavailable():
+    fake = FakeCommunicate(RuntimeError("boom"))
+    with pytest.raises(EdgeUnavailable):
+        await EdgeEngine(fake.factory).synthesize(chunk_of(TEXTS[0]), VOICE, 1.0)
+
+
+async def test_bad_mp3_raises_synthesis_failed():
+    fake = FakeCommunicate([audio_item(b"esto no es un mp3" * 10), boundary(0, TEXTS[0])])
+    with pytest.raises(SynthesisFailed):
+        await EdgeEngine(fake.factory).synthesize(chunk_of(TEXTS[0]), VOICE, 1.0)
+
+
+async def test_list_voices_times_out():
+    import asyncio
+
+    async def slow():
+        await asyncio.sleep(5)
+
+    with pytest.raises(EdgeUnavailable):
+        await EdgeEngine(FakeCommunicate([]).factory, slow, timeout_s=0.05).list_voices()

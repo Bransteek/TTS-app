@@ -82,8 +82,9 @@ class EdgeEngine:
 
     async def list_voices(self) -> list[dict]:
         try:
-            voices = await self._list_voices_fn()
-        except _NETWORK_ERRORS as exc:
+            async with asyncio.timeout(self._timeout_s):
+                voices = await self._list_voices_fn()
+        except Exception as exc:
             raise EdgeUnavailable() from exc
         self._known_voices = list(voices)
         return voices
@@ -99,7 +100,7 @@ class EdgeEngine:
     async def synthesize(self, chunk: Chunk, voice: str, speed: float) -> AudioClip:
         self._check_voice(voice)
         audio, boundaries = await self._fetch(voice, chunk.text, speed)
-        pcm = decode_mp3(audio)
+        pcm = await asyncio.to_thread(decode_mp3, audio)
         marks = [
             m
             for m in align_marks(chunk.sentences, boundaries)
@@ -127,6 +128,12 @@ class EdgeEngine:
                 connect_timeout=10,
                 receive_timeout=int(self._timeout_s),
             )
+        except ValueError as exc:
+            # Voz o velocidad mal formadas: error de configuración, no se reintenta.
+            raise EdgeVoiceNotFound() from exc
+        except Exception as exc:
+            raise EdgeUnavailable() from exc
+        try:
             async with asyncio.timeout(self._timeout_s):
                 async for item in communicate.stream():
                     kind = item.get("type")
@@ -135,7 +142,7 @@ class EdgeEngine:
                     elif kind == "SentenceBoundary":
                         offset = int(item["offset"] / _TICKS_PER_SECOND * OUTPUT_RATE)
                         boundaries.append((offset, item["text"]))
-        except _NETWORK_ERRORS as exc:
+        except Exception as exc:  # nada crudo debe escapar de synthesize()
             raise EdgeUnavailable() from exc
         audio = b"".join(parts)
         if not audio:
