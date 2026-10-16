@@ -215,3 +215,30 @@ class FakeEdge(_FakeEngine):
 
 class FakePiper(_FakeEngine):
     name = "piper"
+
+
+class FakeSource:
+    """Fuente de contenido falsa con capítulos en memoria (sin red).
+
+    `chapters` mapea locator -> Chapter. `failures` es una cola de excepciones:
+    cada `load_chapter` lanza la siguiente antes de devolver nada. `loads`
+    registra los locators pedidos, en orden.
+    """
+
+    def __init__(self, chapters: dict | None = None, failures: list | tuple = ()):
+        self.chapters = dict(chapters or {})
+        self.failures = list(failures)
+        self.loads: list[str] = []
+
+    async def open(self, locator: str, prefetched_html: str | None = None):
+        raise NotImplementedError
+
+    async def load_chapter(self, ref):
+        self.loads.append(ref.locator)
+        await asyncio.sleep(0)
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.chapters[ref.locator]
+
+    async def list_chapters(self) -> list:
+        return [c.ref for c in self.chapters.values()]
