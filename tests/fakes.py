@@ -56,3 +56,30 @@ class FakeOutput:
         """Simula que el stream real se cae (lo que haría PortAudio en su hilo)."""
         assert self.on_error is not None
         self.on_error(exc)
+
+
+class FakeCommunicate:
+    """Doble de `edge_tts.Communicate`.
+
+    `script` es una lista de chunks (dicts como los que emite `stream()`) o una
+    excepción que se lanza al empezar a iterar. Cada instancia registra en
+    `FakeCommunicate.instances` los argumentos con los que se construyó.
+    """
+
+    def __init__(self, script: list[dict] | Exception):
+        self.script = script
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def factory(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self
+
+    @property
+    def kwargs(self) -> dict:
+        return self.calls[-1][1]
+
+    async def stream(self):
+        if isinstance(self.script, Exception):
+            raise self.script
+        for chunk in self.script:
+            yield chunk
