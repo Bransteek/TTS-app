@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "queue_ahead_chunks": 2,
     "queue_max_seconds": 90,
     "skip_seconds": 10,
+    "highlight_sentence": True,
     "continuous": True,
     "store_text": True,
     "http_max_bytes": 5_000_000,
@@ -71,6 +72,11 @@ class _Repo:
         self._conn = conn
         lock = getattr(conn, "lock", None)
         self._lock = lock if lock is not None else threading.Lock()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """La conexión compartida (para crear otros repositorios sobre la misma base)."""
+        return self._conn
 
     def _run(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         attempt = 0

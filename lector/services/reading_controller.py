@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -216,6 +217,15 @@ def _queued_clip(chunk: Chunk, clip: AudioClip, engine: str) -> QueuedClip | Non
     if not marks or marks[0][0] != 0:
         marks.insert(0, (0, chunk.sentences[0].index))
     return QueuedClip(chunk, clip.pcm, marks, engine)
+
+
+_PAGES_LOCATOR = re.compile(r"^pages:(\d+)-(\d+)$")
+
+
+def _page_range_has(locator: str, page: int) -> bool:
+    """¿El capítulo de PDF «pages:<inicio>-<fin>» contiene `page`?"""
+    match = _PAGES_LOCATOR.match(locator)
+    return bool(match) and int(match.group(1)) <= page <= int(match.group(2))
 
 
 def _skip_index(sentences: list[Sentence], start: int, delta: float, speed: float) -> int:
@@ -495,6 +505,42 @@ class ReadingController:
             target, index = self._next_unqueued
             if isinstance(target, Chapter):
                 self._launch(_Launch(target, index, False, False))
+
+    async def set_preferred_engine(self, name: str) -> None:
+        """Motor preferido («edge» o «piper»): vale desde el siguiente fragmento y se guarda.
+
+        Lo ya preparado en la cola suena con el motor anterior; el productor vuelve
+        a trocear con los límites del nuevo motor al ver el cambio.
+        """
+        self._em.set_preferred(name)  # ValueError si el nombre no es válido
+        await self._persist_setting("preferred_engine", name)
+
+    async def locate_page(self, doc_id: str, page: int) -> Position | None:
+        """Posición de la primera frase de `page` en el PDF abierto en vista previa o en lectura.
+
+        Devuelve None si ese documento no está abierto o la página no existe.
+        """
+        if self._preview is not None and self._preview[1].doc_id == doc_id:
+            source, doc, first = self._preview
+        elif self._session is not None and self._session.doc.doc_id == doc_id:
+            source, doc, first = self._session.source, self._session.doc, self._session.first
+        else:
+            return None
+        ref = next((r for r in doc.chapters if _page_range_has(r.locator, page)), None)
+        if ref is None:
+            return None
+        if first is not None and first.ref.locator == ref.locator:
+            chapter = first
+        else:
+            chapter = await source.load_chapter(ref)
+        sentence = next(
+            (s for s in chapter.sentences if s.page is not None and s.page >= page), None
+        )
+        index = ref.index if ref.index is not None else 0
+        if sentence is None:
+            return Position(index, ref.locator, 0, 0, 0, page)
+        return Position(index, ref.locator, sentence.paragraph_index, sentence.index,
+                        sentence.start, page)
 
     async def shutdown(self, save_only: bool = False) -> None:
         """Cierra la sesión. Con `save_only` solo guarda el progreso confirmado."""

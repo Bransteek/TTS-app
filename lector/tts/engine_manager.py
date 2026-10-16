@@ -11,7 +11,7 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING
 
@@ -121,6 +121,24 @@ class EngineManager:
     def set_on_state(self, on_state: Callable[[EngineState, str], None]) -> None:
         """Sustituye el aviso de cambio de estado (lo registra el controlador de lectura)."""
         self._on_state = on_state
+
+    @property
+    def preferred(self) -> str:
+        return self._config.preferred
+
+    def set_preferred(self, name: str) -> None:
+        """Cambia el motor preferido («edge» o «piper»); vale desde el siguiente fragmento.
+
+        Si cambia, el circuito vuelve al estado inicial de la nueva preferencia
+        (como `reset()`): una síntesis en curso termina con su motor, pero sus
+        transiciones ya no se aplican.
+        """
+        if name not in ("edge", "piper"):
+            raise ValueError(f"Motor preferido no válido: {name!r}")
+        if name == self._config.preferred:
+            return
+        self._config = replace(self._config, preferred=name)
+        self.reset()
 
     def reset(self) -> None:
         """Vuelve al estado inicial (sesión nueva): circuito cerrado y motor preferido.

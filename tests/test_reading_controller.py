@@ -808,3 +808,50 @@ async def test_seek_while_paused_after_output_failure_stays_paused(controller_ri
     await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
     await rig.hear(1)
     assert rig.events.heard[-1] == 2
+
+
+# --- Task 16: motor preferido y salto a una página -----------------------------------
+
+
+async def test_set_preferred_engine_persists_and_applies_to_later_chunks(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.fill()  # [0] [1-3] [4-6] en cola y [7-9] generado por Edge
+
+    await asyncio.wait_for(rig.ctl.set_preferred_engine("piper"), WAIT_S)
+
+    assert rig.settings.get("preferred_engine") == "piper"
+    assert rig.manager.state is EngineState.PIPER_ACTIVE
+    await rig.hear(20)
+    assert rig.events.heard == list(range(20))  # el cambio no corta ni repite
+    assert chunk_starts(rig.piper)[:3] == [10, 11, 12]  # límites de Piper desde el siguiente
+    assert all(start <= 7 for start in chunk_starts(rig.edge))
+    assert (EngineState.PIPER_ACTIVE, "Piper local") in rig.events.engine
+
+
+async def test_set_preferred_engine_rejects_unknown_name(controller_rig):
+    rig = controller_rig()
+    with pytest.raises(ValueError):
+        await asyncio.wait_for(rig.ctl.set_preferred_engine("otro"), WAIT_S)
+    assert rig.settings.get("preferred_engine") == "edge"
+
+
+async def test_locate_page_finds_first_sentence_of_that_page(controller_rig, make_pdf):
+    path = make_pdf(pages=[
+        [("Primera página del libro con bastante texto. Otra frase de la primera página.", 11)],
+        [("Comienza la segunda página del libro. Sigue la segunda página.", 11)],
+        [("Tercera página con su propio texto. Fin del libro de prueba.", 11)],
+    ])
+    rig = controller_rig()
+    doc, chapter, _ = await asyncio.wait_for(rig.ctl.open(str(path)), WAIT_S)
+
+    pos = await asyncio.wait_for(rig.ctl.locate_page(doc.doc_id, 2), WAIT_S)
+
+    first_on_2 = next(s for s in chapter.sentences if s.page == 2)
+    assert pos.page == 2
+    assert pos.chapter_locator == chapter.ref.locator
+    assert pos.sentence_index == first_on_2.index
+    await rig.play(doc.doc_id, pos)
+    await rig.hear(1)
+    assert rig.events.sentences[0][1] == first_on_2.text
+    assert await asyncio.wait_for(rig.ctl.locate_page("otro-doc", 2), WAIT_S) is None

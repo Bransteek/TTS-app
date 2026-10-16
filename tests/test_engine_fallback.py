@@ -581,3 +581,48 @@ async def test_set_on_state_replaces_callback(clock):
 
     assert first == []
     assert later == [(S.EDGE_RETRYING, EDGE), (S.PIPER_ACTIVE, PIPER)]
+
+
+# --- Motor preferido elegido en la interfaz (Task 16) -----------------------------------
+
+
+async def test_set_preferred_applies_to_later_chunks(clock):
+    edge, piper = FakeEdge(), FakePiper()
+    manager, states = make_manager(edge, piper, clock)
+    _, engine = await synth(manager, 0)
+    assert engine == "edge"
+
+    manager.set_preferred("piper")
+
+    assert manager.state is S.PIPER_ACTIVE
+    assert states == [(S.PIPER_ACTIVE, PIPER)]
+    _, engine = await synth(manager, 1)
+    assert engine == "piper"
+    assert [c[0] for c in edge.calls] == ["c0"]  # sin pruebas de Edge en modo Piper
+
+    manager.set_preferred("edge")
+
+    assert manager.state is S.EDGE_ACTIVE
+    _, engine = await synth(manager, 2)
+    assert engine == "edge"
+    assert states[-1] == (S.EDGE_ACTIVE, EDGE)
+
+
+async def test_set_preferred_same_value_keeps_circuit(clock):
+    edge, piper = FakeEdge(), FakePiper()
+    manager, states = make_manager(edge, piper, clock)
+    await fall_back_to_piper(manager, edge)
+    assert manager.state is S.PIPER_ACTIVE
+    before = list(states)
+
+    manager.set_preferred("edge")  # ya era la preferencia: Edge sigue en cuarentena
+
+    assert manager.state is S.PIPER_ACTIVE
+    assert states == before
+
+
+def test_set_preferred_rejects_unknown_engine(clock):
+    manager, _ = make_manager(FakeEdge(), FakePiper(), clock)
+    with pytest.raises(ValueError):
+        manager.set_preferred("google")
+    assert manager.state is S.EDGE_ACTIVE

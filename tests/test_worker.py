@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
 import threading
 import time
@@ -142,7 +143,7 @@ def test_bridge_created_in_worker_is_ui_thread_affine(qtbot, worker):
     assert out == [QThread.currentThread()]
 
 
-def test_stop_cancels_futures_of_tasks_that_swallow_cancellation(qtbot):
+def test_stop_cancels_futures_of_tasks_that_swallow_cancellation(qtbot, caplog):
     w = AsyncWorker()
     w.start()
     started = threading.Event()
@@ -166,6 +167,13 @@ def test_stop_cancels_futures_of_tasks_that_swallow_cancellation(qtbot):
     qtbot.waitUntil(lambda: bool(out), timeout=2000)
     qtbot.wait(200)
     assert len(out) == 1 and isinstance(out[0], BaseException)
+
+    # La tarea terca queda pendiente en un bucle cerrado, a propósito. Se recoge aquí,
+    # dentro de la prueba, para que su aviso no salga suelto al final de la sesión.
+    del fut, w
+    with caplog.at_level(logging.ERROR, logger="lector.services.worker"):
+        gc.collect()
+    assert any("destroyed but it is pending" in r.getMessage() for r in caplog.records)
 
 
 def test_stop_cancels_tasks_spawned_while_cancelling():
