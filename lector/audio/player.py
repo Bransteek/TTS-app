@@ -262,6 +262,21 @@ class AudioPlayer:
         self._post(self._wake_waiters)
         return chunk
 
+    def drop_queued(self) -> list[Chunk]:
+        """Descarta los clips en espera, pero no el que suena; devuelve sus `Chunk` en orden.
+
+        No cambia la generación: el clip actual sigue sonando con todos sus eventos, y
+        un `enqueue` que esperaba sitio puede entrar en el hueco (quien llama debe
+        cancelar antes al productor si no quiere eso).
+        """
+        with self._lock:
+            dropped, self._queue = self._queue, deque()
+            self._pending_samples -= sum(len(clip.pcm) for clip in dropped)
+        chunks = [clip.chunk for clip in dropped]
+        del dropped  # los arrays se liberan aquí, fuera del candado
+        self._post(self._wake_waiters)
+        return chunks
+
     def current(self) -> tuple[Chunk, int] | None:
         """`(chunk, sentence_index)` de lo que el callback está entregando a la salida.
 

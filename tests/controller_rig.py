@@ -8,13 +8,16 @@ from collections.abc import Callable
 from lector.audio.player import AudioPlayer
 from lector.content.registry import open_source
 from lector.content.segmenter import build_chapter_text
+from lector.errors import PageUnreachable
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.persistence.database import open_database
 from lector.persistence.repositories import ProgressRecord, SettingsRepo
 from lector.services.navigator import ChapterNavigator
 from lector.services.reading_controller import ControllerDeps, ReadingController, Repos
 from lector.tts.engine_manager import EngineConfig, EngineManager
-from tests.fakes import SAMPLES_PER_SENTENCE, FakeClock, FakeEdge, FakeOutput, FakePiper, FakeSource
+from tests.fakes import (
+    SAMPLES_PER_SENTENCE, FakeClock, FakeEdge, FakeOutput, FakePiper, FakeSource, ManualClock,
+)
 
 STORY_ID = "novela"
 WAIT_S = 2.0  # tope de tiempo real de cada espera: una regresión falla, no se cuelga
@@ -66,11 +69,33 @@ def story_document(chapters: dict[str, Chapter]) -> Document:
                     "https://novela.example/", "https://novela.example/", None, refs)
 
 
-def fake_opener(source: FakeSource, document: Document):
+def fake_opener(source: FakeSource, document: Document, network: dict | None = None):
+    """Abre la fuente en memoria; con `network["online"]` a False falla como sin red."""
+
     async def opener(locator: str, fetcher):
+        if network is not None and not network["online"]:
+            raise PageUnreachable()
         return source, document, source.chapters[locator]
 
     return opener
+
+
+class _Tap:
+    """Reenvía los eventos del reproductor al controlador y anota qué fragmento sonó."""
+
+    def __init__(self, target, played: list[tuple[str, int]]):
+        self._target = target
+        self._played = played
+
+    def on_sentence_started(self, chunk, sentence_index) -> None:
+        self._played.append((chunk.chunk_id, sentence_index))
+        self._target.on_sentence_started(chunk, sentence_index)
+
+    def on_chunk_finished(self, chunk) -> None:
+        self._target.on_chunk_finished(chunk)
+
+    def on_output_error(self, err) -> None:
+        self._target.on_output_error(err)
 
 
 # --- eventos ----------------------------------------------------------------------
@@ -134,8 +159,9 @@ class ControllerRig:
         self.manager = EngineManager(
             self.edge, self.piper, EngineConfig(), clock=self.clock.now, sleep=engine_sleep
         )
-        # Reloj propio del controlador: sus esperas de guardado no adelantan el de los motores.
-        self.save_clock = FakeClock()
+        # Reloj propio del controlador (guardado cada 2 s, espera antes de reabrir la
+        # salida): solo avanza cuando la prueba llama a save_clock.advance().
+        self.save_clock = ManualClock()
         self.out = FakeOutput()
         self.player = AudioPlayer(self.out, asyncio.get_running_loop(), max_ahead=2)
         self.events = EventLog()
@@ -157,11 +183,32 @@ class ControllerRig:
             sleep=self.save_clock.sleep,
         )
         self.ctl = ReadingController(deps, self.events)
+        self.played: list[tuple[str, int]] = []  # (chunk_id, frase) de cada frase que empezó
+        self.player.set_events(_Tap(self.ctl, self.played))
 
     async def start(self, locator: str, start=None) -> Document:
-        doc, _, _ = await self.ctl.open(locator)
-        await asyncio.wait_for(self.ctl.play(doc.doc_id, start), WAIT_S)
+        doc, _, _ = await asyncio.wait_for(self.ctl.open(locator), WAIT_S)
+        await self.play(doc.doc_id, start)
         return doc
+
+    async def play(self, doc_id: str = STORY_ID, start=None) -> None:
+        await asyncio.wait_for(self.ctl.play(doc_id, start), WAIT_S)
+
+    async def stop(self) -> None:
+        await asyncio.wait_for(self.ctl.stop(), WAIT_S)
+
+    def stored(self, doc_id: str = STORY_ID) -> ProgressRecord | None:
+        """Lo que hay en la base de datos ahora mismo (sin forzar ninguna escritura)."""
+        return self.repos.progress.get(doc_id)
+
+    async def written(self, cond: Callable[[ProgressRecord], bool], doc_id: str = STORY_ID) -> None:
+        """Espera (con tope) a que la base de datos contenga un progreso que cumpla `cond`."""
+
+        def check() -> bool:
+            record = self.repos.progress.get(doc_id)
+            return record is not None and cond(record)
+
+        await until(check)
 
     async def fill(self) -> None:
         """Espera a que el productor llene la cola (el que suena + 2 preparados)."""
@@ -214,6 +261,8 @@ def story_rig(build, chapters: int = 3, sentences: int = 10, **kwargs):
     """Rig con una historia de `chapters` capítulos servida por una FakeSource."""
     content = story(chapters, sentences)
     source = FakeSource(content)
-    rig = build(opener=fake_opener(source, story_document(content)), **kwargs)
+    network = {"online": True}
+    rig = build(opener=fake_opener(source, story_document(content), network), **kwargs)
     rig.source = source
+    rig.network = network
     return rig

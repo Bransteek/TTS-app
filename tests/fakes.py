@@ -156,6 +156,37 @@ class FakeClock:
         await asyncio.sleep(0)
 
 
+class ManualClock:
+    """Reloj que solo avanza con `advance`: `sleep` espera de verdad hasta esa hora.
+
+    Sirve para comprobar esperas (p. ej. el límite de un guardado cada 2 s): nada
+    diferido ocurre hasta que la prueba adelanta el reloj.
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.t = start
+        self._sleepers: list[tuple[float, asyncio.Future]] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+        due = [f for at, f in self._sleepers if at <= self.t]
+        self._sleepers = [(at, f) for at, f in self._sleepers if at > self.t]
+        for future in due:
+            if not future.done():
+                future.set_result(None)
+
+    async def sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            await asyncio.sleep(0)
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._sleepers.append((self.t + seconds, future))
+        await future
+
+
 class _FakeEngine:
     """Motor TTS falso.
 

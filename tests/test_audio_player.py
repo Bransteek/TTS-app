@@ -447,3 +447,31 @@ async def test_set_events_redirects_events():
     out.pull(100)
     await settle()
     assert rec.events == [("sentence", "doc:0:0:0", 0), ("finished", "doc:0:0:0")]
+
+
+async def test_drop_queued_keeps_current_clip_and_its_events(rig):
+    player, out, rec = rig(max_seconds=90)
+    forty = 40 * OUTPUT_RATE
+    a = make_clip(0, forty, [(0, 0), (OUTPUT_RATE, 1)])
+    b = make_clip(1, forty)
+    await player.enqueue(a)
+    await player.enqueue(b)
+    out.pull(10)  # suena a
+    c = make_clip(2, forty)
+    blocked = asyncio.ensure_future(player.enqueue(c))  # 40 + 40 + 40 > 90 s: espera
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(blocked), 0.05)
+
+    assert player.drop_queued() == [b.chunk]
+
+    # Las muestras de b ya no cuentan: c cabe y entra (no lo descarta un clear()).
+    assert await asyncio.wait_for(blocked, 1) is True
+    assert player.queued_count() == 2
+    assert player.current() == (a.chunk, 0)
+    assert player.drop_queued() == [c.chunk]
+    out.pull(forty)  # el clip que sonaba termina con todos sus eventos
+    await settle()
+    assert rec.events == [
+        ("sentence", "doc:0:0:0", 0), ("sentence", "doc:0:0:0", 1), ("finished", "doc:0:0:0"),
+    ]
+    assert player.current() is None and player.drop_queued() == []

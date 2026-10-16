@@ -17,24 +17,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
-from pathlib import Path
 from typing import Any, Protocol
 
 from lector.audio.player import AudioPlayer, QueuedClip
 from lector.content import registry
 from lector.content.base import ContentSource
-from lector.content.pdf_source import file_doc_id
 from lector.content.segmenter import make_chunks
 from lector.errors import (
     AmbiguousNextChapter,
     AudioOutputError,
     ChapterLoopDetected,
-    FileMovedOrChanged,
     LectorError,
 )
 from lector.models import Chapter, ChapterRef, Chunk, Document, Position, Sentence, SourceKind
@@ -45,14 +41,16 @@ from lector.persistence.repositories import (
     ProgressRepo,
     SettingsRepo,
 )
+from lector.services.document_opener import DeferredSource, SourceOpener, check_file, store_opened
 from lector.services.navigator import ChapterNavigator
+from lector.services.progress_writer import ProgressWriter, make_record
 from lector.tts.base import AudioClip, clamp_speed
 from lector.tts.engine_manager import EngineManager, EngineState
 
 log = logging.getLogger(__name__)
 
-SAVE_INTERVAL_S = 2.0
 CHARS_PER_SECOND = 14.0
+OUTPUT_RETRY_DELAY_S = 1.0
 NO_MORE_CHAPTERS = "No hay más capítulos publicados"
 CHAPTER_FINISHED = "Terminó el capítulo."
 FIRST_CHAPTER = "Este ya es el primer capítulo."
@@ -61,6 +59,8 @@ SPEED_ADJUSTED = "La velocidad se ajustó a {speed:g}, el valor permitido más c
 
 # Estados del gestor en los que el audio sale de Piper (límites de fragmento de Piper).
 _PIPER_STATES = frozenset({EngineState.PIPER_ACTIVE, EngineState.EDGE_RECOVERY_TEST})
+# Resultado de una navegación manual cancelada por stop(), shutdown() o play().
+_ABORTED = object()
 
 
 class SessionState(StrEnum):
@@ -109,7 +109,6 @@ class Repos:
         return cls(DocumentRepo(conn), ChapterRepo(conn), ProgressRepo(conn))
 
 
-SourceOpener = Callable[[str, Any], Awaitable[tuple[ContentSource, Document, Chapter]]]
 NavigatorFactory = Callable[[ContentSource, Document], ChapterNavigator]
 
 
@@ -124,7 +123,7 @@ class ControllerDeps:
     # None: ChapterNavigator con store_text, prefetch_ahead y wait_max_s de la configuración.
     navigator_factory: NavigatorFactory | None = None
     clock: Callable[[], float] = time.monotonic  # limita el guardado a uno cada 2 s
-    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep  # esperas propias (guardado, salida)
 
 
 @dataclass
@@ -181,15 +180,25 @@ class _Session:
     doc: Document
     source: ContentSource
     nav: ChapterNavigator
-    first: Chapter  # el capítulo que devolvió la fuente al abrirla
+    first: Chapter | None  # el capítulo que devolvió la fuente al abrirla (si se abrió)
 
 
 @dataclass
 class _Launch:
     target: Chapter | ChapterRef
     sentence: int
-    fresh: bool  # posición nueva elegida (reinicia el historial de capítulos y la muestra)
+    show: bool  # posición elegida: se muestra el capítulo en cuanto carga
     mark_on_load: bool  # la marca se calcula al cargar el capítulo
+
+
+@dataclass
+class _End:
+    """Final pendiente del productor; se aplica cuando termina de sonar la cola."""
+
+    state: SessionState
+    notice: tuple[str, str] | None
+    candidates: list[ChapterRef] | None = None
+    continuous_off: bool = False
 
 
 def _queued_clip(chunk: Chunk, clip: AudioClip, engine: str) -> QueuedClip | None:
@@ -238,7 +247,6 @@ class ReadingController:
         self._player = deps.player
         self._em = deps.engine_manager
         self._repos = deps.repos
-        self._clock = deps.clock
         self._sleep = deps.sleep
         self._lock = asyncio.Lock()
         self._state = SessionState.IDLE
@@ -255,9 +263,10 @@ class ReadingController:
         self._next_unqueued: tuple[Chapter | ChapterRef, int] | None = None
         self._planned: dict[int, _Planned] = {}  # id(chunk) -> fragmento en el reproductor
         self._mark: _Mark | None = None
-        self._end: tuple[SessionState, tuple[str, str] | None, list | None] | None = None
+        self._end: _End | None = None
         self._epoch = 0  # cambia con cada salto, play o stop
         self._shown_locator: str | None = None
+        self._nav_tasks: set[asyncio.Task] = set()  # navegaciones manuales en curso
 
         # Componentes del estado de sesión.
         self._active = False  # hay productor o audio de la sesión pendiente
@@ -266,14 +275,16 @@ class ReadingController:
         self._nav_waits = 0
         self._engine_waiting = False
         self._output_retry_used = False
+        self._output_failed = False  # la salida falló y nadie la ha vuelto a abrir
+        self._output_retry: asyncio.Task | None = None
 
-        # Guardado del progreso (una tarea escritora; nunca dos escrituras a la vez).
-        self._writer: asyncio.Task | None = None
-        self._writer_sleeping = False
-        self._dirty = False
-        self._last_write = -math.inf
-        self._save_error_notified = False
-
+        self._progress = ProgressWriter(
+            save=lambda record: self._repos.progress.save(record),
+            build=self._build_record,
+            clock=deps.clock,
+            sleep=deps.sleep,
+            on_error=self._on_save_error,
+        )
         self._em.set_on_state(self._on_engine_state)
         self._player.set_events(self)
 
@@ -287,15 +298,25 @@ class ReadingController:
         """Vista previa: abre la fuente y guarda el documento, pero no reproduce."""
         settings = await self._ensure_settings()
         source, doc, chapter = await self._deps.source_opener(locator, self._deps.fetcher)
-        await asyncio.to_thread(self._store_opened, doc, chapter, settings.store_text)
+        await asyncio.to_thread(
+            store_opened, self._repos.documents, self._repos.chapters, doc, chapter,
+            settings.store_text,
+        )
         progress = await asyncio.to_thread(self._repos.progress.get, doc.doc_id)
         self._preview = (source, doc, chapter)
         return doc, chapter, progress
 
     async def play(self, doc_id: str, start: Position | None = None) -> None:
-        """Empieza a leer en `start`, o donde se quedó, o desde el principio.
+        """Empieza a leer el documento.
 
-        Lanza los errores de apertura (p. ej. `FileMovedOrChanged`) al llamador.
+        `start` es la PRIMERA frase que se lee (`start.sentence_index`), no la última
+        confirmada: para continuar desde un `ProgressRecord` hay que pasar `None`, o
+        una posición con `sentence_index = resume_sentence(record.position)`. Sin
+        `start` se continúa donde se quedó o, si no hay progreso, desde el principio.
+
+        Una novela web del historial se abre sin red con el texto guardado; si falta,
+        la sesión espera la red (WAITING_NETWORK). Lanza los errores de apertura al
+        llamador, p. ej. `FileMovedOrChanged` si un PDF o EPUB se movió o cambió.
         """
         if self._closed:
             return
@@ -306,14 +327,15 @@ class ReadingController:
             try:
                 self._settings = await asyncio.to_thread(_read_settings, self._deps.settings)
                 progress = await asyncio.to_thread(self._repos.progress.get, doc_id)
-                session = await self._session_for(doc_id, start, progress)
+                session = await self._session_for(doc_id)
             except BaseException:
                 self._set_state(SessionState.IDLE)
                 raise
             self._em.reset()  # el productor anterior ya está cancelado
-            if self._paused:
+            if self._paused or self._output_failed:
                 self._paused = False
-                self._player.resume()
+                self._output_failed = False
+                self._player.resume()  # quita la pausa y reabre la salida si falló
             self._output_retry_used = False
             self._shown_locator = None
             self._mark = None
@@ -327,7 +349,7 @@ class ReadingController:
                 self._request_save(force=True)
                 self._launch(_Launch(target, resume_sentence(pos), True, False))
             else:
-                self._launch(_Launch(session.first, 0, True, True))
+                self._launch(_Launch(self._first_target(session), 0, True, True))
 
     async def pause(self) -> None:
         if not self._active or self._paused:
@@ -342,6 +364,7 @@ class ReadingController:
             return
         self._paused = False
         self._output_retry_used = False
+        self._output_failed = False
         self._player.resume()  # también reabre la salida si estaba parada por un fallo
         self._refresh()
 
@@ -382,13 +405,15 @@ class ReadingController:
         current, epoch, nav = base[0], self._epoch, self._session.nav
         nav.reset_visited(current.ref)  # un salto manual nunca es un ciclo por sí solo
         try:
-            nxt = await nav.next_of(current)
+            nxt = await self._navigate(nav.next_of(current))
         except AmbiguousNextChapter as exc:
             self._notice("warn", exc.user_message)
             self._emit("on_needs_choice", list(exc.candidates))
             return
         except LectorError as exc:
             self._notice("warn", exc.user_message)
+            return
+        if nxt is _ABORTED:
             return
         if nxt is None:
             self._notice("info", NO_MORE_CHAPTERS)
@@ -404,9 +429,11 @@ class ReadingController:
             return
         current, epoch = base[0], self._epoch
         try:
-            previous = await self._session.nav.prev_of(current)
+            previous = await self._navigate(self._session.nav.prev_of(current))
         except LectorError as exc:
             self._notice("warn", exc.user_message)
+            return
+        if previous is _ABORTED:
             return
         if previous is None:
             self._notice("info", FIRST_CHAPTER)
@@ -415,14 +442,20 @@ class ReadingController:
         await self._jump(previous, epoch)
 
     async def choose_next(self, ref: ChapterRef) -> None:
+        """Sigue por `ref` y lo recuerda como «siguiente» del capítulo actual (§7.4)."""
         if not self._controllable():
             return
-        epoch = self._epoch
+        base = self._base()
+        current, epoch = (base[0] if base else None), self._epoch
         try:
-            chapter = await self._session.nav.get(ref)
+            chapter = await self._navigate(self._session.nav.get(ref))
         except LectorError as exc:
             self._notice("warn", exc.user_message)
             return
+        if chapter is _ABORTED:
+            return
+        if current is not None and current.ref.locator != chapter.ref.locator:
+            await self._remember_next(current, chapter.ref)
         await self._jump(chapter, epoch)
 
     async def set_voice(
@@ -453,6 +486,16 @@ class ReadingController:
         settings = await self._ensure_settings()
         settings.continuous = on
         await self._persist_setting("continuous", on)
+        if not on:
+            return
+        async with self._lock:
+            # Aún suena el final de un capítulo leído sin lectura continua: se sigue.
+            end, producer = self._end, self._producer
+            if end is None or not end.continuous_off or (producer and not producer.done()):
+                return
+            target, index = self._next_unqueued
+            if isinstance(target, Chapter):
+                self._launch(_Launch(target, index, False, False))
 
     async def shutdown(self, save_only: bool = False) -> None:
         """Cierra la sesión. Con `save_only` solo guarda el progreso confirmado."""
@@ -471,14 +514,7 @@ class ReadingController:
 
     async def flush_progress(self) -> None:
         """Espera a que se escriba el último progreso pedido (adelanta una escritura diferida)."""
-        while True:
-            writer = self._writer
-            if writer is None or writer.done():
-                return
-            if self._writer_sleeping:
-                self._request_save(force=True)
-                continue
-            await asyncio.wait({writer})
+        await self._progress.flush()
 
     # --- Eventos del reproductor (PlayerEvents, en el bucle) --------------------------
 
@@ -487,7 +523,7 @@ class ReadingController:
             planned = self._planned.get(id(chunk))
             if planned is None:
                 return
-            self._output_retry_used = False
+            self._audio_ok()
             k = next((j for j, s in enumerate(chunk.sentences) if s.index == sentence_index), 0)
             if k > 0:  # la anterior del fragmento sonó entera
                 self._confirm(planned, chunk.sentences[k - 1])
@@ -507,7 +543,7 @@ class ReadingController:
             planned = self._planned.pop(id(chunk), None)
             if planned is None:
                 return
-            self._output_retry_used = False
+            self._audio_ok()
             if chunk.sentences:
                 self._confirm(planned, chunk.sentences[-1])
             self._request_save(force=True)
@@ -519,11 +555,16 @@ class ReadingController:
     def on_output_error(self, err: Exception) -> None:
         try:
             log.warning("La salida de audio falló: %s", err, exc_info=err)
-            if self._closed or self._paused:
-                return  # en pausa, resume() la vuelve a abrir
+            if self._closed:
+                return
+            self._output_failed = True
+            if not self._active or self._paused:
+                return  # sin sesión, o en pausa: play() o resume() la vuelven a abrir
             if not self._output_retry_used:
                 self._output_retry_used = True
-                self._player.resume()  # cierra y vuelve a abrir la salida, una vez
+                self._output_retry = asyncio.create_task(
+                    self._retry_output(), name="lector:output-retry"
+                )
                 return
             self._paused = True
             self._player.pause()
@@ -533,6 +574,16 @@ class ReadingController:
             self._notice("warn", message)
         except Exception:
             log.exception("Fallo al procesar un error de la salida de audio")
+
+    async def _retry_output(self) -> None:
+        """Único reintento: espera un poco y cierra y vuelve a abrir la salida."""
+        await self._sleep(OUTPUT_RETRY_DELAY_S)
+        if not self._closed and not self._paused:
+            self._player.resume()
+
+    def _audio_ok(self) -> None:
+        self._output_retry_used = False
+        self._output_failed = False
 
     # --- Avisos del gestor de motores y del navegador ----------------------------------
 
@@ -568,20 +619,20 @@ class ReadingController:
             while True:
                 await self._produce_chapter(chapter, index)
                 if not self._settings.continuous:
-                    self._finish(SessionState.COMPLETED, ("info", CHAPTER_FINISHED))
+                    self._finish(_End(SessionState.COMPLETED, ("info", CHAPTER_FINISHED),
+                                      continuous_off=True))
                     return
                 try:
                     nxt = await nav.next_of(chapter)
                 except AmbiguousNextChapter as exc:
-                    self._finish(
-                        SessionState.NEEDS_ATTENTION, ("warn", exc.user_message), exc.candidates
-                    )
+                    self._finish(_End(SessionState.NEEDS_ATTENTION, ("warn", exc.user_message),
+                                      list(exc.candidates)))
                     return
                 except ChapterLoopDetected as exc:
-                    self._finish(SessionState.NEEDS_ATTENTION, ("warn", exc.user_message))
+                    self._finish(_End(SessionState.NEEDS_ATTENTION, ("warn", exc.user_message)))
                     return
                 if nxt is None:
-                    self._finish(SessionState.COMPLETED, ("info", NO_MORE_CHAPTERS))
+                    self._finish(_End(SessionState.COMPLETED, ("info", NO_MORE_CHAPTERS)))
                     return
                 self._chapter_index(nxt, hint=self._chapter_index(chapter) + 1)
                 nav.mark_visited(nxt.ref)
@@ -599,8 +650,8 @@ class ReadingController:
     def _chapter_ready(self, chapter: Chapter, launch: _Launch) -> None:
         nav = self._session.nav
         self._next_unqueued = (chapter, launch.sentence)
-        if launch.fresh:
-            nav.reset_visited(chapter.ref)
+        # Cada arranque empieza un recorrido nuevo: así un salto atrás no parece un ciclo.
+        nav.reset_visited(chapter.ref)
         if launch.mark_on_load:
             self._set_mark_before(chapter, launch.sentence)
             self._request_save(force=True)
@@ -608,7 +659,7 @@ class ReadingController:
             self._mark.chapter = chapter
         self._loading = False
         self._refresh()
-        if launch.fresh:
+        if launch.show:
             self._show(chapter)
         nav.start_prefetch(chapter)
 
@@ -661,11 +712,12 @@ class ReadingController:
             return s.piper_max_chars, 1
         return s.edge_max_chars, s.edge_max_sentences
 
-    def _finish(
-        self, state: SessionState, notice: tuple[str, str] | None, candidates: list | None = None
-    ) -> None:
-        """Fin del productor: se aplica cuando termina de sonar lo que queda en cola."""
-        self._end = (state, notice, candidates)
+    def _finish(self, end: _End) -> None:
+        """Fin del productor: se aplica cuando termina de sonar lo que queda en cola.
+
+        Hasta entonces la sesión sigue activa: pausa, reanudar y detener funcionan.
+        """
+        self._end = end
         if self._player.queued_count() == 0:
             self._apply_end()
 
@@ -673,29 +725,24 @@ class ReadingController:
         end, self._end = self._end, None
         if end is None:
             return
-        state, notice, candidates = end
         self._active = False
         self._loading = False
-        self._set_state(state)
+        self._set_state(end.state)
         self._request_save(force=True)
-        if notice is not None:
-            self._notice(*notice)
-        if candidates is not None:
-            self._emit("on_needs_choice", list(candidates))
+        if end.notice is not None:
+            self._notice(*end.notice)
+        if end.candidates is not None:
+            self._emit("on_needs_choice", list(end.candidates))
 
     async def _fail(self, exc: Exception) -> None:
+        """El productor murió: se guarda ya y el ERROR llega cuando acabe la cola."""
         log.error("La lectura se detuvo por un error inesperado", exc_info=exc)
         try:
             await self._save_now()
         except Exception:
             log.exception("No se pudo guardar el progreso tras el error")
-        self._active = False
-        self._loading = False
-        self._end = None
-        self._set_state(SessionState.ERROR)
-        self._request_save(force=True)  # deja constancia del estado de error
         message = exc.user_message if isinstance(exc, LectorError) else LectorError.user_message
-        self._notice("error", message)
+        self._finish(_End(SessionState.ERROR, ("error", message)))
 
     async def _cancel_producer(self) -> None:
         task, self._producer = self._producer, None
@@ -705,9 +752,15 @@ class ReadingController:
         await asyncio.wait({task})
 
     async def _halt_locked(self) -> None:
-        """Cancela el productor y vacía el audio; la marca pasa a la frase que sonaba."""
+        """Fin de la sesión actual: productor, navegaciones y audio; la marca pasa a la
+        frase que sonaba."""
         self._epoch += 1
         await self._cancel_producer()  # antes de clear(): ningún enqueue se cuela después
+        await self._cancel_navigation()
+        retry, self._output_retry = self._output_retry, None
+        if retry is not None and not retry.done():
+            retry.cancel()  # play() o resume() reabren la salida si hace falta
+            await asyncio.wait({retry})
         playing = self._playing()
         self._player.clear()
         self._planned.clear()
@@ -716,6 +769,31 @@ class ReadingController:
             self._set_mark_before(*playing)
         self._active = False
         self._loading = False
+
+    async def _navigate(self, coro):
+        """Ejecuta una espera de navegación manual que stop(), shutdown() o play() cancelan.
+
+        Devuelve `_ABORTED` si la cancelaron ellos (no quien llamó).
+        """
+        task = asyncio.create_task(coro, name="lector:navigate")
+        self._nav_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and not (current is not None and current.cancelling()):
+                return _ABORTED
+            raise
+        finally:
+            self._nav_tasks.discard(task)
+
+    async def _cancel_navigation(self) -> None:
+        tasks = [t for t in self._nav_tasks if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
+        self._nav_waits = 0  # una sesión nueva nunca hereda un WAITING_NETWORK
 
     async def _seek(self, target_fn) -> None:
         async with self._lock:
@@ -749,20 +827,45 @@ class ReadingController:
         await self._save_now()  # la posición nueva queda guardada al volver
 
     async def _apply_change(self, apply_now: bool) -> None:
+        """Voz o velocidad nuevas (§5.6).
+
+        Con «Aplicar ya» se corta y se sigue desde el inicio de la frase que sonaba.
+        Si no, el clip que suena termina igual y la cola preparada se descarta y se
+        regenera desde su primera frase.
+        """
         async with self._lock:
+            if not self._active:
+                return
             if apply_now:
-                if self._active:
-                    await self._restart_locked(lambda base: base)
+                await self._restart_locked(lambda base: base)
                 return
-            # Por defecto: lo ya encolado sigue sonando; se regenera desde lo no encolado.
-            if self._producer is None or self._producer.done() or self._next_unqueued is None:
-                return
-            await self._cancel_producer()
-            target, index = self._next_unqueued
+            producing = self._producer is not None and not self._producer.done()
+            await self._cancel_producer()  # antes de descartar: nada se cuela después
+            restart_at = None
+            for chunk in self._player.drop_queued():
+                planned = self._planned.pop(id(chunk), None)
+                if restart_at is None and planned is not None:
+                    restart_at = (planned.chapter, chunk.sentences[0].index)
+            if restart_at is None and producing and self._next_unqueued is not None:
+                restart_at = self._next_unqueued
+            if restart_at is None:
+                return  # solo queda el clip que suena: no hay nada que regenerar
+            target, index = restart_at
             if isinstance(target, Chapter):
                 self._launch(_Launch(target, index, False, False))
             elif self._last_launch is not None:
                 self._launch(self._last_launch)
+
+    async def _remember_next(self, chapter: Chapter, ref: ChapterRef) -> None:
+        chapter.next_ref = ref  # también en memoria: el navegador ya no vuelve a preguntar
+        chapter.next_candidates = []
+        try:
+            await asyncio.to_thread(
+                self._repos.chapters.save, self._session.doc.doc_id, chapter,
+                self._settings.store_text,
+            )
+        except Exception:
+            log.warning("No se pudo recordar el capítulo elegido", exc_info=True)
 
     # --- Posición -----------------------------------------------------------------------
 
@@ -836,7 +939,8 @@ class ReadingController:
             return known
         doc = self._session.doc if self._session else None
         value = next(
-            (r.index for r in (doc.chapters if doc else []) if r.locator == ref.locator and r.index is not None),
+            (r.index for r in (doc.chapters if doc else [])
+             if r.locator == ref.locator and r.index is not None),
             None,
         )
         if value is None:
@@ -851,29 +955,25 @@ class ReadingController:
 
     # --- Sesión y documentos -----------------------------------------------------------
 
-    async def _session_for(
-        self, doc_id: str, start: Position | None, progress: ProgressRecord | None
-    ) -> _Session:
+    async def _session_for(self, doc_id: str) -> _Session:
         if self._session is not None and self._session.doc.doc_id == doc_id:
             return self._session
+        first: Chapter | None = None
         if self._preview is not None and self._preview[1].doc_id == doc_id:
             source, doc, first = self._preview
         else:
-            stored = await asyncio.to_thread(self._repos.documents.get, doc_id)
-            if stored is None:
+            doc = await asyncio.to_thread(self._repos.documents.get, doc_id)
+            if doc is None:
                 raise LectorError(UNKNOWN_DOCUMENT)
-            locator = stored.origin
-            if stored.kind is SourceKind.URL:
-                # Se abre por el capítulo donde se quedó: una sola descarga.
-                position = start or (progress.position if progress else None)
-                if position is not None:
-                    locator = position.chapter_locator
+            if doc.kind is SourceKind.URL:
+                # Sin red: el texto guardado basta y la fuente real se abre al necesitarla.
+                source = DeferredSource(self._deps.source_opener, self._deps.fetcher, doc.origin)
             else:
-                await self._check_file(stored)
-            source, doc, first = await self._deps.source_opener(locator, self._deps.fetcher)
-            if doc.doc_id != doc_id:
-                log.warning("La fuente devolvió otro id (%s); se conserva %s", doc.doc_id, doc_id)
-                doc = replace(doc, doc_id=doc_id)
+                await check_file(doc)
+                source, opened, first = await self._deps.source_opener(doc.origin, self._deps.fetcher)
+                if opened.doc_id != doc_id:
+                    log.warning("La fuente devolvió otro id (%s); se conserva %s", opened.doc_id, doc_id)
+                doc = replace(opened, doc_id=doc_id)
         if self._session is not None:
             await self._session.nav.close()
         nav = self._make_navigator(source, doc)
@@ -883,17 +983,6 @@ class ReadingController:
         self._preview = None
         self._session = _Session(doc, source, nav, first)
         return self._session
-
-    async def _check_file(self, doc: Document) -> None:
-        path = Path(doc.origin)
-        if not path.is_file():
-            raise FileMovedOrChanged(doc.doc_id)
-        try:
-            _, digest = await asyncio.to_thread(file_doc_id, path)
-        except OSError as exc:
-            raise FileMovedOrChanged(doc.doc_id) from exc
-        if doc.file_hash and digest != doc.file_hash:
-            raise FileMovedOrChanged(doc.doc_id)
 
     def _make_navigator(self, source: ContentSource, doc: Document) -> ChapterNavigator:
         if self._deps.navigator_factory is not None:
@@ -905,27 +994,19 @@ class ReadingController:
         )
 
     def _target_for(self, session: _Session, locator: str, index: int | None) -> Chapter | ChapterRef:
-        if session.first.ref.locator == locator:
+        if session.first is not None and session.first.ref.locator == locator:
             return session.first
         for ref in session.doc.chapters:
             if ref.locator == locator:
                 return ref
         return ChapterRef(index, "", locator)
 
-    def _store_opened(self, doc: Document, chapter: Chapter, store_text: bool) -> None:
-        origin_path = size = mtime = None
-        if doc.kind is not SourceKind.URL:
-            origin_path = doc.origin
-            try:
-                stat = Path(doc.origin).stat()
-                size, mtime = stat.st_size, stat.st_mtime
-            except OSError:
-                log.warning("No se pudo leer la fecha del archivo %s", doc.origin)
-        self._repos.documents.upsert(doc, origin_path, size, mtime)
-        try:
-            self._repos.chapters.save(doc.doc_id, chapter, store_text)
-        except LectorError as exc:
-            log.warning("No se pudo guardar el capítulo abierto: %s", exc)
+    def _first_target(self, session: _Session) -> Chapter | ChapterRef:
+        if session.first is not None:
+            return session.first
+        if session.doc.chapters:
+            return session.doc.chapters[0]
+        return ChapterRef(None, "", session.doc.origin)
 
     # --- Configuración -------------------------------------------------------------------
 
@@ -972,66 +1053,26 @@ class ReadingController:
     def _notice(self, level: str, message: str) -> None:
         self._emit("on_notice", level, message)
 
-    # --- Guardado del progreso ------------------------------------------------------------
+    # --- Progreso (la escritura vive en ProgressWriter) ----------------------------------
 
     def _request_save(self, force: bool = False) -> None:
-        """Pide guardar: al momento si `force` o si pasaron 2 s; si no, en cuanto pasen."""
-        if self._mark is None or self._session is None:
-            return
-        self._dirty = True
-        writer = self._writer
-        if writer is not None and not writer.done():
-            if not (force and self._writer_sleeping):
-                return  # la escritura en curso (o la diferida) recoge este cambio
-            writer.cancel()  # está esperando, no escribiendo: se adelanta
-        delay = 0.0
-        if not force:
-            delay = max(0.0, SAVE_INTERVAL_S - (self._clock() - self._last_write))
-        # Se fija aquí, no dentro de la tarea: así se sabe antes de que empiece a correr.
-        self._writer_sleeping = delay > 0
-        self._writer = asyncio.create_task(self._write_loop(delay), name="lector:save")
+        if self._mark is not None and self._session is not None:
+            self._progress.request(force)
 
     async def _save_now(self) -> None:
         self._request_save(force=True)
-        await self.flush_progress()
-
-    async def _write_loop(self, delay: float) -> None:
-        if delay > 0:
-            await self._sleep(delay)
-            self._writer_sleeping = False
-        while self._dirty:
-            self._dirty = False
-            record = self._build_record()
-            if record is None:
-                return
-            self._last_write = self._clock()
-            try:
-                await asyncio.to_thread(self._repos.progress.save, record)
-            except Exception as exc:
-                log.warning("No se pudo guardar el progreso", exc_info=True)
-                if not self._save_error_notified:
-                    self._save_error_notified = True
-                    message = exc.user_message if isinstance(exc, LectorError) else LectorError.user_message
-                    self._notice("warn", message)
-            else:
-                self._save_error_notified = False
+        await self._progress.flush()
 
     def _build_record(self) -> ProgressRecord | None:
         mark, session, settings = self._mark, self._session, self._settings
         if mark is None or session is None or settings is None:
             return None
-        doc, position = session.doc, mark.position
-        return ProgressRecord(
-            doc_id=doc.doc_id,
-            kind=doc.kind,
-            origin=doc.origin,
-            title=doc.title,
-            last_read_at=time.time(),
-            position=position,
-            chapter_url=position.chapter_locator if doc.kind is SourceKind.URL else None,
-            last_chunk_id=mark.chunk_id,
-            edge_voice=settings.edge_voice,
-            piper_voice=settings.piper_voice,
-            speed=settings.speed,
-            session_state=str(self._state),
+        return make_record(
+            session.doc, mark.position, mark.chunk_id,
+            edge_voice=settings.edge_voice, piper_voice=settings.piper_voice,
+            speed=settings.speed, session_state=str(self._state),
         )
+
+    def _on_save_error(self, exc: Exception) -> None:
+        message = exc.user_message if isinstance(exc, LectorError) else LectorError.user_message
+        self._notice("warn", message)
