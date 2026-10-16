@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 
 import pytest
 
@@ -341,7 +343,7 @@ async def test_cancel_during_retry_restores_edge_active(clock):
     assert piper.calls == []
 
 
-async def test_cancel_during_probe_restores_piper_active(clock):
+async def test_cancelled_probe_counts_as_failed_probe(clock):
     edge, piper = FakeEdge(clock=clock), FakePiper()
     manager, _ = make_manager(edge, piper, clock)
     await fall_back_to_piper(manager, edge)
@@ -355,11 +357,19 @@ async def test_cancel_during_probe_restores_piper_active(clock):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-
     assert manager.state is S.PIPER_ACTIVE
-    # La prueba no se consumió: el siguiente fragmento vuelve a sondear.
+
+    # La prueba cancelada cuenta como fallida: el intervalo pasa a 120 s y el
+    # siguiente fragmento (el usuario saltó) no vuelve a pagar la prueba.
     edge.error = None
-    assert (await synth(manager, 2))[1] == "edge"
+    probed_at = clock.now()
+    assert (await synth(manager, 2))[1] == "piper"
+    assert len(edge.probes) == 1
+
+    clock.t = probed_at + 119
+    assert (await synth(manager, 3))[1] == "piper"
+    clock.t = probed_at + 120
+    assert (await synth(manager, 4))[1] == "edge"
     assert len(edge.probes) == 2
 
 
@@ -393,3 +403,169 @@ async def test_callback_and_log_failures_do_not_stop_reading(clock):
 
     assert engine == "piper"
     assert manager.state is S.PIPER_ACTIVE
+
+
+async def test_half_open_failure_doubles_interval_without_retry_ladder(clock):
+    # La prueba sale bien pero la síntesis real con Edge falla siempre.
+    edge = FakeEdge(error=EdgeUnavailable, healthy=True, clock=clock)
+    piper = FakePiper()
+    manager, states = make_manager(edge, piper, clock)
+    await fall_back_to_piper(manager, edge)
+    opened = clock.now()
+
+    n = 1
+    while len(edge.probes) < 6:
+        clock.advance(1)
+        assert (await synth(manager, n))[1] == "piper"
+        n += 1
+
+    times = [opened] + [at for _, at in edge.probes]
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    # 60 s de intervalo inicial, limitado por el enfriamiento de 120 s; luego se duplica.
+    assert gaps == [120, 120, 240, 480, 600, 600]
+    assert clock.sleeps == [1, 2, 4]  # sin escalera de reintentos tras el semiabierto
+    assert len(edge.calls) == 4 + 6  # un único intento real por cada prueba superada
+    assert [s for s, _ in states].count(S.EDGE_RETRYING) == 1
+    assert manager.state is S.PIPER_ACTIVE
+
+
+async def test_interval_resets_only_after_real_edge_success(clock):
+    config = EngineConfig(piper_cooldown_s=0)
+    edge = FakeEdge(error=EdgeUnavailable, healthy=True, clock=clock)
+    piper = FakePiper()
+    manager, _ = make_manager(edge, piper, clock, config)
+    await fall_back_to_piper(manager, edge)
+    opened = clock.now()
+
+    # Prueba correcta + fallo real: el intervalo pasa a 120 s.
+    clock.t = opened + 60
+    assert (await synth(manager, 1))[1] == "piper"
+    reopened = clock.now()
+    clock.t = reopened + 119
+    assert (await synth(manager, 2))[1] == "piper"
+    assert len(edge.probes) == 1
+
+    # Prueba correcta + fragmento real por Edge: el circuito se cierra del todo.
+    edge.error = None
+    clock.t = reopened + 120
+    assert (await synth(manager, 3))[1] == "edge"
+    assert manager.state is S.EDGE_ACTIVE
+
+    # Una caída nueva vuelve a tener escalera de reintentos e intervalo de 60 s.
+    edge.error = EdgeUnavailable
+    edge.healthy = False
+    sleeps_before = len(clock.sleeps)
+    assert (await synth(manager, 4))[1] == "piper"
+    assert clock.sleeps[sleeps_before:] == [1, 2, 4]
+    opened_again = clock.now()
+    clock.t = opened_again + 59
+    await synth(manager, 5)
+    assert len(edge.probes) == 2
+    clock.t = opened_again + 60
+    await synth(manager, 6)
+    assert len(edge.probes) == 3
+
+
+async def test_reset_during_wait_discards_stale_transitions(clock):
+    edge, piper = FakeEdge(error=EdgeUnavailable), FakePiper(error=PiperModelMissing)
+    manager, states = make_manager(edge, piper, clock)
+
+    task = asyncio.create_task(manager.synthesize(make_chunk(0), EDGE_VOICE, PIPER_VOICE, 1.0))
+    async with asyncio.timeout(5):
+        while len(clock.sleeps) < 5:
+            await asyncio.sleep(0)
+    assert manager.state is S.WAITING_NETWORK
+
+    manager.reset()
+    assert manager.state is S.EDGE_ACTIVE
+    piper.error = None
+    async with asyncio.timeout(5):
+        _, engine = await task
+
+    assert engine == "piper"  # la síntesis en curso aún devuelve su clip
+    assert manager.state is S.EDGE_ACTIVE  # pero no aplica sus transiciones
+    assert states[-1] == (S.EDGE_ACTIVE, EDGE)
+
+    edge.error = None
+    assert (await synth(manager, 1))[1] == "edge"
+    assert edge.probes == []
+
+
+async def test_preferred_piper_falls_back_to_edge_but_stays_on_piper(clock):
+    edge, piper = FakeEdge(), FakePiper(errors=[PiperModelMissing])
+    manager, states = make_manager(edge, piper, clock, EngineConfig(preferred="piper"))
+
+    _, engine = await synth(manager, 0)
+    assert engine == "edge"
+    assert clock.sleeps == []  # respaldo inmediato, sin espera
+    assert manager.state is S.PIPER_ACTIVE
+    assert states == []
+
+    # El siguiente fragmento vuelve a intentar Piper primero.
+    assert (await synth(manager, 1))[1] == "piper"
+    assert [c[0] for c in piper.calls] == ["c0", "c1"]
+
+
+async def test_preferred_piper_wait_loop_edge_success_stays_on_piper(clock):
+    edge = FakeEdge(errors=[EdgeUnavailable] * 2)
+    piper = FakePiper(errors=[PiperModelMissing] * 2)
+    manager, states = make_manager(edge, piper, clock, EngineConfig(preferred="piper"))
+
+    _, engine = await synth(manager, 0)
+
+    assert engine == "edge"
+    assert clock.sleeps == [1, 2]
+    assert manager.state is S.PIPER_ACTIVE
+    assert states == [(S.WAITING_NETWORK, EDGE), (S.PIPER_ACTIVE, PIPER)]
+    assert (await synth(manager, 1))[1] == "piper"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"wait_max_s": 0},
+    {"wait_max_s": -1},
+    {"backoff": ()},
+    {"edge_retries": -1},
+    {"recovery_initial_s": 0},
+    {"recovery_initial_s": 100, "recovery_max_s": 50},
+    {"piper_cooldown_s": -1},
+    {"preferred": "otro"},
+])
+def test_config_validation(kwargs):
+    with pytest.raises(ValueError):
+        EngineConfig(**kwargs)
+
+
+def test_config_accepts_edge_cases():
+    EngineConfig(edge_retries=0, piper_cooldown_s=0, recovery_initial_s=600, recovery_max_s=600)
+
+
+async def test_chunk_log_runs_off_event_loop_thread(clock):
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    class RecordingLog:
+        def record(self, chunk_id, engine, outcome):
+            threads.append(threading.get_ident())
+
+    manager, _ = make_manager(FakeEdge(), FakePiper(), clock, chunk_log=RecordingLog())
+    await synth(manager, 0)
+
+    assert len(threads) == 1
+    assert threads[0] != loop_thread
+
+
+async def test_long_outage_logs_traceback_once_per_engine(clock, caplog):
+    caplog.set_level(logging.DEBUG, logger="lector.tts.engine_manager")
+    edge = FakeEdge(errors=[EdgeUnavailable] * 20)
+    piper = FakePiper(error=PiperModelMissing)
+    manager, _ = make_manager(edge, piper, clock)
+
+    assert (await synth(manager, 0))[1] == "edge"
+
+    with_trace = [r for r in caplog.records if r.exc_info]
+    assert sorted(r.getMessage() for r in with_trace) == [
+        "El motor edge falló", "El motor piper falló",
+    ]
+    repeats = [r for r in caplog.records if "sigue fallando" in r.getMessage()]
+    assert len(repeats) == (20 - 1) + (17 - 1)  # el resto, una línea DEBUG por intento
+    assert all(r.levelno == logging.DEBUG for r in repeats)
