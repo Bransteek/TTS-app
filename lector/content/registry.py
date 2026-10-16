@@ -32,8 +32,8 @@ async def open_source(
     """Abre `locator` con el adaptador que le toca.
 
     `prefix_overrides` ({host: ["/ruta/", …]}) son los prefijos de obra corregidos por
-    el usuario para webs genéricas (§5.2): se aplica el que contiene la URL. Madara,
-    PDF y EPUB los ignoran.
+    el usuario para webs genéricas (§5.2): se aplica el que contiene la URL (la escrita o
+    la final tras redirecciones). Madara, PDF y EPUB los ignoran.
     """
     lowered = locator.strip().lower()
     source: ContentSource
@@ -52,7 +52,10 @@ async def open_source(
         if is_madara(result.text):
             source = MadaraSource(fetcher)
         else:
-            override = prefix_override_for(prefix_overrides, url)
+            # Tras una redirección vale la URL escrita o la final, la que esté bajo un
+            # prefijo guardado (el más largo si lo están las dos).
+            found = [prefix_override_for(prefix_overrides, u) for u in (url, result.url)]
+            override = max((p for p in found if p), key=len, default=None)
             source = GenericWebSource(fetcher, work_prefix_override=override)
         document, chapter = await source.open(url, prefetched_html=result.text)
     return source, document, chapter

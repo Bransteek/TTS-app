@@ -109,3 +109,39 @@ async def test_prefix_override_only_for_the_work_it_belongs_to(stub_adapters):
         "https://example.com/obras/y/cap-1", FakeFetcher(PLAIN), prefix_overrides=overrides
     )
     assert source._override is None  # otra obra del mismo host: detección normal
+
+
+class RedirectFetcher(FakeFetcher):
+    """El servidor redirige: la página llega desde otra dirección."""
+
+    def __init__(self, html: str, final_url: str) -> None:
+        super().__init__(html)
+        self.final_url = final_url
+
+    async def get(self, url: str) -> FetchResult:
+        self.calls.append(url)
+        return FetchResult(self.final_url, 200, self.html, "text/html")
+
+
+@pytest.mark.parametrize(
+    ("typed", "final", "expected"),
+    [
+        # Enlace corto que redirige al capítulo: vale la URL final.
+        ("https://example.com/c/123", "https://example.com/obras/x/capitulo-5/", "/obras/x/"),
+        # La URL escrita está bajo el prefijo y la final no: vale la escrita.
+        ("https://example.com/obras/x/capitulo-5", "https://example.com/ver?id=5", "/obras/x/"),
+        # Las dos están bajo prefijos distintos: gana el más largo.
+        ("https://example.com/obras/c-5", "https://example.com/obras/x/c-5/", "/obras/x/"),
+        # Ninguna: detección normal.
+        ("https://example.com/c/123", "https://example.com/otra/c-5/", None),
+    ],
+)
+async def test_prefix_override_matches_typed_or_redirected_url(stub_adapters, typed, final,
+                                                               expected):
+    overrides = {"example.com": ["/obras/", "/obras/x/"]} if "obras/c-5" in typed else {
+        "example.com": ["/obras/x/"]}
+    source, _, _ = await open_source(
+        typed, RedirectFetcher(PLAIN, final), prefix_overrides=overrides
+    )
+    assert isinstance(source, GenericWebSource)
+    assert source._override == expected
