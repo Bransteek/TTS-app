@@ -7,6 +7,7 @@ from lector.content.base import doc_id_for_url
 from lector.content.generic_web import (
     GenericWebSource,
     find_next_candidates,
+    find_prev_candidates,
     guess_work_prefix,
 )
 from lector.errors import NoExtractableText
@@ -106,6 +107,75 @@ def test_work_prefix_from_index_link():
 def test_work_prefix_ignores_unrelated_index_link():
     html = page('<a href="/otra/obra/">Índice</a>')
     assert guess_work_prefix(PAGE_URL, html) == PREFIX
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        f"{HOST}/novela/x/../y/capitulo-6/",
+        f"{HOST}/novela/x/%2e%2e/y/capitulo-6/",
+        f"{HOST}/novela/x/%2E%2E/y/capitulo-6/",
+        f"{HOST}/novela/x/./../y/capitulo-6/",
+    ],
+)
+def test_dot_segments_cannot_escape_prefix(href):
+    assert nav_links(page(f'<a href="{href}">Siguiente</a>')) == []
+
+
+def test_dot_segments_inside_prefix_are_normalized():
+    html = page(f'<a href="{HOST}/novela/x/y/../capitulo-6/">Siguiente</a>')
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Siguiente capítulo »", "Next »", "SIGUIENTE   CAPITULO", "Capítulo siguiente →", "» ", "→", "Next chapter"],
+)
+def test_tolerant_next_text(text):
+    assert nav_links(page(f'<a href="/novela/x/capitulo-6/">{text}</a>')) == [
+        f"{HOST}/novela/x/capitulo-6/"
+    ]
+
+
+@pytest.mark.parametrize("text", ["Siguiente novela", "Next episode", "Ver siguiente capítulo recomendado"])
+def test_next_text_requires_exact_match(text):
+    assert nav_links(page(f'<a href="/novela/x/capitulo-6/">{text}</a>')) == []
+
+
+def prev_links(html: str) -> list[str]:
+    return find_prev_candidates(html, PAGE_URL, PREFIX)
+
+
+def test_prev_rel():
+    html = page(
+        '<link rel="prev" href="/novela/x/capitulo-4/">'
+        '<a href="/novela/x/capitulo-3/">Anterior</a>'
+    )
+    assert prev_links(html) == [f"{HOST}/novela/x/capitulo-4/"]
+
+
+@pytest.mark.parametrize("text", ["Anterior", "« Anterior", "Capítulo anterior", "Previous chapter", "←", "Prev"])
+def test_prev_text(text):
+    html = page(f'<a href="/novela/x/capitulo-4/">{text}</a>')
+    assert prev_links(html) == [f"{HOST}/novela/x/capitulo-4/"]
+
+
+def test_prev_filters_and_no_numeric_tiebreak():
+    html = page(
+        '<a href="/novela/y/capitulo-4/">Anterior</a>'
+        '<a href="/novela/x/capitulo-4/">Previous</a>'
+        '<a href="/novela/x/extra/">Prev</a>'
+    )
+    assert len(prev_links(html)) == 2
+
+
+async def test_open_sets_prev_ref():
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
+    try:
+        _, chapter = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert chapter.prev_ref.locator == f"{HOST}/novela/x/capitulo-4/"
 
 
 # --- fuente completa ---------------------------------------------------------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 import lxml.html
@@ -13,16 +14,50 @@ from lector.errors import NoExtractableText
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.security.http_client import SafeFetcher
 
-_NEXT_TEXTS = {
-    "siguiente", "capitulo siguiente", "capítulo siguiente", "next", "next chapter",
-    "»", "→", "siguiente »", "siguiente →",
+_NEXT_WORDS = {"siguiente", "siguiente capitulo", "capitulo siguiente", "next", "next chapter"}
+_PREV_WORDS = {
+    "anterior", "capitulo anterior", "anterior capitulo", "previous", "prev",
+    "previous chapter", "prev chapter",
 }
+_NEXT_ARROWS = {"»", "→", ">"}
+_PREV_ARROWS = {"«", "←", "<"}
+_DECORATION = " \t\r\n»«→←<>.,:;|-–—·•"
 _INDEX_TEXTS = {"índice", "indice", "tabla de contenidos", "index"}
 _LAST_NUMBER = re.compile(r"(\d+)(?!.*\d)")
 
 
 def _norm_text(element) -> str:
     return re.sub(r"\s+", " ", element.text_content()).strip().lower()
+
+
+def _fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _matches(element, words: set[str], arrows: set[str]) -> bool:
+    """Igualdad exacta tras normalizar (sin acentos ni flechas alrededor); nunca subcadenas."""
+    text = _fold(_norm_text(element))
+    core = re.sub(r"\s+", " ", text.strip(_DECORATION))
+    return core in words if core else text in arrows
+
+
+def _clean_path(path: str) -> str:
+    """Resuelve «.» y «..» (también codificados como %2e) como lo haría el servidor."""
+    segments: list[str] = []
+    raw = re.sub(r"(?i)%2e", ".", path).split("/")
+    for i, seg in enumerate(raw):
+        if seg == "..":
+            if len(segments) > 1:
+                segments.pop()
+            if i == len(raw) - 1:
+                segments.append("")
+        elif seg == ".":
+            if i == len(raw) - 1:
+                segments.append("")
+        else:
+            segments.append(seg)
+    return "/".join(segments) or "/"
 
 
 def _parse(html: str):
@@ -92,11 +127,10 @@ def guess_work_prefix(chapter_url: str, html: str) -> str:
     return prefix
 
 
-def find_next_candidates(html: str, page_url: str, work_prefix: str) -> list[str]:
-    """URLs posibles de «siguiente capítulo»; una sola si es inequívoca."""
-    tree = _parse(html)
-    if tree is None:
-        return []
+def _nav_links(
+    tree, page_url: str, work_prefix: str, rel: str, words: set[str], arrows: set[str]
+) -> list[str]:
+    """Enlaces rel=<rel> o de texto reconocido, del mismo host y dentro de la obra."""
     work_prefix = _with_slash(work_prefix)
     host = urlsplit(page_url).netloc.lower()
 
@@ -105,21 +139,32 @@ def find_next_candidates(html: str, page_url: str, work_prefix: str) -> list[str
         for href in hrefs:
             if not href or not href.strip():
                 continue
-            url = _strip(urljoin(page_url, href.strip()))
-            parts = urlsplit(url)
+            parts = urlsplit(_strip(urljoin(page_url, href.strip())))
             if parts.scheme not in ("http", "https") or parts.netloc.lower() != host:
                 continue
+            parts = parts._replace(path=_clean_path(parts.path))
             if not _with_slash(parts.path).startswith(work_prefix):
                 continue
+            url = parts.geturl()
             if _same_url(url, page_url) or url in found:
                 continue
             found.append(url)
         return found
 
-    by_rel = keep([el.get("href") for el in tree.cssselect("link[rel~=next][href], a[rel~=next][href]")])
-    candidates = by_rel or keep(
-        [a.get("href") for a in tree.cssselect("a[href]") if _norm_text(a) in _NEXT_TEXTS]
+    by_rel = keep(
+        [el.get("href") for el in tree.cssselect(f"link[rel~={rel}][href], a[rel~={rel}][href]")]
     )
+    return by_rel or keep(
+        [a.get("href") for a in tree.cssselect("a[href]") if _matches(a, words, arrows)]
+    )
+
+
+def find_next_candidates(html: str, page_url: str, work_prefix: str) -> list[str]:
+    """URLs posibles de «siguiente capítulo»; una sola si es inequívoca."""
+    tree = _parse(html)
+    if tree is None:
+        return []
+    candidates = _nav_links(tree, page_url, work_prefix, "next", _NEXT_WORDS, _NEXT_ARROWS)
     if len(candidates) >= 2:
         expected = _increment_last_number(page_url)
         if expected is not None:
@@ -127,6 +172,14 @@ def find_next_candidates(html: str, page_url: str, work_prefix: str) -> list[str
             if len(matching) == 1:
                 return matching
     return candidates
+
+
+def find_prev_candidates(html: str, page_url: str, work_prefix: str) -> list[str]:
+    """URLs posibles de «capítulo anterior» (sin desempate numérico)."""
+    tree = _parse(html)
+    if tree is None:
+        return []
+    return _nav_links(tree, page_url, work_prefix, "prev", _PREV_WORDS, _PREV_ARROWS)
 
 
 class GenericWebSource(ContentSource):
@@ -191,6 +244,7 @@ class GenericWebSource(ContentSource):
         title = self._title(html)
         urls = find_next_candidates(html, url, self._prefix)
         refs = [ChapterRef(None, "", u) for u in urls]
+        prev = find_prev_candidates(html, url, self._prefix)
         return Chapter(
             ref=ChapterRef(None, title, url),
             title=title,
@@ -198,7 +252,7 @@ class GenericWebSource(ContentSource):
             paragraphs=paragraphs,
             sentences=sentences,
             next_ref=refs[0] if len(refs) == 1 else None,
-            prev_ref=None,
+            prev_ref=ChapterRef(None, "", prev[0]) if len(prev) == 1 else None,
             next_candidates=refs if len(refs) > 1 else [],
         )
 
