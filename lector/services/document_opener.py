@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from lector.content.base import ContentSource
-from lector.content.pdf_source import file_doc_id
-from lector.errors import FileMovedOrChanged, LectorError
+from lector.errors import LectorError
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.persistence.repositories import ChapterRepo, DocumentRepo
+from lector.services import recovery
 
 log = logging.getLogger(__name__)
 
@@ -46,17 +46,12 @@ def store_opened(
         log.warning("No se pudo guardar el capítulo abierto: %s", exc)
 
 
-async def check_file(doc: Document) -> None:
-    """Lanza `FileMovedOrChanged` si el archivo ya no existe o su contenido cambió."""
-    path = Path(doc.origin)
-    if not path.is_file():
-        raise FileMovedOrChanged(doc.doc_id)
-    try:
-        _, digest = await asyncio.to_thread(file_doc_id, path)
-    except OSError as exc:
-        raise FileMovedOrChanged(doc.doc_id) from exc
-    if doc.file_hash and digest != doc.file_hash:
-        raise FileMovedOrChanged(doc.doc_id)
+async def check_file(doc: Document, stored_stat: tuple[int, float] | None = None) -> None:
+    """Lanza `FileMovedOrChanged` si el archivo ya no existe o su contenido cambió.
+
+    Delega en `recovery.check_file` (única implementación) en un hilo.
+    """
+    await asyncio.to_thread(recovery.check_file, doc, doc.origin, stored_stat)
 
 
 class DeferredSource:

@@ -158,6 +158,25 @@ class DocumentRepo(_Repo):
         row = self._run(op)
         return self._row_to_doc(row) if row else None
 
+    def file_stat(self, doc_id: str) -> tuple[int, float] | None:
+        """(tamaño, mtime) guardados del archivo, o None si no se guardaron."""
+        row = self._run(lambda c: c.execute(
+            "SELECT file_size, file_mtime FROM documents WHERE doc_id=?", (doc_id,)).fetchone())
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return row[0], row[1]
+
+    def update_origin(self, doc_id: str, origin: str, file_size: int | None,
+                      file_mtime: float | None) -> None:
+        """Nueva ubicación del archivo (documento y progreso)."""
+
+        def op(c: sqlite3.Connection) -> None:
+            c.execute("UPDATE documents SET origin=?, file_size=?, file_mtime=? WHERE doc_id=?",
+                      (origin, file_size, file_mtime, doc_id))
+            c.execute("UPDATE progress SET origin=? WHERE doc_id=?", (origin, doc_id))
+
+        self._run(op)
+
     def delete_if_unread(self, doc_id: str) -> bool:
         """Borra el documento y sus capítulos si nunca se leyó (sin progreso). True si lo borró."""
 

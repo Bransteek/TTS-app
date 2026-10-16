@@ -1022,7 +1022,8 @@ class ReadingController:
                     lambda locator, _fetcher: self._open_source(locator), self._deps.fetcher, doc
                 )
             else:
-                await check_file(doc)
+                stat = await asyncio.to_thread(self._repos.documents.file_stat, doc_id)
+                await check_file(doc, stat)
                 source, opened, first = await self._open_source(doc.origin)
                 if opened.doc_id != doc_id:
                     log.warning("La fuente devolvió otro id (%s); se conserva %s", opened.doc_id, doc_id)
