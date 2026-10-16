@@ -10,17 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QHideEvent, QPalette, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -32,29 +29,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from lector.content.generic_web import set_prefix_override
 from lector.errors import LectorError
-from lector.models import Chapter, ChapterRef, Document, Position
+from lector.models import ChapterRef
 from lector.persistence.repositories import (
     ChapterRepo,
     DocumentRepo,
-    ProgressRecord,
     SettingsRepo,
     VoicesCacheRepo,
 )
 from lector.services.reading_controller import SessionState
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
-from lector.tts.engine_manager import EDGE_LABEL, PIPER_LABEL, EngineState
 from lector.tts.piper_engine import PiperModelManager
 from lector.ui.history_dialog import HistoryDialog
-from lector.ui.playback_controls import (
-    PlaybackControls,
-    VoicePanel,
-    edge_voice_items,
-    piper_voice_items,
-)
-from lector.ui.preview_panel import ChoicePanel, PreviewPanel, validate_prefix
-from lector.ui.resume_dialog import ResumeChoice, ResumeDialog, ResumeOffer, chapter_with_page
+from lector.ui.open_flow import PLAYING_STATES, OpenFlowMixin
+from lector.ui.playback_controls import PlaybackControls, VoicePanel
+from lector.ui.preview_panel import ChoicePanel, PreviewPanel
+from lector.ui.resume_dialog import ResumeDialog, ResumeOffer
+from lector.ui.status_panels import VoiceStatusMixin
 
 log = logging.getLogger(__name__)
 
@@ -62,20 +53,7 @@ GENERIC_ERROR = (
     "Ocurrió un problema inesperado. La lectura se ha pausado y tu progreso está guardado."
 )
 SETTINGS_LOAD_FAILED = "No se pudo cargar la configuración. Se usan los valores por defecto."
-NOTHING_TO_READ = "Pega la dirección de un capítulo o abre un archivo PDF o EPUB."
 CONTINUING = "Se sigue leyendo donde lo dejaste."
-STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
-LEAVE_CHECK_MS = 300  # la app sin foco tanto tiempo: el usuario se fue (no es un parpadeo)
-WAITING_TEXT = "Esperando conexión…"
-EDGE_TEXT = {
-    EngineState.EDGE_ACTIVE: "Conectado",
-    EngineState.EDGE_RETRYING: "Reintentando…",
-    EngineState.EDGE_RECOVERY_TEST: "Reintentando…",
-    EngineState.PIPER_ACTIVE: "Sin conexión",
-    EngineState.WAITING_NETWORK: "Sin conexión",
-}
-_PLAYING_STATES = frozenset({SessionState.READING, SessionState.LOADING,
-                             SessionState.WAITING_NETWORK})
 _SETTING_KEYS = ("edge_voice", "language", "piper_voice", "piper_speaker", "speed",
                  "continuous", "skip_seconds", "preferred_engine", "highlight_sentence")
 
@@ -85,13 +63,6 @@ class _Loaded:
     values: dict[str, Any]
     edge_voices: list[dict]
     piper: list[tuple[str, list[str]]]  # (modelo instalado, hablantes)
-
-
-@dataclass
-class _Preview:
-    locator: str
-    doc: Document
-    chapter: Chapter
 
 
 def _read_state(settings: SettingsRepo, voices: VoicesCacheRepo,
@@ -107,20 +78,7 @@ def _read_state(settings: SettingsRepo, voices: VoicesCacheRepo,
     return _Loaded(values, edge_voices, piper)
 
 
-def _store_override(settings: SettingsRepo, chapter_url: str, path: str | None) -> None:
-    """Recuerda el prefijo corregido de la obra de `chapter_url` (None: lo olvida).
-
-    En el hilo de trabajo.
-    """
-    overrides = set_prefix_override(settings.get("work_prefix_overrides"), chapter_url, path)
-    settings.set("work_prefix_overrides", overrides)
-
-
-def _chapter_start(index: int, ref: ChapterRef, page: int | None = None) -> Position:
-    return Position(ref.index if ref.index is not None else index, ref.locator, 0, 0, 0, page)
-
-
-class MainWindow(QMainWindow):
+class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
     close_to_tray_requested = Signal()  # al cerrar: la app pasa a la bandeja y sigue leyendo
     settings_requested = Signal()  # «Configuración…» o el enlace de Piper (diálogo de T18)
 
@@ -147,18 +105,9 @@ class MainWindow(QMainWindow):
         self._state = SessionState.IDLE
         self._session_doc: str | None = None  # documento de la sesión (play o document_sig)
         self._session_chapter: str | None = None  # capítulo que suena (document_sig)
-        self._preview: _Preview | None = None
-        self._opening = False
-        self._open_gen = 0  # cada apertura nueva deja caducas las respuestas de las anteriores
-        self._play_pending = False  # un play() en vuelo: no se manda otro
-        self._confirm_after_leer = False  # «Leer» pidió leer y la vista previa espera confirmar
-        # Posición elegida (capítulo, «empezar», …) que aún no cargó: un reintento vuelve a ella.
-        self._pending_start: tuple[str, Position] | None = None
-        self._own_dialogs = 0  # diálogos nativos propios abiertos (no cuentan como irse)
-        self._preferred = "edge"
-        self._engine_seen = False
+        self._init_open_flow()
+        self._init_voice_status()
         self._highlight = True
-        self._piper_short: dict[str, str] = {}
         self._notice_level: str | None = None
         self.settings_loaded = False
         self.history_dialog: HistoryDialog | None = None
@@ -166,10 +115,6 @@ class MainWindow(QMainWindow):
         self._choice_tag: tuple[str | None, str | None] | None = None  # (doc, capítulo)
         self._quitting = False
         self._resume = ResumeOffer(self, self._apply_resume, lambda: self.show_notice(CONTINUING))
-        self._leave_timer = QTimer(self)
-        self._leave_timer.setSingleShot(True)
-        self._leave_timer.setInterval(LEAVE_CHECK_MS)
-        self._leave_timer.timeout.connect(self._check_user_left)
 
         self.setWindowTitle("Lector")
         self._build()
@@ -234,6 +179,10 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
+        # Hueco para avisos propios de la app (p. ej. el de primer arranque de T18): `add_top_banner`.
+        self._banner_layout = QVBoxLayout()
+        self._banner_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self._banner_layout)
         layout.addWidget(self.notice_label)
         layout.addLayout(input_row)
         layout.addWidget(self.preview)
@@ -247,16 +196,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         self.setCentralWidget(central)
 
-        self.engine_label = QLabel(f"Motor activo: {EDGE_LABEL}")
-        self.edge_label = QLabel(f"Edge: {EDGE_TEXT[EngineState.EDGE_ACTIVE]}")
-        self.piper_label = QLabel()
-        self.piper_label.setTextFormat(Qt.TextFormat.RichText)
-        self.waiting_label = QLabel(WAITING_TEXT)
-        self.waiting_label.hide()
-        self._set_piper_label(None)
-        bar = self.statusBar()
-        for label in (self.waiting_label, self.engine_label, self.edge_label, self.piper_label):
-            bar.addPermanentWidget(label)
+        self._build_status_bar()
 
         menu = self.menuBar().addMenu("Lector")
         self.history_action = QAction("Historial…", self)
@@ -277,7 +217,6 @@ class MainWindow(QMainWindow):
         self.open_file_button.clicked.connect(self._on_open_file_clicked)
         self.history_action.triggered.connect(self._show_history)
         self.settings_action.triggered.connect(self.settings_requested.emit)
-        self.piper_label.linkActivated.connect(lambda _link: self.settings_requested.emit())
         self.choice_panel.chosen.connect(self._on_choice_chosen)
         app = QApplication.instance()
         if app is not None:
@@ -295,13 +234,11 @@ class MainWindow(QMainWindow):
         c.restart_button.clicked.connect(lambda: self._run(ctl.restart_chapter()))
         c.continuous_check.clicked.connect(lambda on: self._run(ctl.set_continuous(on)))
 
-        v = self.voice
-        v.preferred_changed.connect(self._on_preferred_changed)
-        v.edge_voice_changed.connect(
-            lambda voice: self._run(ctl.set_voice(voice, None, v.apply_now()))
-        )
-        v.piper_voice_changed.connect(self._on_piper_voice_changed)
-        v.speed_changed.connect(lambda speed: self._run(ctl.set_speed(speed, v.apply_now())))
+        self._connect_voice()
+
+    def add_top_banner(self, widget: QWidget) -> None:
+        """Pone `widget` arriba del todo de la ventana, sobre el aviso y la entrada (p. ej. el banner de T18)."""
+        self._banner_layout.addWidget(widget)
 
     # --- configuración (leída en el hilo de trabajo) -------------------------------------------
 
@@ -313,23 +250,7 @@ class MainWindow(QMainWindow):
 
     def _apply_loaded(self, loaded: _Loaded) -> None:
         values = loaded.values
-        self._preferred = values["preferred_engine"] or "edge"
-        self.voice.set_preferred(self._preferred)
-        if not self._engine_seen:
-            self.engine_label.setText(
-                f"Motor activo: {PIPER_LABEL if self._preferred == 'piper' else EDGE_LABEL}"
-            )
-        edge_voice = values["edge_voice"]
-        self.voice.set_edge_voices(
-            edge_voice_items(loaded.edge_voices, values["language"], edge_voice), edge_voice
-        )
-        piper = piper_voice_items(loaded.piper)
-        self._piper_short = {data: short for _, data, short in piper}
-        speaker = values["piper_speaker"]
-        current = f"{values['piper_voice']}#{speaker}" if speaker else values["piper_voice"]
-        self.voice.set_piper_voices([(text, data) for text, data, _ in piper], current)
-        self._set_piper_label(current)
-        self.voice.set_speed(float(values["speed"]))
+        self._apply_voice_settings(loaded)
         self.controls.set_continuous(bool(values["continuous"]))
         self.controls.set_skip_seconds(int(values["skip_seconds"]))
         highlight = values["highlight_sentence"]
@@ -344,13 +265,6 @@ class MainWindow(QMainWindow):
         log.error("No se pudo cargar la configuración",
                   exc_info=(type(exc), exc, exc.__traceback__))
         self.show_notice(SETTINGS_LOAD_FAILED, "warn")
-
-    def _set_piper_label(self, voice: str | None) -> None:
-        short = self._piper_short.get(voice) if voice else None
-        if short:
-            self.piper_label.setText(f"Piper: Listo ({short})")
-        else:
-            self.piper_label.setText('Piper: <a href="#configuracion">Sin voz instalada</a>')
 
     # --- llamadas al trabajador -------------------------------------------------------------
 
@@ -396,289 +310,6 @@ class MainWindow(QMainWindow):
         self.notice_label.hide()
         self._notice_level = None
 
-    # --- abrir y leer ------------------------------------------------------------------------
-
-    def _on_read_clicked(self) -> None:
-        locator = self.url_edit.text().strip()
-        if not locator:
-            self.show_notice(NOTHING_TO_READ)
-            return
-        if self._opening or self._play_pending:
-            return  # doble clic: ya hay una orden en vuelo
-        preview = self._preview
-        if preview is None or preview.locator != locator:
-            self._open(locator, autoplay=True)
-            return
-        doc = preview.doc
-        if self._session_doc == doc.doc_id:
-            # Ya se empezó a leer este documento: «Leer» no lo reinicia ni vuelve al
-            # capítulo elegido al principio; sigue donde iba.
-            if self._state in _PLAYING_STATES:
-                return
-            if self._state is SessionState.PAUSED:
-                self._run(self._ctl.resume())
-                return
-            if not self.preview.needs_confirmation():
-                self._play(doc.doc_id, None)
-                return
-            # Se volvió a abrir y la vista previa espera confirmar: vale lo que se elija ahora.
-        edited = self.preview.edited_prefix()
-        if edited is not None:
-            self._reopen_with_prefix(preview, edited)
-            return
-        picked = self.preview.selected_chapter()
-        self._play(doc.doc_id, _chapter_start(*picked) if picked else None)
-
-    def _on_open_file_clicked(self) -> None:
-        with self.own_native_dialog():
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Abrir PDF o EPUB", "", "Libros PDF o EPUB (*.pdf *.epub)"
-            )
-        if path:
-            self.url_edit.setText(path)
-            self._open(path, autoplay=False)
-
-    def _open(self, locator: str, autoplay: bool) -> None:
-        self._start_open(locator, self._ctl.open(locator), autoplay, confirmed=False)
-
-    def _reopen_with_prefix(self, preview: _Preview, typed: str) -> None:
-        """Guarda el prefijo corregido de la obra y vuelve a abrir con él antes de leer.
-
-        Un campo vacío olvida la corrección guardada (vuelve a la detección). El mismo
-        prefijo (con o sin «/» final) no cambia nada: se lee lo ya abierto.
-        """
-        doc, chapter_url = preview.doc, preview.chapter.ref.locator
-        path: str | None = None
-        if typed:
-            path, error = validate_prefix(typed, doc.origin, chapter_url)
-            if error is not None:
-                self.preview.show_prefix_error(error)
-                return
-            if path == urlsplit(doc.work_prefix or "").path.rstrip("/") + "/":
-                self._play(doc.doc_id, None)
-                return
-        settings, documents, ctl, locator = self._settings, self._documents, self._ctl, preview.locator
-
-        async def save_and_open():
-            await asyncio.to_thread(_store_override, settings, chapter_url, path)
-            result = await ctl.open(locator)
-            if result[0].doc_id != doc.doc_id:
-                # El documento del prefijo equivocado no queda en el historial si no se leyó.
-                # Es limpieza: si falla, se avisa en el registro y se lee igual.
-                try:
-                    await asyncio.to_thread(documents.delete_if_unread, doc.doc_id)
-                except Exception:
-                    log.warning("No se pudo borrar el documento sin leer %s", doc.doc_id,
-                                exc_info=True)
-            return result
-
-        self._start_open(locator, save_and_open(), autoplay=True, confirmed=True)
-
-    def _start_open(self, locator: str, job: Coroutine, autoplay: bool, confirmed: bool) -> None:
-        self._clear_notice()
-        self._clear_choice()
-        self._resume.cancel()
-        self._confirm_after_leer = False
-        self._pending_start = None
-        self._open_gen += 1
-        gen = self._open_gen
-        self._set_opening(True)
-
-        def opened(result) -> None:
-            if gen != self._open_gen:
-                return  # caducada: después se abrió otra cosa (p. ej. desde el historial)
-            self._set_opening(False)
-            doc, chapter, progress = result
-            self._preview = _Preview(locator, doc, chapter)
-            fresh = progress is None
-            self.preview.show_preview(
-                doc, chapter,
-                editable_prefix=fresh and not confirmed and doc.adapter == "generic",
-                choose_chapter=fresh and doc.index_page,
-            )
-            self.preview.show()
-            if progress is not None:
-                known = chapter.title if chapter.ref.locator == progress.position.chapter_locator else None
-                self.offer_resume(doc, progress, chapter_title=known)
-            elif autoplay and not self.preview.needs_confirmation():
-                self._play(doc.doc_id, None)
-            elif autoplay:
-                self._confirm_after_leer = True
-                if not self.user_present():
-                    self._auto_confirm()  # se fue mientras se abría: no espera a nadie
-
-        def failed(exc: BaseException) -> None:
-            if gen != self._open_gen:
-                return
-            self._set_opening(False)
-            self._on_error(exc)
-
-        if not self._run(job, opened, failed):
-            self._set_opening(False)
-
-    def _set_opening(self, busy: bool) -> None:
-        self._opening = busy
-        self.read_button.setEnabled(not busy)
-        self.open_file_button.setEnabled(not busy)
-        if busy:
-            self.statusBar().showMessage("Abriendo…")
-        else:
-            self.statusBar().clearMessage()
-
-    def _play(self, doc_id: str, start: Position | None) -> None:
-        """Lee `doc_id` desde `start`; sin `start`, desde la posición elegida que no llegó a cargar."""
-        if start is not None:
-            self._pending_start = (doc_id, start)
-        elif self._pending_start is not None and self._pending_start[0] == doc_id:
-            start = self._pending_start[1]
-        self._play_job(doc_id, self._ctl.play(doc_id, start))
-
-    def _play_job(self, doc_id: str, job: Coroutine) -> None:
-        """Manda una orden que empieza a leer `doc_id`.
-
-        Mientras está en vuelo, «Leer» y Leer/Pausar no mandan otra (doble clic); una
-        elección explícita (reanudar, historial) sí se manda.
-        """
-        self._session_doc = doc_id
-        self._clear_choice()  # una elección pendiente era de la lectura anterior
-        self._confirm_after_leer = False
-        self.preview.settle()  # ya no se espera confirmar el prefijo ni el capítulo
-
-        def done(_result=None) -> None:
-            self._play_pending = False
-
-        def failed(exc: BaseException) -> None:
-            done()
-            self._on_error(exc)
-
-        self._play_pending = self._run(job, done, failed)
-
-    def _on_play_pause(self) -> None:
-        # Pausar y seguir valen aunque haya un play() en vuelo; solo no se manda otro play.
-        if self._state in _PLAYING_STATES:
-            self._run(self._ctl.pause())
-        elif self._state is SessionState.PAUSED:
-            self._run(self._ctl.resume())
-        elif self._play_pending or self._opening:
-            return
-        elif self._session_doc is not None:
-            self._play(self._session_doc, None)
-        else:
-            self._on_read_clicked()
-
-    # --- reanudación ----------------------------------------------------------------------------
-
-    def user_present(self) -> bool:
-        """¿El usuario mira la app? Visible, sin minimizar y con el foco (aquí o en un diálogo)."""
-        if not self.isVisible() or self.isMinimized():
-            return False
-        return self.isActiveWindow() or QApplication.activeWindow() is not None
-
-    def _auto_confirm(self) -> None:
-        """Sin el usuario delante tras «Leer»: empieza con lo detectado, sin esperar.
-
-        Prefijo detectado en una web genérica; capítulo 1 al abrir desde el índice. Lo que
-        el usuario hubiera escrito o elegido sin confirmar no cuenta.
-        """
-        preview = self._preview
-        if not self._confirm_after_leer or preview is None:
-            return
-        self._confirm_after_leer = False
-        if not self.preview.needs_confirmation():
-            return
-        doc = preview.doc
-        start = None
-        if not self.preview.chapter_list.isHidden() and doc.chapters:
-            start = _chapter_start(0, doc.chapters[0])
-        self._play(doc.doc_id, start)
-        self.show_notice(STARTED_TEXT)
-
-    def _user_left(self, hidden: bool) -> None:
-        """El usuario se fue al juego: oculta o minimizada (`hidden`) o la app sin foco."""
-        if self._quitting or self._own_dialogs:
-            return
-        self._auto_confirm()
-        if hidden:
-            self._resume.window_hidden()
-        else:
-            self._resume.window_deactivated()
-
-    @Slot(Qt.ApplicationState)
-    def _on_app_state(self, state: Qt.ApplicationState) -> None:
-        # Un diálogo de la propia app con el foco no deja la app inactiva. Se espera un poco
-        # antes de decidir: un parpadeo del foco no cuenta como irse.
-        if state == Qt.ApplicationState.ApplicationActive:
-            self._leave_timer.stop()
-        elif self.isVisible():  # oculta: ya se trató al ocultarla
-            self._leave_timer.start()
-
-    def _check_user_left(self) -> None:
-        if self._own_dialogs:
-            return
-        if self.isVisible() and not self.user_present():
-            self._user_left(hidden=self.isMinimized())
-
-    @contextmanager
-    def own_native_dialog(self) -> Iterator[None]:
-        """Envuelve un diálogo nativo de la app (p. ej. `QFileDialog.getOpenFileName`).
-
-        Mientras está abierto, Qt no ve ninguna ventana activa y la app queda inactiva:
-        eso no es irse al juego. Al cerrarse se mira solo el estado real (si el usuario
-        sigue fuera, la comprobación diferida lo detecta). Puede anidarse; T17 y T18
-        deben usarlo con sus propios diálogos nativos.
-        """
-        self._own_dialogs += 1
-        self._leave_timer.stop()
-        try:
-            yield
-        finally:
-            self._own_dialogs -= 1
-            if not self._own_dialogs:
-                self._leave_timer.stop()
-                if self.isVisible() and not self.user_present():
-                    self._leave_timer.start()
-
-    def offer_resume(self, doc: Document, progress: ProgressRecord, *,
-                     chapter_title: str | None = None,
-                     auto_continue_when_hidden: bool = True) -> None:
-        """Ofrece continuar, empezar o elegir capítulo o página.
-
-        Sin el usuario delante (oculta, minimizada o sin foco) nunca abre un diálogo:
-        con `auto_continue_when_hidden` continúa; sin él, la oferta espera a que se
-        muestre la ventana (la recuperación al arrancar no lee sin que se lo pidan).
-        """
-        self._resume.offer(doc, progress, present=self.user_present(),
-                           chapter_title=chapter_title,
-                           auto_continue_when_hidden=auto_continue_when_hidden)
-
-    def _apply_resume(self, doc: Document, progress: ProgressRecord, choice: ResumeChoice) -> None:
-        if choice.kind == "continue":
-            self._play(doc.doc_id, None)
-        elif choice.kind == "start":
-            self._play(doc.doc_id, self._start_of(doc, progress))
-        elif choice.kind == "chapter" and choice.chapter is not None:
-            index = doc.chapters.index(choice.chapter) if choice.chapter in doc.chapters else 0
-            self._play(doc.doc_id, _chapter_start(index, choice.chapter))
-        elif choice.kind == "page" and choice.page is not None:
-            self._play_job(doc.doc_id, self._play_page(doc, choice.page))
-
-    def _start_of(self, doc: Document, progress: ProgressRecord) -> Position:
-        if doc.chapters:
-            return _chapter_start(0, doc.chapters[0])
-        # Web sin índice: el principio es el del capítulo abierto (o el guardado).
-        if self._preview is not None and self._preview.doc.doc_id == doc.doc_id:
-            return _chapter_start(0, self._preview.chapter.ref)
-        pos = progress.position
-        return Position(pos.chapter_index, pos.chapter_locator, 0, 0, 0, None)
-
-    async def _play_page(self, doc: Document, page: int) -> None:
-        """En el trabajador: busca la primera frase de la página y lee desde ahí."""
-        position = await self._ctl.locate_page(doc.doc_id, page)
-        if position is None:
-            found = chapter_with_page(doc, page)
-            position = _chapter_start(*found, page=page) if found else None
-        await self._ctl.play(doc.doc_id, position)
-
     # --- historial --------------------------------------------------------------------------------
 
     def _show_history(self) -> None:
@@ -693,31 +324,6 @@ class MainWindow(QMainWindow):
         self.history_dialog = dialog
         dialog.show()
 
-    def _open_from_history(self, doc: Document, progress: ProgressRecord | None,
-                           chapter_title: str | None = None) -> None:
-        self._clear_notice()
-        self._clear_choice()
-        self._resume.cancel()
-        self._confirm_after_leer = False
-        self._pending_start = None
-        self._open_gen += 1  # lo que se estuviera abriendo ya no vale: manda el historial
-        self._set_opening(False)
-        self.url_edit.setText(doc.origin)
-        self.preview.hide()
-        self._preview = None
-        if progress is not None:
-            self.offer_resume(doc, progress, chapter_title=chapter_title)
-        else:
-            self._play(doc.doc_id, None)
-
-    def _on_preferred_changed(self, name: str) -> None:
-        self._preferred = name
-        self._run(self._ctl.set_preferred_engine(name))
-
-    def _on_piper_voice_changed(self, voice: str) -> None:
-        self._set_piper_label(voice)
-        self._run(self._ctl.set_voice(None, voice, self.voice.apply_now()))
-
     # --- avisos del controlador ---------------------------------------------------------------
 
     @Slot(str)
@@ -728,24 +334,20 @@ class MainWindow(QMainWindow):
             log.warning("Estado de sesión desconocido: %r", value)
             return
         previous, self._state = self._state, state
-        self.controls.set_playing(state in _PLAYING_STATES)
+        self.controls.set_playing(state in PLAYING_STATES)
         self.waiting_label.setVisible(state is SessionState.WAITING_NETWORK)
         back_to_reading = state is SessionState.READING and previous is not SessionState.READING
         if back_to_reading and self._notice_level in ("warn", "error"):
             self._clear_notice()  # el problema avisado ya pasó
 
+    # `@Slot` solo funciona en una clase de Qt: los de los mixins se declaran aquí y delegan.
+    @Slot(Qt.ApplicationState)
+    def _on_app_state(self, state: Qt.ApplicationState) -> None:
+        self._handle_app_state(state)
+
     @Slot(str, str)
     def _on_engine_state(self, value: str, active: str) -> None:
-        self._engine_seen = True
-        self.engine_label.setText(f"Motor activo: {active}")
-        try:
-            state = EngineState(value.lower())
-        except ValueError:
-            log.warning("Estado de motor desconocido: %r", value)
-            return
-        if state is EngineState.PIPER_ACTIVE and self._preferred == "piper":
-            return  # Piper por elección: no dice nada de la conexión con Edge
-        self.edge_label.setText(f"Edge: {EDGE_TEXT[state]}")
+        self._handle_engine_state(value, active)
 
     @Slot(object, object)
     def _on_document(self, doc, chapter) -> None:
@@ -834,7 +436,14 @@ class MainWindow(QMainWindow):
         if self._quitting:
             event.accept()
             return
-        # Cerrar no sale de la app: se oculta en la bandeja y la lectura sigue (T17/T19).
         event.ignore()
+        self._hide_to_tray()
+
+    def _hide_to_tray(self) -> None:
+        """Cerrar no sale de la app: se oculta en la bandeja y la lectura sigue (punto de T17/T19).
+
+        Aquí (cierre), en `hideEvent` y en `changeEvent` (minimizar) se decide qué pasa al
+        irse el usuario; los avisos de la app se muestran con `show_notice`.
+        """
         self.hide()
         self.close_to_tray_requested.emit()

@@ -1283,7 +1283,7 @@ def test_own_dialog_taking_focus_is_not_leaving(qtbot, make_window, ctl, monkeyp
 
 def test_open_file_without_leer_never_auto_confirms(qtbot, make_window, ctl, monkeypatch):
     """Solo «Leer» pide leer: abrir un archivo para verlo no empieza aunque el usuario se vaya."""
-    from lector.ui import main_window as mw
+    from lector.ui import open_flow as mw
 
     ctl.open_result = (make_doc(index_page=True), make_chapter(), None)
     monkeypatch.setattr(mw.QFileDialog, "getOpenFileName",
@@ -1502,7 +1502,7 @@ def spin(ms: int) -> None:
 
 def native_file_dialog(window, monkeypatch, *, comes_back: bool = True, browse_ms: int = 800):
     """«Abrir PDF/EPUB…» nativo: Qt no ve ninguna ventana activa mientras está abierto."""
-    from lector.ui import main_window as mw
+    from lector.ui import open_flow as mw
 
     app = QApplication.instance()
 
@@ -1609,7 +1609,7 @@ def test_failed_delete_of_wrong_document_does_not_block_reading(qtbot, make_wind
     read(qtbot, window)
     qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
 
-    with caplog.at_level(logging.WARNING, logger="lector.ui.main_window"):
+    with caplog.at_level(logging.WARNING, logger="lector.ui.open_flow"):
         window.preview.prefix_edit.setText("https://example.com/")
         window.read_button.click()
         wait_call(qtbot, ctl, "play", "doc-corregido", None)
