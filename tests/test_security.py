@@ -170,3 +170,50 @@ async def test_post_sends_ajax_header():
     assert seen[0].headers["x-requested-with"] == "XMLHttpRequest"
     assert seen[0].content == b"k=v"
     assert result.text == "ok"
+
+
+async def test_size_limit_streaming_aborts_early():
+    consumed = 0
+
+    async def body():
+        nonlocal consumed
+        for _ in range(100):  # 100 MB potenciales, sin Content-Length
+            consumed += 1
+            yield b"a" * 1_000_000
+
+    def handler(request):
+        return httpx.Response(200, content=body(), headers=HTML)
+
+    fetcher = make_fetcher(handler)
+    with pytest.raises(PageUnreachable):
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert consumed < 10
+
+
+async def test_unencodable_host_is_invalid_url():
+    fetcher = make_fetcher(lambda request: httpx.Response(200, text="x", headers=HTML))
+    with pytest.raises(InvalidUrl):
+        await fetcher.get("http://☃.net/")
+    await fetcher.aclose()
+
+
+async def test_redirect_to_unencodable_host_is_invalid_url():
+    def handler(request):
+        return httpx.Response(302, headers=[(b"location", "http://☃.net/".encode())])
+
+    fetcher = make_fetcher(handler)
+    with pytest.raises(InvalidUrl):
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+
+
+async def test_resolver_oserror_is_recoverable_unreachable():
+    async def resolver(host, port):
+        raise OSError("dns caído")
+
+    fetcher = SafeFetcher(resolver=resolver, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    with pytest.raises(PageUnreachable) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert exc.value.recoverable is True

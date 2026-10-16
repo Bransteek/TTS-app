@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from ..errors import InvalidUrl, PageUnreachable
+from ..errors import InvalidUrl, LectorError, PageUnreachable
 from .url_validator import ensure_public_ip, resolve_public, validate_url
 
 USER_AGENT = (
@@ -86,30 +86,48 @@ class SafeFetcher:
         await self._client.aclose()
 
     async def _fetch(self, method: str, url: str, data: dict | None) -> FetchResult:
+        try:
+            return await self._fetch_hops(method, url, data)
+        except LectorError:
+            raise
+        except httpx.InvalidURL:  # p. ej. host que no se puede codificar en IDNA
+            raise InvalidUrl() from None
+        except httpx.RemoteProtocolError as exc:
+            # httpx construye next_request y falla con un Location no válido (p. ej. IDNA)
+            if "Invalid URL in location header" in str(exc):
+                raise InvalidUrl() from None
+            raise PageUnreachable(recoverable=True) from None
+        except (httpx.HTTPError, TimeoutError, OSError):
+            raise PageUnreachable(recoverable=True) from None
+
+    async def _fetch_hops(self, method: str, url: str, data: dict | None) -> FetchResult:
         current = validate_url(url)
         for _ in range(self._max_redirects + 1):
             parts = urlsplit(current)
             port = parts.port or (443 if parts.scheme == "https" else 80)
-            ip = ensure_public_ip(await self._resolver(parts.hostname, port))
+            try:
+                resolved = await self._resolver(parts.hostname, port)
+            except LectorError:
+                raise
+            except Exception:
+                raise PageUnreachable(recoverable=True) from None
+            ip = ensure_public_ip(resolved)
             headers = {"X-Requested-With": "XMLHttpRequest"} if method == "POST" else {}
             request = self._client.build_request(
                 method, current, data=data, headers=headers, extensions={"pinned_ip": ip}
             )
-            try:
-                async with asyncio.timeout(self._timeout):
-                    response = await self._client.send(request, stream=True)
-                    try:
-                        location = response.headers.get("location")
-                        if response.status_code in REDIRECT_CODES and location:
-                            current = validate_url(urljoin(current, location))
-                            if response.status_code in (301, 302, 303):
-                                method, data = "GET", None
-                            continue
-                        return await self._read(current, response)
-                    finally:
-                        await response.aclose()
-            except (httpx.HTTPError, TimeoutError, OSError):
-                raise PageUnreachable(recoverable=True) from None
+            async with asyncio.timeout(self._timeout):
+                response = await self._client.send(request, stream=True)
+                try:
+                    location = response.headers.get("location")
+                    if response.status_code in REDIRECT_CODES and location:
+                        current = validate_url(urljoin(current, location))
+                        if response.status_code in (301, 302, 303):
+                            method, data = "GET", None
+                        continue
+                    return await self._read(current, response)
+                finally:
+                    await response.aclose()
         raise PageUnreachable("La página redirige demasiadas veces.", recoverable=False)
 
     async def _read(self, url: str, response: httpx.Response) -> FetchResult:
