@@ -57,5 +57,5 @@ async def open_source(
             found = [prefix_override_for(prefix_overrides, u) for u in (url, result.url)]
             override = max((p for p in found if p), key=len, default=None)
             source = GenericWebSource(fetcher, work_prefix_override=override)
-        document, chapter = await source.open(url, prefetched_html=result.text)
+        document, chapter = await source.open(result.url, prefetched_html=result.text)
     return source, document, chapter
