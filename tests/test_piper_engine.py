@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import numpy as np
 import pytest
 
 from lector.audio.pcm import OUTPUT_RATE
 from lector.audio.player import QueuedClip
-from lector.errors import PiperModelMissing, SynthesisFailed
+from lector.errors import PageUnreachable, PiperModelMissing, SynthesisFailed
 from lector.models import Chunk, Sentence
 from lector.tts.piper_engine import PiperEngine, PiperModelManager
 from tests.fakes import FakePiperVoice
@@ -109,8 +110,8 @@ async def test_speaker_id_from_map(tmp_path):
     assert fake.calls[-1][1].speaker_id == 3
     await engine.synthesize(chunk_of("Hola."), MODEL, 1.0)
     assert fake.calls[-1][1].speaker_id is None
-    with pytest.raises(SynthesisFailed):
-        await engine.synthesize(chunk_of("Hola."), f"{MODEL}#Z", 1.0)
+    await engine.synthesize(chunk_of("Hola."), f"{MODEL}#Z", 1.0)  # typo: no mata el respaldo
+    assert fake.calls[-1][1].speaker_id is None
 
 
 async def test_model_loaded_once_and_reloaded_on_change(tmp_path):
@@ -135,23 +136,113 @@ async def test_loader_and_synth_errors_are_mapped(tmp_path):
     assert await engine.health_check(MODEL) is False
 
 
-async def test_cancellation_propagates(tmp_path):
-    engine, _, _ = make_engine(tmp_path)
+async def test_cancellation_during_synthesis_propagates(tmp_path):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    class Slow(FakePiperVoice):
+        def synthesize(self, text, syn_config=None, include_alignments=False):
+            started.set()
+            release.wait(5)
+            return super().synthesize(text, syn_config)
+
+    engine, _, _ = make_engine(tmp_path, fake=Slow())
     task = asyncio.ensure_future(engine.synthesize(chunk_of("Hola."), MODEL, 1.0))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
     task.cancel()
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
 
-async def test_download_uses_download_voice(tmp_path, monkeypatch):
-    calls, progress = [], []
-    monkeypatch.setattr(
-        "lector.tts.piper_engine.download_voice",
-        lambda name, directory: calls.append((name, directory)),
-    )
-    await PiperModelManager(tmp_path).download(MODEL, progress.append)
-    assert calls == [(MODEL, tmp_path)]
-    assert progress[0] == 0.0 and progress[-1] == 1.0
+@pytest.mark.parametrize("speed,scale", [(10.0, 0.4), (0.1, 2.0)])
+async def test_speed_clamped_at_limits(tmp_path, speed, scale):
+    engine, fake, _ = make_engine(tmp_path)
+    await engine.synthesize(chunk_of("Hola."), MODEL, speed)
+    assert fake.calls[0][1].length_scale == pytest.approx(scale)
+
+
+def make_transport(onnx=b"x" * 200_000, cfg=b'{"speaker_id_map": {"F": 0}}', fail_onnx_at=None, hits=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if hits is not None:
+            hits.append(str(request.url))
+        if request.url.path.endswith(".onnx.json"):
+            return httpx.Response(200, content=cfg)
+        if fail_onnx_at is not None:
+            raise httpx.ReadError("corte", request=request)
+        return httpx.Response(200, content=onnx)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_download_success_with_progress(tmp_path):
+    hits, progress = [], []
+    mgr = PiperModelManager(tmp_path, transport=make_transport(hits=hits))
+    await mgr.download(MODEL, progress.append)
+    assert mgr.is_installed(MODEL) and mgr.speakers(MODEL) == ["F"]
+    assert all("huggingface.co/rhasspy/piper-voices" in u and "es_ES/sharvard/medium" in u for u in hits)
+    assert len(progress) > 2 and progress[-1] == 1.0
+    assert progress == sorted(progress)
+    assert not list(tmp_path.glob(".part-*"))
+
+
+async def test_download_failure_leaves_nothing(tmp_path):
+    mgr = PiperModelManager(tmp_path, transport=make_transport(fail_onnx_at=1))
+    with pytest.raises(PageUnreachable):
+        await mgr.download(MODEL)
+    assert not mgr.is_installed(MODEL)
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_truncated_is_rejected(tmp_path):
+    def handler(request):
+        if request.url.path.endswith(".json"):
+            return httpx.Response(200, content=b"{}")
+        return httpx.Response(200, headers={"content-length": "100"}, content=b"")
+
+    mgr = PiperModelManager(tmp_path, transport=httpx.MockTransport(handler))
+    with pytest.raises(PageUnreachable):
+        await mgr.download(MODEL)
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_bad_json_rejected(tmp_path):
+    mgr = PiperModelManager(tmp_path, transport=make_transport(cfg=b"<html>"))
+    with pytest.raises(PageUnreachable):
+        await mgr.download(MODEL)
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_cancellation_cleans_up(tmp_path):
+    started = asyncio.Event()
+
+    class Slow(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"x" * 1000
+            started.set()
+            await asyncio.sleep(30)
+
+    def handler(request):
+        return httpx.Response(200, stream=Slow())
+
+    mgr = PiperModelManager(tmp_path, transport=httpx.MockTransport(handler))
+    task = asyncio.ensure_future(mgr.download(MODEL))
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_retry_after_failure_succeeds(tmp_path):
+    bad = PiperModelManager(tmp_path, transport=make_transport(fail_onnx_at=1))
+    with pytest.raises(PageUnreachable):
+        await bad.download(MODEL)
+    good = PiperModelManager(tmp_path, transport=make_transport())
+    await good.download(MODEL)
+    assert good.is_installed(MODEL)
 
 
 async def test_download_rejects_bad_name(tmp_path):
@@ -164,3 +255,14 @@ def test_catalog_shape():
     assert "es_ES-sharvard-medium" in names and len(names) >= 5
     assert all({"name", "label", "gender", "size_mb", "license_note"} <= v.keys()
                for v in PiperModelManager.CATALOG)
+
+
+async def test_broken_piper_import_maps_to_missing(tmp_path, monkeypatch):
+    import sys
+
+    install(tmp_path)
+    monkeypatch.setitem(sys.modules, "piper", None)  # import -> ImportError
+    engine = PiperEngine(PiperModelManager(tmp_path))
+    with pytest.raises(PiperModelMissing):
+        await engine.synthesize(chunk_of("Hola."), MODEL, 1.0)
+    assert await engine.health_check(MODEL) is False
