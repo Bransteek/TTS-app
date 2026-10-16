@@ -56,6 +56,19 @@ class PlayerEvents(Protocol):
     def on_output_error(self, err: Exception) -> None: ...
 
 
+class _NoEvents:
+    """Destinatario provisional hasta que alguien llame a `set_events`."""
+
+    def on_sentence_started(self, chunk: Chunk, sentence_index: int) -> None:
+        pass
+
+    def on_chunk_finished(self, chunk: Chunk) -> None:
+        pass
+
+    def on_output_error(self, err: Exception) -> None:
+        log.warning("Fallo de la salida de audio sin destinatario: %s", err)
+
+
 class AudioOutput(Protocol):
     def start(
         self,
@@ -156,13 +169,13 @@ class AudioPlayer:
         self,
         output: AudioOutput,
         loop: asyncio.AbstractEventLoop,
-        events: PlayerEvents,
+        events: PlayerEvents | None = None,
         max_ahead: int = 2,
         max_seconds: float = 90.0,
     ):
         self._output = output
         self._loop = loop
-        self._events = events
+        self._events: PlayerEvents = events if events is not None else _NoEvents()
         self._max_ahead = max_ahead
         self._max_samples = max_seconds * OUTPUT_RATE
 
@@ -187,6 +200,10 @@ class AudioPlayer:
         self._output_gen = 0  # cambia en cada arranque, fallo atendido o close()
 
     # --- API del bucle -------------------------------------------------------------
+
+    def set_events(self, events: PlayerEvents) -> None:
+        """Cambia el destinatario de los eventos (el controlador se registra al crearse)."""
+        self._events = events
 
     async def enqueue(self, clip: QueuedClip) -> bool:
         """Encola el clip; espera si ya hay `max_ahead` clips además del que suena,

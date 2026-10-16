@@ -1,0 +1,1037 @@
+"""Controlador de lectura: orquesta navegador, motores y reproductor.
+
+Hilos: todo el controlador vive en el bucle asyncio del hilo de trabajo. El
+reproductor entrega sus eventos en ese bucle (`call_soon_threadsafe`), el gestor
+de motores y el navegador avisan desde tareas del mismo bucle, y los métodos
+públicos se ejecutan ahí. Por eso el estado no necesita candados de hilo; un
+`asyncio.Lock` serializa las operaciones que sustituyen al productor, de modo
+que nunca hay dos vivos a la vez. Los eventos hacia la interfaz
+(`ControllerEvents`) también salen en ese bucle: quien los reciba en Qt debe
+reenviarlos a su hilo.
+
+Progreso confirmado: `Position` describe la última frase que sonó entera
+(`sentence_index == -1` si aún no sonó ninguna del capítulo). El punto de
+reanudación es la frase siguiente (`resume_sentence`).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from enum import StrEnum, auto
+from pathlib import Path
+from typing import Any, Protocol
+
+from lector.audio.player import AudioPlayer, QueuedClip
+from lector.content import registry
+from lector.content.base import ContentSource
+from lector.content.pdf_source import file_doc_id
+from lector.content.segmenter import make_chunks
+from lector.errors import (
+    AmbiguousNextChapter,
+    AudioOutputError,
+    ChapterLoopDetected,
+    FileMovedOrChanged,
+    LectorError,
+)
+from lector.models import Chapter, ChapterRef, Chunk, Document, Position, Sentence, SourceKind
+from lector.persistence.repositories import (
+    ChapterRepo,
+    DocumentRepo,
+    ProgressRecord,
+    ProgressRepo,
+    SettingsRepo,
+)
+from lector.services.navigator import ChapterNavigator
+from lector.tts.base import AudioClip, clamp_speed
+from lector.tts.engine_manager import EngineManager, EngineState
+
+log = logging.getLogger(__name__)
+
+SAVE_INTERVAL_S = 2.0
+CHARS_PER_SECOND = 14.0
+NO_MORE_CHAPTERS = "No hay más capítulos publicados"
+CHAPTER_FINISHED = "Terminó el capítulo."
+FIRST_CHAPTER = "Este ya es el primer capítulo."
+UNKNOWN_DOCUMENT = "No se encontró ese documento en el historial."
+SPEED_ADJUSTED = "La velocidad se ajustó a {speed:g}, el valor permitido más cercano."
+
+# Estados del gestor en los que el audio sale de Piper (límites de fragmento de Piper).
+_PIPER_STATES = frozenset({EngineState.PIPER_ACTIVE, EngineState.EDGE_RECOVERY_TEST})
+
+
+class SessionState(StrEnum):
+    IDLE = auto()
+    LOADING = auto()
+    READING = auto()
+    PAUSED = auto()
+    STOPPED = auto()
+    COMPLETED = auto()
+    WAITING_NETWORK = auto()
+    NEEDS_ATTENTION = auto()
+    ERROR = auto()
+
+
+class ControllerEvents(Protocol):
+    """Avisos hacia la interfaz. Se llaman en el bucle asyncio del hilo de trabajo."""
+
+    def on_session_state(self, state: SessionState) -> None: ...
+
+    def on_engine_state(self, state: EngineState, active: str) -> None: ...
+
+    def on_document(self, doc: Document, chapter: Chapter) -> None: ...
+
+    def on_sentence(
+        self, chapter_title: str, sentence_text: str, sentence_index: int, total: int
+    ) -> None: ...
+
+    def on_notice(self, level: str, message: str) -> None: ...  # "info" | "warn" | "error"
+
+    def on_needs_choice(self, candidates: list[ChapterRef]) -> None: ...
+
+
+def resume_sentence(position: Position) -> int:
+    """Frase por la que se reanuda: la siguiente a la última confirmada."""
+    return position.sentence_index + 1
+
+
+@dataclass
+class Repos:
+    documents: DocumentRepo
+    chapters: ChapterRepo
+    progress: ProgressRepo
+
+    @classmethod
+    def from_connection(cls, conn) -> Repos:
+        return cls(DocumentRepo(conn), ChapterRepo(conn), ProgressRepo(conn))
+
+
+SourceOpener = Callable[[str, Any], Awaitable[tuple[ContentSource, Document, Chapter]]]
+NavigatorFactory = Callable[[ContentSource, Document], ChapterNavigator]
+
+
+@dataclass
+class ControllerDeps:
+    fetcher: Any  # SafeFetcher (None si solo se abren archivos)
+    repos: Repos
+    engine_manager: EngineManager
+    player: AudioPlayer
+    settings: SettingsRepo
+    source_opener: SourceOpener = registry.open_source
+    # None: ChapterNavigator con store_text, prefetch_ahead y wait_max_s de la configuración.
+    navigator_factory: NavigatorFactory | None = None
+    clock: Callable[[], float] = time.monotonic  # limita el guardado a uno cada 2 s
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+@dataclass
+class _Settings:
+    edge_max_chars: int
+    edge_max_sentences: int
+    piper_max_chars: int
+    continuous: bool
+    store_text: bool
+    prefetch_ahead: int
+    wait_max_s: float
+    edge_voice: str
+    piper_voice: str  # «nombre#hablante», como lo espera el motor
+    speed: float
+
+
+def _read_settings(repo: SettingsRepo) -> _Settings:
+    get = repo.get
+    piper, speaker = get("piper_voice"), get("piper_speaker")
+    speed, _ = clamp_speed("edge", float(get("speed")))
+    return _Settings(
+        edge_max_chars=int(get("edge_max_chars")),
+        edge_max_sentences=int(get("edge_max_sentences")),
+        piper_max_chars=int(get("piper_max_chars")),
+        continuous=bool(get("continuous")),
+        store_text=bool(get("store_text")),
+        prefetch_ahead=int(get("prefetch_ahead")),
+        wait_max_s=float(get("wait_max_s")),
+        edge_voice=get("edge_voice"),
+        piper_voice=f"{piper}#{speaker}" if speaker else piper,
+        speed=speed,
+    )
+
+
+@dataclass(eq=False)
+class _Planned:
+    """Un fragmento entregado al reproductor y el capítulo al que pertenece."""
+
+    chunk: Chunk
+    chapter: Chapter
+
+
+@dataclass
+class _Mark:
+    """Última frase confirmada. `chapter` es una referencia hasta que se carga."""
+
+    chapter: Chapter | ChapterRef
+    position: Position
+    chunk_id: str | None
+
+
+@dataclass(eq=False)
+class _Session:
+    doc: Document
+    source: ContentSource
+    nav: ChapterNavigator
+    first: Chapter  # el capítulo que devolvió la fuente al abrirla
+
+
+@dataclass
+class _Launch:
+    target: Chapter | ChapterRef
+    sentence: int
+    fresh: bool  # posición nueva elegida (reinicia el historial de capítulos y la muestra)
+    mark_on_load: bool  # la marca se calcula al cargar el capítulo
+
+
+def _queued_clip(chunk: Chunk, clip: AudioClip, engine: str) -> QueuedClip | None:
+    """Clip listo para el reproductor; None si no trae audio.
+
+    Corrige marcas imperfectas en vez de dejar que un clip raro detenga la lectura.
+    """
+    size = len(clip.pcm)
+    if size == 0:
+        return None
+    marks: list[tuple[int, int]] = []
+    for offset, index in clip.marks:
+        if 0 <= offset < size and (not marks or offset > marks[-1][0]):
+            marks.append((offset, index))
+    if not marks or marks[0][0] != 0:
+        marks.insert(0, (0, chunk.sentences[0].index))
+    return QueuedClip(chunk, clip.pcm, marks, engine)
+
+
+def _skip_index(sentences: list[Sentence], start: int, delta: float, speed: float) -> int:
+    """Avanza o retrocede frase a frase hasta cubrir |delta| segundos estimados."""
+    per_second = CHARS_PER_SECOND * speed
+    index = min(start, len(sentences))
+    covered = 0.0
+    if delta >= 0:
+        while covered < delta and index < len(sentences):
+            covered += len(sentences[index].text) / per_second
+            index += 1
+    else:
+        while covered < -delta and index > 0:
+            index -= 1
+            covered += len(sentences[index].text) / per_second
+    return index
+
+
+class ReadingController:
+    """Sesión de lectura: un productor (síntesis -> cola) y el progreso confirmado.
+
+    Implementa `PlayerEvents`: se registra en el reproductor y en el gestor de
+    motores al crearse.
+    """
+
+    def __init__(self, deps: ControllerDeps, events: ControllerEvents):
+        self._deps = deps
+        self._events = events
+        self._player = deps.player
+        self._em = deps.engine_manager
+        self._repos = deps.repos
+        self._clock = deps.clock
+        self._sleep = deps.sleep
+        self._lock = asyncio.Lock()
+        self._state = SessionState.IDLE
+        self._closed = False
+
+        self._settings: _Settings | None = None
+        self._preview: tuple[ContentSource, Document, Chapter] | None = None
+        self._session: _Session | None = None
+        self._chapter_indexes: dict[str, int] = {}
+
+        # Productor y posición.
+        self._producer: asyncio.Task | None = None
+        self._last_launch: _Launch | None = None
+        self._next_unqueued: tuple[Chapter | ChapterRef, int] | None = None
+        self._planned: dict[int, _Planned] = {}  # id(chunk) -> fragmento en el reproductor
+        self._mark: _Mark | None = None
+        self._end: tuple[SessionState, tuple[str, str] | None, list | None] | None = None
+        self._epoch = 0  # cambia con cada salto, play o stop
+        self._shown_locator: str | None = None
+
+        # Componentes del estado de sesión.
+        self._active = False  # hay productor o audio de la sesión pendiente
+        self._loading = False
+        self._paused = False
+        self._nav_waits = 0
+        self._engine_waiting = False
+        self._output_retry_used = False
+
+        # Guardado del progreso (una tarea escritora; nunca dos escrituras a la vez).
+        self._writer: asyncio.Task | None = None
+        self._writer_sleeping = False
+        self._dirty = False
+        self._last_write = -math.inf
+        self._save_error_notified = False
+
+        self._em.set_on_state(self._on_engine_state)
+        self._player.set_events(self)
+
+    @property
+    def state(self) -> SessionState:
+        return self._state
+
+    # --- API pública ----------------------------------------------------------------
+
+    async def open(self, locator: str) -> tuple[Document, Chapter, ProgressRecord | None]:
+        """Vista previa: abre la fuente y guarda el documento, pero no reproduce."""
+        settings = await self._ensure_settings()
+        source, doc, chapter = await self._deps.source_opener(locator, self._deps.fetcher)
+        await asyncio.to_thread(self._store_opened, doc, chapter, settings.store_text)
+        progress = await asyncio.to_thread(self._repos.progress.get, doc.doc_id)
+        self._preview = (source, doc, chapter)
+        return doc, chapter, progress
+
+    async def play(self, doc_id: str, start: Position | None = None) -> None:
+        """Empieza a leer en `start`, o donde se quedó, o desde el principio.
+
+        Lanza los errores de apertura (p. ej. `FileMovedOrChanged`) al llamador.
+        """
+        if self._closed:
+            return
+        async with self._lock:
+            await self._halt_locked()
+            await self._save_now()
+            self._set_state(SessionState.LOADING)
+            try:
+                self._settings = await asyncio.to_thread(_read_settings, self._deps.settings)
+                progress = await asyncio.to_thread(self._repos.progress.get, doc_id)
+                session = await self._session_for(doc_id, start, progress)
+            except BaseException:
+                self._set_state(SessionState.IDLE)
+                raise
+            self._em.reset()  # el productor anterior ya está cancelado
+            if self._paused:
+                self._paused = False
+                self._player.resume()
+            self._output_retry_used = False
+            self._shown_locator = None
+            self._mark = None
+            if start is not None:
+                target = self._target_for(session, start.chapter_locator, start.chapter_index)
+                self._launch(_Launch(target, start.sentence_index, True, True))
+            elif progress is not None:
+                pos = progress.position
+                target = self._target_for(session, pos.chapter_locator, pos.chapter_index)
+                self._mark = _Mark(target, pos, progress.last_chunk_id)
+                self._request_save(force=True)
+                self._launch(_Launch(target, resume_sentence(pos), True, False))
+            else:
+                self._launch(_Launch(session.first, 0, True, True))
+
+    async def pause(self) -> None:
+        if not self._active or self._paused:
+            return
+        self._paused = True
+        self._player.pause()
+        self._refresh()
+        await self._save_now()
+
+    async def resume(self) -> None:
+        if not self._active or not self._paused:
+            return
+        self._paused = False
+        self._output_retry_used = False
+        self._player.resume()  # también reabre la salida si estaba parada por un fallo
+        self._refresh()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            if self._session is None or self._state in (SessionState.IDLE, SessionState.STOPPED):
+                return
+            await self._halt_locked()
+            await self._session.nav.close()
+            self._set_state(SessionState.STOPPED)
+            await self._save_now()
+
+    async def next_sentence(self) -> None:
+        await self._seek(lambda base: (base[0], base[1] + 1) if base else None)
+
+    async def prev_sentence(self) -> None:
+        await self._seek(lambda base: (base[0], base[1] - 1) if base else None)
+
+    async def restart_chapter(self) -> None:
+        await self._seek(lambda base: (base[0], 0) if base else None)
+
+    async def skip_seconds(self, delta: float) -> None:
+        def target(base):
+            if base is None:
+                return None
+            chapter, index = base
+            speed = self._settings.speed if self._settings else 1.0
+            return chapter, _skip_index(chapter.sentences, index, delta, speed)
+
+        await self._seek(target)
+
+    async def next_chapter(self) -> None:
+        if not self._controllable():
+            return
+        base = self._base()
+        if base is None:
+            return
+        current, epoch, nav = base[0], self._epoch, self._session.nav
+        nav.reset_visited(current.ref)  # un salto manual nunca es un ciclo por sí solo
+        try:
+            nxt = await nav.next_of(current)
+        except AmbiguousNextChapter as exc:
+            self._notice("warn", exc.user_message)
+            self._emit("on_needs_choice", list(exc.candidates))
+            return
+        except LectorError as exc:
+            self._notice("warn", exc.user_message)
+            return
+        if nxt is None:
+            self._notice("info", NO_MORE_CHAPTERS)
+            return
+        self._chapter_index(nxt, hint=self._chapter_index(current) + 1)
+        await self._jump(nxt, epoch)
+
+    async def prev_chapter(self) -> None:
+        if not self._controllable():
+            return
+        base = self._base()
+        if base is None:
+            return
+        current, epoch = base[0], self._epoch
+        try:
+            previous = await self._session.nav.prev_of(current)
+        except LectorError as exc:
+            self._notice("warn", exc.user_message)
+            return
+        if previous is None:
+            self._notice("info", FIRST_CHAPTER)
+            return
+        self._chapter_index(previous, hint=self._chapter_index(current) - 1)
+        await self._jump(previous, epoch)
+
+    async def choose_next(self, ref: ChapterRef) -> None:
+        if not self._controllable():
+            return
+        epoch = self._epoch
+        try:
+            chapter = await self._session.nav.get(ref)
+        except LectorError as exc:
+            self._notice("warn", exc.user_message)
+            return
+        await self._jump(chapter, epoch)
+
+    async def set_voice(
+        self, edge_voice: str | None, piper_voice: str | None, apply_now: bool
+    ) -> None:
+        settings = await self._ensure_settings()
+        if edge_voice is not None:
+            settings.edge_voice = edge_voice
+            await self._persist_setting("edge_voice", edge_voice)
+        if piper_voice is not None:
+            settings.piper_voice = piper_voice
+            name, _, speaker = piper_voice.partition("#")
+            await self._persist_setting("piper_voice", name)
+            await self._persist_setting("piper_speaker", speaker or None)
+        await self._apply_change(apply_now)
+
+    async def set_speed(self, speed: float, apply_now: bool) -> None:
+        settings = await self._ensure_settings()
+        # El rango de Edge cabe dentro del de Piper: vale para los dos motores.
+        value, clamped = clamp_speed("edge", speed)
+        if clamped:
+            self._notice("info", SPEED_ADJUSTED.format(speed=value))
+        settings.speed = value
+        await self._persist_setting("speed", value)
+        await self._apply_change(apply_now)
+
+    async def set_continuous(self, on: bool) -> None:
+        settings = await self._ensure_settings()
+        settings.continuous = on
+        await self._persist_setting("continuous", on)
+
+    async def shutdown(self, save_only: bool = False) -> None:
+        """Cierra la sesión. Con `save_only` solo guarda el progreso confirmado."""
+        if save_only:
+            await self._save_now()
+            return
+        if self._closed:
+            return
+        async with self._lock:
+            self._closed = True
+            await self._halt_locked()
+            if self._session is not None:
+                await self._session.nav.close()
+            self._player.close()
+            await self._save_now()
+
+    async def flush_progress(self) -> None:
+        """Espera a que se escriba el último progreso pedido (adelanta una escritura diferida)."""
+        while True:
+            writer = self._writer
+            if writer is None or writer.done():
+                return
+            if self._writer_sleeping:
+                self._request_save(force=True)
+                continue
+            await asyncio.wait({writer})
+
+    # --- Eventos del reproductor (PlayerEvents, en el bucle) --------------------------
+
+    def on_sentence_started(self, chunk: Chunk, sentence_index: int) -> None:
+        try:
+            planned = self._planned.get(id(chunk))
+            if planned is None:
+                return
+            self._output_retry_used = False
+            k = next((j for j, s in enumerate(chunk.sentences) if s.index == sentence_index), 0)
+            if k > 0:  # la anterior del fragmento sonó entera
+                self._confirm(planned, chunk.sentences[k - 1])
+                self._request_save()
+            chapter = planned.chapter
+            self._show(chapter)
+            if 0 <= sentence_index < len(chapter.sentences):
+                self._emit(
+                    "on_sentence", chapter.title, chapter.sentences[sentence_index].text,
+                    sentence_index, len(chapter.sentences),
+                )
+        except Exception:
+            log.exception("Fallo al procesar el inicio de una frase")
+
+    def on_chunk_finished(self, chunk: Chunk) -> None:
+        try:
+            planned = self._planned.pop(id(chunk), None)
+            if planned is None:
+                return
+            self._output_retry_used = False
+            if chunk.sentences:
+                self._confirm(planned, chunk.sentences[-1])
+            self._request_save(force=True)
+            if self._end is not None and self._player.queued_count() == 0:
+                self._apply_end()
+        except Exception:
+            log.exception("Fallo al procesar el final de un fragmento")
+
+    def on_output_error(self, err: Exception) -> None:
+        try:
+            log.warning("La salida de audio falló: %s", err, exc_info=err)
+            if self._closed or self._paused:
+                return  # en pausa, resume() la vuelve a abrir
+            if not self._output_retry_used:
+                self._output_retry_used = True
+                self._player.resume()  # cierra y vuelve a abrir la salida, una vez
+                return
+            self._paused = True
+            self._player.pause()
+            self._refresh()
+            self._request_save(force=True)
+            message = err.user_message if isinstance(err, LectorError) else AudioOutputError.user_message
+            self._notice("warn", message)
+        except Exception:
+            log.exception("Fallo al procesar un error de la salida de audio")
+
+    # --- Avisos del gestor de motores y del navegador ----------------------------------
+
+    def _on_engine_state(self, state: EngineState, active: str) -> None:
+        self._emit("on_engine_state", state, active)
+        waiting = state is EngineState.WAITING_NETWORK
+        if waiting != self._engine_waiting:
+            self._engine_waiting = waiting
+            self._refresh()
+
+    def _on_nav_waiting(self, waiting: bool) -> None:
+        self._nav_waits = self._nav_waits + 1 if waiting else max(0, self._nav_waits - 1)
+        self._refresh()
+
+    # --- Productor ----------------------------------------------------------------------
+
+    def _launch(self, launch: _Launch) -> None:
+        self._last_launch = launch
+        self._next_unqueued = (launch.target, launch.sentence)
+        self._end = None
+        self._active = True
+        self._loading = not isinstance(launch.target, Chapter)
+        self._refresh()
+        self._producer = asyncio.create_task(self._produce(launch), name="lector:producer")
+
+    async def _produce(self, launch: _Launch) -> None:
+        nav = self._session.nav
+        try:
+            target = launch.target
+            chapter = target if isinstance(target, Chapter) else await nav.get(target)
+            index = launch.sentence
+            self._chapter_ready(chapter, launch)
+            while True:
+                await self._produce_chapter(chapter, index)
+                if not self._settings.continuous:
+                    self._finish(SessionState.COMPLETED, ("info", CHAPTER_FINISHED))
+                    return
+                try:
+                    nxt = await nav.next_of(chapter)
+                except AmbiguousNextChapter as exc:
+                    self._finish(
+                        SessionState.NEEDS_ATTENTION, ("warn", exc.user_message), exc.candidates
+                    )
+                    return
+                except ChapterLoopDetected as exc:
+                    self._finish(SessionState.NEEDS_ATTENTION, ("warn", exc.user_message))
+                    return
+                if nxt is None:
+                    self._finish(SessionState.COMPLETED, ("info", NO_MORE_CHAPTERS))
+                    return
+                self._chapter_index(nxt, hint=self._chapter_index(chapter) + 1)
+                nav.mark_visited(nxt.ref)
+                nav.start_prefetch(nxt)
+                chapter, index = nxt, 0
+                self._next_unqueued = (chapter, 0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._closed:
+                log.debug("Productor detenido durante el cierre: %s", exc)
+                return
+            await self._fail(exc)
+
+    def _chapter_ready(self, chapter: Chapter, launch: _Launch) -> None:
+        nav = self._session.nav
+        self._next_unqueued = (chapter, launch.sentence)
+        if launch.fresh:
+            nav.reset_visited(chapter.ref)
+        if launch.mark_on_load:
+            self._set_mark_before(chapter, launch.sentence)
+            self._request_save(force=True)
+        elif self._mark is not None and not isinstance(self._mark.chapter, Chapter):
+            self._mark.chapter = chapter
+        self._loading = False
+        self._refresh()
+        if launch.fresh:
+            self._show(chapter)
+        nav.start_prefetch(chapter)
+
+    async def _produce_chapter(self, chapter: Chapter, start: int) -> None:
+        """Sintetiza y encola desde `start`; si cambia el motor, vuelve a trocear."""
+        sentences = chapter.sentences
+        chapter_index = self._chapter_index(chapter)
+        index = start
+        while index < len(sentences):
+            kind = self._engine_kind()
+            max_chars, max_sentences = self._limits(kind)
+            chunks = make_chunks(
+                self._session.doc.doc_id, chapter_index, sentences,
+                max_chars, max_sentences, first_sentence=index,
+            )
+            if not chunks:
+                return
+            for chunk in chunks:
+                await self._produce_chunk(chunk, chapter)
+                index = chunk.sentences[-1].index + 1
+                self._next_unqueued = (chapter, index)
+                if self._engine_kind() != kind:
+                    break  # el resto se trocea con los límites del motor nuevo
+
+    async def _produce_chunk(self, chunk: Chunk, chapter: Chapter) -> None:
+        settings = self._settings
+        clip, engine = await self._em.synthesize(
+            chunk, settings.edge_voice, settings.piper_voice, settings.speed
+        )
+        queued = _queued_clip(chunk, clip, engine)
+        if queued is None:
+            log.warning("El motor %s no devolvió audio para %s; se salta", engine, chunk.chunk_id)
+            return
+        self._planned[id(chunk)] = _Planned(chunk, chapter)
+        try:
+            accepted = await self._player.enqueue(queued)
+        except BaseException:
+            self._planned.pop(id(chunk), None)
+            raise
+        if not accepted:
+            self._planned.pop(id(chunk), None)
+            raise RuntimeError("El reproductor descartó un fragmento sin cancelar el productor")
+
+    def _engine_kind(self) -> str:
+        return "piper" if self._em.state in _PIPER_STATES else "edge"
+
+    def _limits(self, kind: str) -> tuple[int, int]:
+        s = self._settings
+        if kind == "piper":
+            return s.piper_max_chars, 1
+        return s.edge_max_chars, s.edge_max_sentences
+
+    def _finish(
+        self, state: SessionState, notice: tuple[str, str] | None, candidates: list | None = None
+    ) -> None:
+        """Fin del productor: se aplica cuando termina de sonar lo que queda en cola."""
+        self._end = (state, notice, candidates)
+        if self._player.queued_count() == 0:
+            self._apply_end()
+
+    def _apply_end(self) -> None:
+        end, self._end = self._end, None
+        if end is None:
+            return
+        state, notice, candidates = end
+        self._active = False
+        self._loading = False
+        self._set_state(state)
+        self._request_save(force=True)
+        if notice is not None:
+            self._notice(*notice)
+        if candidates is not None:
+            self._emit("on_needs_choice", list(candidates))
+
+    async def _fail(self, exc: Exception) -> None:
+        log.error("La lectura se detuvo por un error inesperado", exc_info=exc)
+        try:
+            await self._save_now()
+        except Exception:
+            log.exception("No se pudo guardar el progreso tras el error")
+        self._active = False
+        self._loading = False
+        self._end = None
+        self._set_state(SessionState.ERROR)
+        self._request_save(force=True)  # deja constancia del estado de error
+        message = exc.user_message if isinstance(exc, LectorError) else LectorError.user_message
+        self._notice("error", message)
+
+    async def _cancel_producer(self) -> None:
+        task, self._producer = self._producer, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.wait({task})
+
+    async def _halt_locked(self) -> None:
+        """Cancela el productor y vacía el audio; la marca pasa a la frase que sonaba."""
+        self._epoch += 1
+        await self._cancel_producer()  # antes de clear(): ningún enqueue se cuela después
+        playing = self._playing()
+        self._player.clear()
+        self._planned.clear()
+        self._end = None
+        if playing is not None:
+            self._set_mark_before(*playing)
+        self._active = False
+        self._loading = False
+
+    async def _seek(self, target_fn) -> None:
+        async with self._lock:
+            if self._controllable():
+                await self._restart_locked(target_fn)
+
+    async def _jump(self, chapter: Chapter, epoch: int) -> None:
+        async with self._lock:
+            if epoch == self._epoch and self._controllable():
+                await self._restart_locked(lambda base: (chapter, 0))
+
+    async def _restart_locked(self, target_fn) -> None:
+        """Corta el audio y vuelve a empezar en la frase que devuelve `target_fn(base)`.
+
+        `base` es `(capítulo, frase)` de lo que suena o, si no suena nada, de la
+        reanudación. Guarda la posición nueva en cuanto se decide.
+        """
+        self._epoch += 1
+        await self._cancel_producer()
+        target = target_fn(self._base())
+        if target is None:  # el primer capítulo aún no ha cargado: nada que mover
+            if self._last_launch is not None:
+                self._launch(self._last_launch)
+            return
+        self._player.clear()
+        self._planned.clear()
+        chapter, index = target
+        index = max(0, min(index, len(chapter.sentences)))
+        self._set_mark_before(chapter, index)
+        self._launch(_Launch(chapter, index, True, False))
+        await self._save_now()  # la posición nueva queda guardada al volver
+
+    async def _apply_change(self, apply_now: bool) -> None:
+        async with self._lock:
+            if apply_now:
+                if self._active:
+                    await self._restart_locked(lambda base: base)
+                return
+            # Por defecto: lo ya encolado sigue sonando; se regenera desde lo no encolado.
+            if self._producer is None or self._producer.done() or self._next_unqueued is None:
+                return
+            await self._cancel_producer()
+            target, index = self._next_unqueued
+            if isinstance(target, Chapter):
+                self._launch(_Launch(target, index, False, False))
+            elif self._last_launch is not None:
+                self._launch(self._last_launch)
+
+    # --- Posición -----------------------------------------------------------------------
+
+    def _playing(self) -> tuple[Chapter, int] | None:
+        """(capítulo, frase) de lo que el reproductor está entregando, si hay algo."""
+        current = self._player.current()
+        if current is None:
+            return None
+        chunk, index = current
+        planned = self._planned.get(id(chunk))
+        return (planned.chapter, index) if planned is not None else None
+
+    def _base(self) -> tuple[Chapter, int] | None:
+        playing = self._playing()
+        if playing is not None:
+            return playing
+        mark = self._mark
+        if mark is not None and isinstance(mark.chapter, Chapter):
+            return mark.chapter, resume_sentence(mark.position)
+        return None
+
+    def _controllable(self) -> bool:
+        return (
+            not self._closed
+            and self._session is not None
+            and self._state not in (SessionState.IDLE, SessionState.STOPPED)
+        )
+
+    def _confirm(self, planned: _Planned, sentence: Sentence) -> None:
+        position = Position(
+            chapter_index=planned.chunk.chapter_index,
+            chapter_locator=planned.chapter.ref.locator,
+            paragraph_index=sentence.paragraph_index,
+            sentence_index=sentence.index,
+            char_offset=sentence.end,
+            page=self._page_of(planned.chapter, sentence),
+        )
+        self._mark = _Mark(planned.chapter, position, planned.chunk.chunk_id)
+
+    def _set_mark_before(self, chapter: Chapter, index: int) -> None:
+        """Marca como confirmada la frase anterior a `index` (-1 si es la primera)."""
+        sentences = chapter.sentences
+        index = max(0, min(index, len(sentences)))
+        if index == 0:
+            first = sentences[0] if sentences else None
+            paragraph = first.paragraph_index if first else 0
+            sentence_index, offset = -1, 0
+            page = self._page_of(chapter, first) if first else None
+        else:
+            prev = sentences[index - 1]
+            paragraph, sentence_index, offset = prev.paragraph_index, prev.index, prev.end
+            page = self._page_of(chapter, prev)
+        position = Position(
+            self._chapter_index(chapter), chapter.ref.locator, paragraph, sentence_index, offset, page
+        )
+        self._mark = _Mark(chapter, position, None)
+
+    @staticmethod
+    def _page_of(chapter: Chapter, sentence: Sentence) -> int | None:
+        if 0 <= sentence.paragraph_index < len(chapter.paragraphs):
+            return chapter.paragraphs[sentence.paragraph_index].page
+        return sentence.page
+
+    def _chapter_index(self, chapter: Chapter, hint: int | None = None) -> int:
+        """Índice del capítulo; si la fuente no lo sabe, se deduce del vecino."""
+        ref = chapter.ref
+        if ref.index is not None:
+            return ref.index
+        known = self._chapter_indexes.get(ref.locator)
+        if known is not None:
+            return known
+        doc = self._session.doc if self._session else None
+        value = next(
+            (r.index for r in (doc.chapters if doc else []) if r.locator == ref.locator and r.index is not None),
+            None,
+        )
+        if value is None:
+            value = hint if hint is not None and hint >= 0 else 0
+        self._chapter_indexes[ref.locator] = value
+        return value
+
+    def _show(self, chapter: Chapter) -> None:
+        if chapter.ref.locator != self._shown_locator and self._session is not None:
+            self._shown_locator = chapter.ref.locator
+            self._emit("on_document", self._session.doc, chapter)
+
+    # --- Sesión y documentos -----------------------------------------------------------
+
+    async def _session_for(
+        self, doc_id: str, start: Position | None, progress: ProgressRecord | None
+    ) -> _Session:
+        if self._session is not None and self._session.doc.doc_id == doc_id:
+            return self._session
+        if self._preview is not None and self._preview[1].doc_id == doc_id:
+            source, doc, first = self._preview
+        else:
+            stored = await asyncio.to_thread(self._repos.documents.get, doc_id)
+            if stored is None:
+                raise LectorError(UNKNOWN_DOCUMENT)
+            locator = stored.origin
+            if stored.kind is SourceKind.URL:
+                # Se abre por el capítulo donde se quedó: una sola descarga.
+                position = start or (progress.position if progress else None)
+                if position is not None:
+                    locator = position.chapter_locator
+            else:
+                await self._check_file(stored)
+            source, doc, first = await self._deps.source_opener(locator, self._deps.fetcher)
+            if doc.doc_id != doc_id:
+                log.warning("La fuente devolvió otro id (%s); se conserva %s", doc.doc_id, doc_id)
+                doc = replace(doc, doc_id=doc_id)
+        if self._session is not None:
+            await self._session.nav.close()
+        nav = self._make_navigator(source, doc)
+        nav.on_waiting = self._on_nav_waiting
+        self._nav_waits = 0
+        self._chapter_indexes.clear()
+        self._preview = None
+        self._session = _Session(doc, source, nav, first)
+        return self._session
+
+    async def _check_file(self, doc: Document) -> None:
+        path = Path(doc.origin)
+        if not path.is_file():
+            raise FileMovedOrChanged(doc.doc_id)
+        try:
+            _, digest = await asyncio.to_thread(file_doc_id, path)
+        except OSError as exc:
+            raise FileMovedOrChanged(doc.doc_id) from exc
+        if doc.file_hash and digest != doc.file_hash:
+            raise FileMovedOrChanged(doc.doc_id)
+
+    def _make_navigator(self, source: ContentSource, doc: Document) -> ChapterNavigator:
+        if self._deps.navigator_factory is not None:
+            return self._deps.navigator_factory(source, doc)
+        s = self._settings
+        return ChapterNavigator(
+            source, doc, self._repos.chapters, s.store_text,
+            prefetch_ahead=s.prefetch_ahead, wait_max_s=s.wait_max_s,
+        )
+
+    def _target_for(self, session: _Session, locator: str, index: int | None) -> Chapter | ChapterRef:
+        if session.first.ref.locator == locator:
+            return session.first
+        for ref in session.doc.chapters:
+            if ref.locator == locator:
+                return ref
+        return ChapterRef(index, "", locator)
+
+    def _store_opened(self, doc: Document, chapter: Chapter, store_text: bool) -> None:
+        origin_path = size = mtime = None
+        if doc.kind is not SourceKind.URL:
+            origin_path = doc.origin
+            try:
+                stat = Path(doc.origin).stat()
+                size, mtime = stat.st_size, stat.st_mtime
+            except OSError:
+                log.warning("No se pudo leer la fecha del archivo %s", doc.origin)
+        self._repos.documents.upsert(doc, origin_path, size, mtime)
+        try:
+            self._repos.chapters.save(doc.doc_id, chapter, store_text)
+        except LectorError as exc:
+            log.warning("No se pudo guardar el capítulo abierto: %s", exc)
+
+    # --- Configuración -------------------------------------------------------------------
+
+    async def _ensure_settings(self) -> _Settings:
+        if self._settings is None:
+            self._settings = await asyncio.to_thread(_read_settings, self._deps.settings)
+        return self._settings
+
+    async def _persist_setting(self, key: str, value: Any) -> None:
+        try:
+            await asyncio.to_thread(self._deps.settings.set, key, value)
+        except Exception:
+            log.warning("No se pudo guardar el ajuste %s", key, exc_info=True)
+
+    # --- Estado y avisos -------------------------------------------------------------------
+
+    def _refresh(self) -> None:
+        if not self._active:
+            return
+        if self._paused:
+            state = SessionState.PAUSED
+        elif self._nav_waits or self._engine_waiting:
+            state = SessionState.WAITING_NETWORK
+        elif self._loading:
+            state = SessionState.LOADING
+        else:
+            state = SessionState.READING
+        self._set_state(state)
+
+    def _set_state(self, state: SessionState) -> None:
+        if state is self._state:
+            return
+        self._state = state
+        self._emit("on_session_state", state)
+        if state is SessionState.WAITING_NETWORK:
+            self._request_save(force=True)
+
+    def _emit(self, name: str, *args) -> None:
+        try:
+            getattr(self._events, name)(*args)
+        except Exception:
+            log.exception("Fallo en el aviso %s hacia la interfaz", name)
+
+    def _notice(self, level: str, message: str) -> None:
+        self._emit("on_notice", level, message)
+
+    # --- Guardado del progreso ------------------------------------------------------------
+
+    def _request_save(self, force: bool = False) -> None:
+        """Pide guardar: al momento si `force` o si pasaron 2 s; si no, en cuanto pasen."""
+        if self._mark is None or self._session is None:
+            return
+        self._dirty = True
+        writer = self._writer
+        if writer is not None and not writer.done():
+            if not (force and self._writer_sleeping):
+                return  # la escritura en curso (o la diferida) recoge este cambio
+            writer.cancel()  # está esperando, no escribiendo: se adelanta
+        delay = 0.0
+        if not force:
+            delay = max(0.0, SAVE_INTERVAL_S - (self._clock() - self._last_write))
+        # Se fija aquí, no dentro de la tarea: así se sabe antes de que empiece a correr.
+        self._writer_sleeping = delay > 0
+        self._writer = asyncio.create_task(self._write_loop(delay), name="lector:save")
+
+    async def _save_now(self) -> None:
+        self._request_save(force=True)
+        await self.flush_progress()
+
+    async def _write_loop(self, delay: float) -> None:
+        if delay > 0:
+            await self._sleep(delay)
+            self._writer_sleeping = False
+        while self._dirty:
+            self._dirty = False
+            record = self._build_record()
+            if record is None:
+                return
+            self._last_write = self._clock()
+            try:
+                await asyncio.to_thread(self._repos.progress.save, record)
+            except Exception as exc:
+                log.warning("No se pudo guardar el progreso", exc_info=True)
+                if not self._save_error_notified:
+                    self._save_error_notified = True
+                    message = exc.user_message if isinstance(exc, LectorError) else LectorError.user_message
+                    self._notice("warn", message)
+            else:
+                self._save_error_notified = False
+
+    def _build_record(self) -> ProgressRecord | None:
+        mark, session, settings = self._mark, self._session, self._settings
+        if mark is None or session is None or settings is None:
+            return None
+        doc, position = session.doc, mark.position
+        return ProgressRecord(
+            doc_id=doc.doc_id,
+            kind=doc.kind,
+            origin=doc.origin,
+            title=doc.title,
+            last_read_at=time.time(),
+            position=position,
+            chapter_url=position.chapter_locator if doc.kind is SourceKind.URL else None,
+            last_chunk_id=mark.chunk_id,
+            edge_voice=settings.edge_voice,
+            piper_voice=settings.piper_voice,
+            speed=settings.speed,
+            session_state=str(self._state),
+        )

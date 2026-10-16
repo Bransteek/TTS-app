@@ -569,3 +569,15 @@ async def test_long_outage_logs_traceback_once_per_engine(clock, caplog):
     repeats = [r for r in caplog.records if "sigue fallando" in r.getMessage()]
     assert len(repeats) == (20 - 1) + (17 - 1)  # el resto, una línea DEBUG por intento
     assert all(r.levelno == logging.DEBUG for r in repeats)
+
+
+async def test_set_on_state_replaces_callback(clock):
+    edge, piper = FakeEdge(error=EdgeUnavailable), FakePiper()
+    manager, first = make_manager(edge, piper, clock)
+    later: list[tuple[EngineState, str]] = []
+    manager.set_on_state(lambda s, a: later.append((s, a)))
+
+    await synth(manager, 0)
+
+    assert first == []
+    assert later == [(S.EDGE_RETRYING, EDGE), (S.PIPER_ACTIVE, PIPER)]

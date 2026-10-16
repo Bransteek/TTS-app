@@ -118,6 +118,10 @@ class EngineManager:
     def state(self) -> EngineState:
         return self._c.state
 
+    def set_on_state(self, on_state: Callable[[EngineState, str], None]) -> None:
+        """Sustituye el aviso de cambio de estado (lo registra el controlador de lectura)."""
+        self._on_state = on_state
+
     def reset(self) -> None:
         """Vuelve al estado inicial (sesión nueva): circuito cerrado y motor preferido.
 

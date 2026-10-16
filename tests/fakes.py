@@ -13,6 +13,10 @@ from lector.tts.base import AudioClip
 # deja alguna muestra sin escribir, la prueba lo ve en lugar de ver ceros.
 UNWRITTEN = 12345
 
+# Audio que los motores falsos generan por frase (FakeOutput.pull de esta
+# cantidad hace sonar exactamente una frase).
+SAMPLES_PER_SENTENCE = 240
+
 
 class FakeOutput:
     """Salida de audio falsa: guarda el callback y lo invoca de forma síncrona con `pull`.
@@ -193,9 +197,10 @@ class _FakeEngine:
             outcome = self.errors.pop(0) if self.errors else self.error
             if outcome is not None:
                 raise outcome
+            # SAMPLES_PER_SENTENCE muestras y una marca por frase.
             return AudioClip(
-                pcm=np.full(240, 1000, dtype=np.int16),
-                marks=[(0, chunk.sentences[0].index)],
+                pcm=np.full(SAMPLES_PER_SENTENCE * len(chunk.sentences), 1000, dtype=np.int16),
+                marks=[(SAMPLES_PER_SENTENCE * k, s.index) for k, s in enumerate(chunk.sentences)],
             )
         finally:
             self.in_flight -= 1

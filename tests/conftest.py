@@ -126,3 +126,20 @@ def make_epub(tmp_path):
         return path
 
     return build
+
+
+@pytest.fixture
+async def controller_rig(tmp_path):
+    """Fábrica de montajes del controlador; todos se cierran al terminar la prueba."""
+    from tests.controller_rig import ControllerRig
+
+    rigs = []
+
+    def build(*, db_path=None, **kwargs):
+        rig = ControllerRig(db_path or tmp_path / "lector.db", **kwargs)
+        rigs.append(rig)
+        return rig
+
+    yield build
+    for rig in reversed(rigs):
+        await rig.close()

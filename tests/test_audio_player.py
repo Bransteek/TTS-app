@@ -436,3 +436,14 @@ def test_resample_same_rate_and_empty():
     pcm = np.arange(100, dtype=np.int16)
     np.testing.assert_array_equal(resample(pcm, OUTPUT_RATE), pcm)
     assert len(resample(np.zeros(0, np.int16), 22050)) == 0
+
+
+async def test_set_events_redirects_events():
+    out = FakeOutput()
+    player = AudioPlayer(out, asyncio.get_running_loop())  # sin destinatario todavía
+    rec = Recorder()
+    player.set_events(rec)
+    await player.enqueue(make_clip(0, 100))
+    out.pull(100)
+    await settle()
+    assert rec.events == [("sentence", "doc:0:0:0", 0), ("finished", "doc:0:0:0")]
