@@ -15,6 +15,7 @@ import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from lector.content.base import doc_id_for_url
 from lector.errors import FileMovedOrChanged, PageUnreachable
 from lector.models import Chapter, ChapterRef, Document, Paragraph, Position, Sentence, SourceKind
 from lector.persistence.database import open_database
@@ -25,6 +26,7 @@ from lector.persistence.repositories import (
     SettingsRepo,
     VoicesCacheRepo,
 )
+from lector.services.reading_controller import SessionState
 from lector.services.worker import AsyncWorker, QtEventBridge
 from lector.tts.engine_manager import EngineState
 from lector.tts.piper_engine import PiperModelManager
@@ -57,12 +59,21 @@ def make_chapter(locator: str = URL, title: str = "Capítulo 1", paragraphs: int
 
 
 def make_doc(chapters: list[ChapterRef] | None = None, kind: SourceKind = SourceKind.URL,
-             doc_id: str = "doc-1", title: str = "La novela") -> Document:
+             doc_id: str = "doc-1", title: str = "La novela", adapter: str | None = None,
+             index_page: bool = False) -> Document:
     if chapters is None:
         chapters = [ChapterRef(0, "Capítulo 1", URL), ChapterRef(1, "Capítulo 2", URL2),
                     ChapterRef(2, "Capítulo 3", URL3)]
     origin = "https://example.com/novela/" if kind is SourceKind.URL else "/tmp/libro.pdf"
-    return Document(doc_id, kind, origin, title, origin, origin, None, chapters)
+    if adapter is None:
+        adapter = {SourceKind.URL: "madara", SourceKind.PDF: "pdf", SourceKind.EPUB: "epub"}[kind]
+    return Document(doc_id, kind, origin, title, origin, origin, None, chapters,
+                    adapter=adapter, index_page=index_page)
+
+
+def generic_doc(doc_id: str = "doc-g", prefix: str = "https://example.com/novela/") -> Document:
+    return Document(doc_id, SourceKind.URL, prefix, "Web genérica", prefix, prefix, None, [],
+                    adapter="generic")
 
 
 def pdf_doc() -> Document:
@@ -92,9 +103,11 @@ class FakeController:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.threads: set[threading.Thread] = set()
-        self.open_result: tuple | BaseException | None = None
+        # Un resultado (o excepción) para todas las aperturas, o una lista: uno por apertura.
+        self.open_result: tuple | BaseException | list | None = None
         self.open_block_s = 0.0  # bloquea el hilo del trabajador (apertura lenta)
         self.play_error: BaseException | None = None
+        self.play_gate: threading.Event | None = None  # si se da, play() espera a que se abra
         self.page_position: Position | None = None
 
     def _record(self, *call) -> None:
@@ -105,12 +118,15 @@ class FakeController:
         self._record("open", locator)
         if self.open_block_s:
             time.sleep(self.open_block_s)
-        if isinstance(self.open_result, BaseException):
-            raise self.open_result
-        return self.open_result
+        result = self.open_result.pop(0) if isinstance(self.open_result, list) else self.open_result
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def play(self, doc_id, start=None):
         self._record("play", doc_id, start)
+        if self.play_gate is not None:
+            await asyncio.to_thread(self.play_gate.wait, 2)
         if self.play_error is not None:
             raise self.play_error
 
@@ -206,8 +222,9 @@ def make_window(qtbot, worker, conn, ctl, tmp_path):
         qtbot.addWidget(window)
         qtbot.waitUntil(lambda: window.settings_loaded, timeout=WAIT_MS)
         if show:
-            window.show()
-            qtbot.waitExposed(window)
+            with qtbot.waitExposed(window):
+                window.show()
+            activate(qtbot, window)
         return window
 
     return build
@@ -220,6 +237,12 @@ def wait_call(qtbot, ctl: FakeController, name: str, *args) -> tuple:
 
     qtbot.waitUntil(lambda: bool(found()), timeout=WAIT_MS)
     return found()[-1]
+
+
+def activate(qtbot, window: MainWindow) -> None:
+    """El usuario vuelve a la ventana (offscreen no devuelve el foco al cerrar un diálogo)."""
+    with qtbot.waitActive(window):
+        window.activateWindow()
 
 
 def read(qtbot, window: MainWindow, locator: str = URL) -> None:
@@ -462,6 +485,7 @@ def test_open_with_progress_offers_resume(qtbot, make_window, ctl):
     window.resume_dialog.continue_button.click()
     wait_call(qtbot, ctl, "play", "doc-1", None)
 
+    activate(qtbot, window)
     read(qtbot, window, URL2)  # otra apertura: empezar desde el principio
     qtbot.waitUntil(lambda: window.resume_dialog is not None and window.resume_dialog.isVisible(),
                     timeout=WAIT_MS)
@@ -490,6 +514,7 @@ def test_resume_choice_chapter_and_page(qtbot, make_window, ctl):
     assert not dialog.isVisible()
 
     ctl.calls.clear()
+    activate(qtbot, window)
     window.offer_resume(doc, make_progress(doc))
     window.resume_dialog.choose_button.click()
     window.resume_dialog.page_spin.setValue(7)
@@ -511,27 +536,6 @@ def test_resume_while_hidden_continues_without_dialog(qtbot, make_window, ctl):
 
 
 # --- vista previa, lectura y voz ------------------------------------------------------------
-
-
-def test_prefix_field_only_for_generic_web_and_saved(qtbot, make_window, ctl, conn):
-    doc = make_doc(chapters=[])
-    ctl.open_result = (doc, make_chapter(), None)
-    settings = SpySettings(conn)
-    window = make_window(show=True, settings=settings)
-    read(qtbot, window)
-    wait_call(qtbot, ctl, "play")
-
-    prefix = window.preview.prefix_edit
-    assert prefix.isVisible()
-    assert window.preview.prefix_label.text() == "Prefijo de la obra"
-    assert prefix.text() == "https://example.com/novela/"
-    prefix.setText("https://example.com/obras/mi-novela/")
-    prefix.editingFinished.emit()
-    qtbot.waitUntil(
-        lambda: SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": "/obras/mi-novela/"},
-        timeout=WAIT_MS,
-    )
-    assert threading.main_thread() not in settings.threads
 
 
 def test_document_and_sentence_signals_update_reading_view(qtbot, make_window):
@@ -652,8 +656,8 @@ def test_ambiguous_next_choice_waits_until_window_is_shown(qtbot, make_window, c
     assert window.choice_panel.isHidden()
     assert window.pending_choice == refs
 
-    window.show()
-    qtbot.waitExposed(window)
+    with qtbot.waitExposed(window):
+        window.show()
 
     assert window.choice_panel.isVisible()
     assert window.choice_panel.list.count() == 2
@@ -695,7 +699,7 @@ def test_history_dialog_without_progress_plays_from_start(qtbot, worker, conn):
     assert [dialog.table.item(0, i).text() for i in range(3)] == ["La novela", "EPUB", "Sin empezar"]
     with qtbot.waitSignal(dialog.document_chosen, timeout=WAIT_MS) as got:
         dialog.table.cellDoubleClicked.emit(0, 2)
-    assert got.args[0].doc_id == "doc-1" and got.args[1] is None
+    assert got.args[0].doc_id == "doc-1" and got.args[1] is None and got.args[2] is None
 
 
 def test_close_hides_to_tray(qtbot, make_window):
@@ -730,3 +734,449 @@ def test_cancelled_call_shows_nothing(qtbot, make_window, ctl, worker):
     fut.cancel()
     qtbot.wait(100)
     assert window.notice_label.isHidden()
+
+
+# --- Fix round 1: prefijo de la obra (§5.2) ----------------------------------------------------
+
+
+def test_generic_web_waits_for_prefix_confirmation(qtbot, make_window, ctl):
+    doc = generic_doc()
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+
+    read(qtbot, window)
+
+    qtbot.waitUntil(lambda: window.preview.isVisible(), timeout=WAIT_MS)
+    qtbot.wait(100)
+    assert [c[0] for c in ctl.calls] == ["open"]  # no lee sin confirmar
+    assert window.preview.prefix_edit.isVisible()
+    assert window.preview.prefix_label.text() == "Prefijo de la obra"
+    assert window.preview.prefix_edit.text() == "https://example.com/novela/"
+    assert "Leer" in window.preview.hint_label.text()
+
+    window.read_button.click()  # confirma sin cambios: lee lo ya abierto
+    wait_call(qtbot, ctl, "play", "doc-g", None)
+    assert [c[0] for c in ctl.calls] == ["open", "play"]
+
+
+def test_prefix_field_hidden_for_madara_without_index(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(chapters=[], adapter="madara"), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert window.preview.prefix_edit.isHidden()
+
+
+@pytest.mark.parametrize(
+    ("typed", "message"),
+    [
+        ("obras/mi-novela/", "dirección completa"),
+        ("ftp://example.com/obras/", "dirección completa"),
+        ("https://otra-web.com/obras/", "misma web"),
+    ],
+)
+def test_invalid_prefix_is_rejected_inline(qtbot, make_window, ctl, conn, typed, message):
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText(typed)
+    window.read_button.click()
+
+    qtbot.waitUntil(lambda: window.preview.prefix_error_label.isVisible(), timeout=WAIT_MS)
+    assert message in window.preview.prefix_error_label.text()
+    qtbot.wait(100)
+    assert [c[0] for c in ctl.calls] == ["open"]
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {}
+
+
+def test_edited_prefix_is_saved_then_reopened_before_reading(qtbot, make_window, ctl, conn):
+    corrected = generic_doc("doc-corregido", "https://example.com/obras/mi-novela/")
+    ctl.open_result = [(generic_doc(), make_chapter(), None), (corrected, make_chapter(), None)]
+    settings = SpySettings(conn)
+    window = make_window(show=True, settings=settings)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+
+    window.preview.prefix_edit.setText("https://example.com/obras/mi-novela")
+    window.read_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-corregido", None)
+    assert [c[0] for c in ctl.calls] == ["open", "open", "play"]
+    assert ctl.calls[1] == ("open", URL)  # se vuelve a abrir con la corrección
+    assert SettingsRepo(conn).get("work_prefix_overrides") == {"example.com": "/obras/mi-novela/"}
+    assert threading.main_thread() not in settings.threads
+    assert window.preview.prefix_error_label.isHidden()
+
+
+@pytest.fixture
+def real_rig(worker, tmp_path):
+    """ReadingController real (montaje de pruebas) construido en el bucle del trabajador."""
+    import httpx
+
+    from lector.content.registry import open_source
+    from lector.security.http_client import SafeFetcher
+    from tests.controller_rig import ControllerRig
+    from tests.test_chapter_navigation import PAGE_URL, make_handler, page
+    from tests.test_chapter_navigation import resolver as generic_resolver
+
+    html = page('<a href="/novela/x/capitulo-6/">Siguiente</a>')
+    holder = {}
+
+    async def build():
+        fetcher = SafeFetcher(resolver=generic_resolver,
+                              transport=httpx.MockTransport(make_handler({PAGE_URL: html})))
+        holder["fetcher"] = fetcher
+        return ControllerRig(tmp_path / "real.db", fetcher=fetcher, opener=open_source)
+
+    rig = worker.submit(build()).result(timeout=2)
+    yield rig
+
+    async def close():
+        try:
+            await rig.close()
+        finally:
+            await holder["fetcher"].aclose()
+
+    worker.submit(close()).result(timeout=3)
+
+
+def test_prefix_correction_end_to_end_with_real_controller(qtbot, worker, real_rig, tmp_path):
+    from tests.test_chapter_navigation import HOST, PAGE_URL
+
+    bridge = QtEventBridge()
+    window = MainWindow(worker, bridge, real_rig.ctl, real_rig.settings, PiperModelManager(tmp_path / "v"))
+    qtbot.addWidget(window)
+    qtbot.waitUntil(lambda: window.settings_loaded, timeout=WAIT_MS)
+    with qtbot.waitExposed(window):
+        window.show()
+
+    read(qtbot, window, PAGE_URL)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+    assert window.preview.prefix_edit.text() == HOST + "/novela/x/"
+    assert real_rig.ctl.state is SessionState.IDLE  # espera la confirmación
+
+    window.preview.prefix_edit.setText(HOST + "/novela/z/")
+    window.read_button.click()
+
+    qtbot.waitUntil(lambda: bool(real_rig.edge.calls), timeout=WAIT_MS)  # ya lee
+    host = HOST.split("://", 1)[1]
+    assert real_rig.settings.get("work_prefix_overrides") == {host: "/novela/z/"}
+    doc_id = doc_id_for_url(host + "/novela/z/")
+    assert real_rig.repos.documents.get(doc_id).work_prefix == HOST + "/novela/z/"
+    assert window.preview.next_label.text() == "Siguiente detectado: ninguno"
+
+    # La corrección se usa en la siguiente apertura de esa web.
+    doc, _, _ = worker.submit(real_rig.ctl.open(PAGE_URL)).result(timeout=2)
+    assert doc.work_prefix == HOST + "/novela/z/" and doc.doc_id == doc_id
+
+
+# --- Fix round 1: novela abierta desde su índice (§4) -------------------------------------------
+
+
+def test_work_page_lets_user_pick_chapter_with_first_preselected(qtbot, make_window, ctl):
+    doc = make_doc(index_page=True)
+    ctl.open_result = (doc, make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window, "https://example.com/novela/")
+
+    qtbot.waitUntil(lambda: window.preview.chapter_list.isVisible(), timeout=WAIT_MS)
+    qtbot.wait(100)
+    assert [c[0] for c in ctl.calls] == ["open"]
+    chapters = window.preview.chapter_list
+    assert [chapters.item(i).text() for i in range(chapters.count())] == [
+        "Capítulo 1", "Capítulo 2", "Capítulo 3",
+    ]
+    assert chapters.currentRow() == 0
+
+    chapters.setCurrentRow(2)
+    window.read_button.click()
+    _, _, start = wait_call(qtbot, ctl, "play")
+    assert start == Position(2, URL3, 0, 0, 0, None)
+
+
+def test_chapter_page_hides_chapter_list(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert window.preview.chapter_list.isHidden()
+
+
+def test_work_page_default_starts_at_chapter_one(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(index_page=True), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window, "https://example.com/novela/")
+    qtbot.waitUntil(lambda: window.preview.chapter_list.isVisible(), timeout=WAIT_MS)
+    window.read_button.click()
+    _, _, start = wait_call(qtbot, ctl, "play")
+    assert start == Position(0, URL, 0, 0, 0, None)
+
+
+# --- Fix round 1: oferta de reanudar y ventana oculta -------------------------------------------
+
+
+def wait_dialog(qtbot, window):
+    qtbot.waitUntil(lambda: window.resume_dialog is not None and window.resume_dialog.isVisible(),
+                    timeout=WAIT_MS)
+    return window.resume_dialog
+
+
+def test_inactive_window_continues_instead_of_dialog(qtbot, make_window, ctl, monkeypatch):
+    doc = make_doc()
+    ctl.open_result = (doc, make_chapter(), make_progress(doc))
+    window = make_window(show=True)
+    monkeypatch.setattr(window, "isActiveWindow", lambda: False)
+    monkeypatch.setattr(QApplication, "activeWindow", staticmethod(lambda: None))  # el juego delante
+
+    read(qtbot, window)
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert window.resume_dialog is None
+    assert window.notice_label.text() == "Se sigue leyendo donde lo dejaste."
+
+
+@pytest.mark.parametrize("how", ["close", "minimize", "hide"])
+def test_pending_dialog_continues_when_window_goes_away(qtbot, make_window, ctl, how):
+    doc = make_doc()
+    ctl.open_result = (doc, make_chapter(), make_progress(doc))
+    window = make_window(show=True)
+    read(qtbot, window)
+    dialog = wait_dialog(qtbot, window)
+
+    {"close": window.close, "minimize": window.showMinimized, "hide": window.hide}[how]()
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert not dialog.isVisible()
+    assert window.notice_label.text() == "Se sigue leyendo donde lo dejaste."
+    qtbot.wait(100)
+    assert [c[0] for c in ctl.calls].count("play") == 1
+
+
+def test_offer_without_auto_continue_waits_for_window(qtbot, make_window, ctl):
+    doc = make_doc()
+    window = make_window(show=False)
+
+    window.offer_resume(doc, make_progress(doc), auto_continue_when_hidden=False)
+
+    qtbot.wait(100)
+    assert ctl.calls == [] and window.resume_dialog is None
+    with qtbot.waitExposed(window):
+        window.show()
+    dialog = wait_dialog(qtbot, window)
+
+    window.hide()  # sigue pendiente: no se lee sin que el usuario lo pida
+    qtbot.wait(100)
+    assert not dialog.isVisible() and ctl.calls == []
+    window.show()
+    dialog = wait_dialog(qtbot, window)
+    dialog.start_button.click()
+    _, _, start = wait_call(qtbot, ctl, "play")
+    assert start == Position(0, URL, 0, 0, 0, None)
+
+
+def test_resume_dialog_shows_known_chapter_title(qtbot, make_window, ctl):
+    doc = generic_doc()
+    chapter = make_chapter(URL, "Capítulo 7: El regreso")
+    record = make_progress(make_doc())  # guardado en URL2...
+    record.position = Position(6, URL, 3, 3, 0, None)  # ...pero aquí en el capítulo abierto
+    ctl.open_result = (doc, chapter, record)
+    window = make_window(show=True)
+    read(qtbot, window)
+    assert "Capítulo 7: El regreso" in wait_dialog(qtbot, window).where_label.text()
+
+
+def test_history_shows_stored_chapter_title(qtbot, worker, conn):
+    from lector.persistence.repositories import ChapterRepo
+
+    doc = generic_doc()
+    DocumentRepo(conn).upsert(doc, None, None, None)
+    ChapterRepo(conn).save(doc.doc_id, make_chapter(URL, "Capítulo 7: El regreso"), False)
+    record = make_progress(make_doc())
+    record.doc_id, record.position = doc.doc_id, Position(6, URL, 3, 3, 0, None)
+    ProgressRepo(conn).save(record)
+    dialog = HistoryDialog(worker, DocumentRepo(conn), chapters=ChapterRepo(conn))
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog.table.rowCount() == 1, timeout=WAIT_MS)
+    assert dialog.table.item(0, 2).text() == "Capítulo 7: El regreso"
+    with qtbot.waitSignal(dialog.document_chosen, timeout=WAIT_MS) as got:
+        dialog.table.cellDoubleClicked.emit(0, 0)
+    assert got.args[2] == "Capítulo 7: El regreso"
+
+
+# --- Fix round 1: elección de capítulo caducada ------------------------------------------------
+
+
+def test_choice_panel_cleared_when_another_document_opens(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    refs = [ChapterRef(None, "A", URL2), ChapterRef(None, "B", URL3)]
+    window.test_bridge.needs_choice_sig.emit(refs)
+    assert window.choice_panel.isVisible()
+
+    ctl.open_result = (make_doc(doc_id="otro"), make_chapter(), None)
+    read(qtbot, window, URL3)
+    wait_call(qtbot, ctl, "play")
+    window.test_bridge.document_sig.emit(make_doc(doc_id="otro"), make_chapter())
+
+    assert window.choice_panel.isHidden()
+    assert window.pending_choice is None
+
+
+def test_choice_cleared_when_chapter_changes(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    bridge = window.test_bridge
+    bridge.document_sig.emit(make_doc(), make_chapter(URL, "Capítulo 1"))
+    bridge.needs_choice_sig.emit([ChapterRef(None, "A", URL2), ChapterRef(None, "B", URL3)])
+    bridge.document_sig.emit(make_doc(), make_chapter(URL, "Capítulo 1"))  # mismo capítulo
+    assert window.choice_panel.isVisible()
+
+    bridge.document_sig.emit(make_doc(), make_chapter(URL2, "Capítulo 2"))
+
+    assert window.choice_panel.isHidden()
+
+
+def test_pending_choice_dropped_when_session_changes_while_hidden(qtbot, make_window, ctl, conn):
+    doc = make_doc()
+    DocumentRepo(conn).upsert(doc, None, None, None)
+    window = make_window(show=True)
+    window.test_bridge.document_sig.emit(doc, make_chapter())
+    window.hide()
+    window.test_bridge.needs_choice_sig.emit([ChapterRef(None, "A", URL2)])
+    assert window.pending_choice is not None
+    window.test_bridge.document_sig.emit(make_doc(doc_id="otro"), make_chapter())
+
+    with qtbot.waitExposed(window):
+        window.show()
+
+    assert window.choice_panel.isHidden() and window.pending_choice is None
+
+
+def test_choose_next_only_for_the_session_of_the_candidates(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    window.test_bridge.document_sig.emit(make_doc(), make_chapter())
+    refs = [ChapterRef(None, "A", URL2), ChapterRef(None, "B", URL3)]
+    window.test_bridge.needs_choice_sig.emit(refs)
+    window._play("otro", None)  # empieza otra lectura antes de que llegue su documento
+
+    assert window.choice_panel.isHidden()
+    window.choice_panel.chosen.emit(refs[0])  # aunque llegara una elección vieja
+    wait_call(qtbot, ctl, "play", "otro", None)
+    qtbot.wait(100)
+    assert not any(c[0] == "choose_next" for c in ctl.calls)
+
+
+# --- Fix round 1: menores ------------------------------------------------------------------------
+
+
+def test_read_does_not_restart_document_already_reading(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(), make_chapter(), None)
+    window = make_window(show=True)
+    read(qtbot, window)
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    for state in ("loading", "reading", "waiting_network"):
+        window.test_bridge.session_state_sig.emit(state)
+        window.read_button.click()
+    qtbot.wait(100)
+    assert [c[0] for c in ctl.calls] == ["open", "play"]
+
+    window.test_bridge.session_state_sig.emit("paused")
+    window.read_button.click()  # en pausa, «Leer» reanuda
+    wait_call(qtbot, ctl, "resume")
+    assert [c[0] for c in ctl.calls].count("play") == 1
+
+
+def test_double_click_sends_a_single_play(qtbot, make_window, ctl):
+    ctl.open_result = (generic_doc(), make_chapter(), None)
+    ctl.play_gate = threading.Event()
+    window = make_window(show=True)
+    read(qtbot, window)
+    qtbot.waitUntil(lambda: window.preview.prefix_edit.isVisible(), timeout=WAIT_MS)
+    try:
+        window.read_button.click()
+        window.read_button.click()
+        window.controls.play_pause_button.click()
+        wait_call(qtbot, ctl, "play")
+        qtbot.wait(100)
+        assert [c[0] for c in ctl.calls].count("play") == 1
+    finally:
+        ctl.play_gate.set()
+
+
+def test_notice_cleared_when_reading_resumes_after_warning(qtbot, make_window):
+    window = make_window(show=True)
+    bridge = window.test_bridge
+    bridge.session_state_sig.emit("reading")
+    bridge.notice_sig.emit("warn", "La voz en línea no está disponible por ahora.")
+    bridge.session_state_sig.emit("waiting_network")
+    assert window.notice_label.isVisible()
+
+    bridge.session_state_sig.emit("reading")
+
+    assert window.notice_label.isHidden()
+    bridge.notice_sig.emit("info", "Terminó el capítulo.")
+    bridge.session_state_sig.emit("completed")
+    bridge.session_state_sig.emit("reading")
+    assert window.notice_label.isVisible()  # los avisos informativos se quedan
+
+
+class BrokenSettings(SettingsRepo):
+    def get(self, key):
+        raise RuntimeError("disco roto")
+
+
+def test_settings_load_failure_message(qtbot, make_window, conn, caplog):
+    with caplog.at_level(logging.ERROR):
+        window = make_window(show=True, settings=BrokenSettings(conn))
+    assert window.notice_label.text() == (
+        "No se pudo cargar la configuración. Se usan los valores por defecto."
+    )
+    assert any(r.exc_info for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("state", "label", "expected"),
+    [
+        ("loading", "Pausar", ("pause",)),
+        ("waiting_network", "Pausar", ("pause",)),
+        ("needs_attention", "Leer", ("play", "doc-1", None)),
+        ("error", "Leer", ("play", "doc-1", None)),
+        ("completed", "Leer", ("play", "doc-1", None)),
+    ],
+)
+def test_play_pause_label_and_action_per_state(qtbot, make_window, ctl, state, label, expected):
+    window = make_window()
+    window.test_bridge.document_sig.emit(make_doc(), make_chapter())
+    window.test_bridge.session_state_sig.emit(state)
+    assert window.controls.play_pause_button.text() == label
+    window.controls.play_pause_button.click()
+    assert wait_call(qtbot, ctl, expected[0]) == expected
+
+
+def test_minimize_state_change_alone_continues(qtbot, make_window, ctl, monkeypatch):
+    """Algunas plataformas solo avisan del minimizado con WindowStateChange (sin hideEvent)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QWindowStateChangeEvent
+
+    doc = make_doc()
+    ctl.open_result = (doc, make_chapter(), make_progress(doc))
+    window = make_window(show=True)
+    read(qtbot, window)
+    wait_dialog(qtbot, window)
+
+    monkeypatch.setattr(window, "isMinimized", lambda: True)
+    QApplication.sendEvent(window, QWindowStateChangeEvent(Qt.WindowState.WindowNoState))
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+
+
+def test_choice_panel_cleared_when_opening_even_without_reading(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    window.test_bridge.needs_choice_sig.emit([ChapterRef(None, "A", URL2)])
+    ctl.open_result = (generic_doc(), make_chapter(), None)  # espera confirmación: no hay play
+
+    read(qtbot, window, URL3)
+
+    qtbot.waitUntil(lambda: window.preview.isVisible(), timeout=WAIT_MS)
+    assert window.choice_panel.isHidden()
+    assert not any(c[0] == "play" for c in ctl.calls)

@@ -1,10 +1,16 @@
-"""Diálogo al abrir un documento ya empezado: continuar, empezar o elegir capítulo o página."""
+"""Oferta de reanudar al abrir un documento ya empezado.
+
+`ResumeDialog` ofrece continuar, empezar o elegir capítulo o página. `ResumeOffer`
+gestiona su ciclo de vida en una ventana que puede ocultarse o minimizarse: la
+oferta nunca abre una ventana encima del juego.
+"""
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -51,11 +57,16 @@ def chapter_name(ref: ChapterRef, fallback_index: int) -> str:
     return ref.title or f"Capítulo {fallback_index + 1}"
 
 
-def where_text(doc: Document, position: Position) -> str:
-    """Nombre del capítulo en el que se quedó la lectura."""
-    for i, ref in enumerate(doc.chapters):
-        if ref.locator == position.chapter_locator:
-            return chapter_name(ref, i)
+def where_text(doc: Document, position: Position, known_title: str | None = None) -> str:
+    """Nombre del capítulo en el que se quedó la lectura.
+
+    El título del índice o `known_title` (p. ej. el guardado); «Capítulo N» solo si no hay.
+    """
+    ref = next((r for r in doc.chapters if r.locator == position.chapter_locator), None)
+    if ref is not None and ref.title:
+        return ref.title
+    if known_title:
+        return known_title
     return f"Capítulo {position.chapter_index + 1}"
 
 
@@ -64,7 +75,8 @@ class ResumeDialog(QDialog):
 
     chosen = Signal(object)
 
-    def __init__(self, doc: Document, progress: ProgressRecord, parent: QWidget | None = None):
+    def __init__(self, doc: Document, progress: ProgressRecord, parent: QWidget | None = None,
+                 chapter_title: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Continuar la lectura")
         self._doc = doc
@@ -74,7 +86,7 @@ class ResumeDialog(QDialog):
         font.setBold(True)
         title.setFont(font)
         title.setWordWrap(True)
-        self.where_label = QLabel(f"Ibas por: {where_text(doc, progress.position)}")
+        self.where_label = QLabel(f"Ibas por: {where_text(doc, progress.position, chapter_title)}")
         self.where_label.setWordWrap(True)
 
         self.continue_button = QPushButton("Continuar desde donde lo dejé")
@@ -149,3 +161,100 @@ class ResumeDialog(QDialog):
     def _choose(self, choice: ResumeChoice) -> None:
         self.chosen.emit(choice)
         self.accept()
+
+
+@dataclass
+class _Offer:
+    doc: Document
+    progress: ProgressRecord
+    chapter_title: str | None
+    auto_continue: bool
+
+
+class ResumeOffer(QObject):
+    """Muestra la oferta de reanudar solo con el usuario delante.
+
+    - Ventana oculta, minimizada o sin foco al ofrecer: con `auto_continue_when_hidden`
+      se continúa sin diálogo; sin él, la oferta queda pendiente hasta `window_shown()`.
+    - Si la ventana se va con el diálogo abierto (`window_hidden()`), igual: se continúa
+      o la oferta vuelve a quedar pendiente.
+
+    `apply(doc, progress, choice)` hace la elección; `on_continued()` avisa de que se
+    continuó sin preguntar.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        apply: Callable[[Document, ProgressRecord, ResumeChoice], None],
+        on_continued: Callable[[], None],
+    ):
+        super().__init__(parent)
+        self._parent = parent
+        self._apply = apply
+        self._on_continued = on_continued
+        self.dialog: ResumeDialog | None = None
+        self._showing: _Offer | None = None  # la oferta del diálogo abierto
+        self._pending: _Offer | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._pending is not None
+
+    def offer(self, doc: Document, progress: ProgressRecord, *, present: bool,
+              chapter_title: str | None = None, auto_continue_when_hidden: bool = True) -> None:
+        self.cancel()
+        offer = _Offer(doc, progress, chapter_title, auto_continue_when_hidden)
+        if present:
+            self._show(offer)
+        elif offer.auto_continue:
+            self._continue(offer)
+        else:
+            self._pending = offer
+
+    def window_hidden(self) -> None:
+        offer = self._showing
+        if offer is None:
+            return
+        self._showing = None  # antes de cerrar: cerrar no cuenta como descartar
+        if self.dialog is not None:
+            self.dialog.close()
+        if offer.auto_continue:
+            self._continue(offer)
+        else:
+            self._pending = offer
+
+    def window_shown(self) -> None:
+        if self._pending is not None:
+            offer, self._pending = self._pending, None
+            self._show(offer)
+
+    def cancel(self) -> None:
+        """Olvida la oferta (p. ej. se abre otro documento)."""
+        self._pending = None
+        self._showing = None
+        if self.dialog is not None:
+            self.dialog.close()
+
+    def _show(self, offer: _Offer) -> None:
+        if self.dialog is not None:
+            self.dialog.deleteLater()
+        dialog = ResumeDialog(offer.doc, offer.progress, self._parent, offer.chapter_title)
+        dialog.chosen.connect(lambda choice: self._chosen(offer, choice))
+        dialog.rejected.connect(lambda: self._dismissed(offer))
+        self.dialog = dialog
+        self._showing = offer
+        dialog.show()
+
+    def _chosen(self, offer: _Offer, choice: ResumeChoice) -> None:
+        if self._showing is offer:
+            self._showing = None
+            self._apply(offer.doc, offer.progress, choice)
+
+    def _dismissed(self, offer: _Offer) -> None:
+        if self._showing is offer:  # el usuario cerró el diálogo sin elegir
+            self._showing = None
+
+    def _continue(self, offer: _Offer) -> None:
+        self._apply(offer.doc, offer.progress, ResumeChoice("continue"))
+        self._on_continued()

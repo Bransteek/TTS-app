@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from lector.tts.piper_engine import PiperModelManager
+
 SPEED_PRESETS = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.5, 0.05
 SPEED_DEBOUNCE_MS = 400  # al escribir en la casilla, se aplica tras esta pausa
@@ -170,6 +172,39 @@ class VoicePanel(QGroupBox):
 
     def _emit_speed(self) -> None:
         self.speed_changed.emit(round(self.speed_spin.value(), 2))
+
+
+_GENDER = {"Female": "mujer", "Male": "hombre"}
+
+
+def edge_voice_items(voices: list[dict], language: str, current: str) -> list[tuple[str, str]]:
+    """(texto, ShortName) de las voces de Edge del idioma; la voz elegida siempre aparece."""
+    family = (language or "es").split("-")[0].lower()
+    items = []
+    for v in sorted(voices, key=lambda v: (v.get("Locale", ""), v.get("ShortName", ""))):
+        short, locale = v.get("ShortName", ""), v.get("Locale", "")
+        if not short or locale.split("-")[0].lower() != family:
+            continue
+        name = short.rsplit("-", 1)[-1].removesuffix("Neural") or short
+        gender = _GENDER.get(v.get("Gender", ""))
+        items.append((f"{name} — {locale}" + (f", {gender}" if gender else ""), short))
+    if current and all(data != current for _, data in items):
+        items.insert(0, (current, current))
+    return items
+
+
+def piper_voice_items(installed: list[tuple[str, list[str]]]) -> list[tuple[str, str, str]]:
+    """(texto del desplegable, voz «nombre#hablante», nombre corto para el indicador)."""
+    labels = {m["name"]: m["label"] for m in PiperModelManager.CATALOG}
+    out = []
+    for name, speakers in installed:
+        label = labels.get(name, name)
+        short = label.split(" (")[0]
+        if speakers:
+            out += [(f"{label} – voz {s}", f"{name}#{s}", f"{short} {s}") for s in speakers]
+        else:
+            out.append((label, name, short))
+    return out
 
 
 def _fill(combo: QComboBox, items: list[tuple[str, str]], current: str | None) -> None:

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from lector.models import Document, SourceKind
-from lector.persistence.repositories import DocumentRepo, ProgressRecord
+from lector.persistence.repositories import ChapterRepo, DocumentRepo, ProgressRecord
 from lector.services.worker import AsyncWorker, call_ui
 from lector.ui.resume_dialog import where_text
 
@@ -29,19 +29,37 @@ KIND_TEXT = {SourceKind.URL: "Web", SourceKind.PDF: "PDF", SourceKind.EPUB: "EPU
 HEADERS = ("Título", "Tipo", "Capítulo", "Fecha")
 
 
-def _row(doc: Document, progress: ProgressRecord | None) -> tuple[str, str, str, str]:
+_Row = tuple[Document, ProgressRecord | None, str | None]  # documento, progreso, título guardado
+
+
+def _load(documents: DocumentRepo, chapters: ChapterRepo | None) -> list[_Row]:
+    """En el hilo de trabajo: documentos recientes y el título guardado de su capítulo."""
+    rows = []
+    for doc, progress in documents.list_recent():
+        title = None
+        if progress is not None and chapters is not None:
+            title = chapters.title(doc.doc_id, progress.position.chapter_locator)
+        rows.append((doc, progress, title))
+    return rows
+
+
+def _row(doc: Document, progress: ProgressRecord | None,
+         title: str | None) -> tuple[str, str, str, str]:
     if progress is None:
         chapter, date = "Sin empezar", "—"
     else:
-        chapter = where_text(doc, progress.position)
+        chapter = where_text(doc, progress.position, title)
         date = datetime.fromtimestamp(progress.last_read_at).strftime("%d/%m/%Y %H:%M")
     return doc.title or doc.origin, KIND_TEXT.get(doc.kind, str(doc.kind)), chapter, date
 
 
 class HistoryDialog(QDialog):
-    """Sin modalidad. Un doble clic emite `document_chosen(doc, progreso o None)` y cierra."""
+    """Sin modalidad. Un doble clic emite `document_chosen(doc, progreso o None, título)` y cierra.
 
-    document_chosen = Signal(object, object)
+    `título` es el título guardado del capítulo del progreso (o None).
+    """
+
+    document_chosen = Signal(object, object, object)
 
     def __init__(
         self,
@@ -49,11 +67,12 @@ class HistoryDialog(QDialog):
         documents: DocumentRepo,
         parent: QWidget | None = None,
         on_error: Callable[[BaseException], None] | None = None,
+        chapters: ChapterRepo | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Historial")
         self.resize(640, 360)
-        self._rows: list[tuple[Document, ProgressRecord | None]] = []
+        self._rows: list[_Row] = []
         self._on_error = on_error
 
         self.status_label = QLabel("Cargando…")
@@ -75,13 +94,14 @@ class HistoryDialog(QDialog):
         layout.addWidget(QLabel("Haz doble clic en un documento para abrirlo."))
 
         # La consulta va al hilo de trabajo: la interfaz nunca toca la base de datos.
-        call_ui(worker.submit(asyncio.to_thread(documents.list_recent)), self._fill, self._failed)
+        job = asyncio.to_thread(_load, documents, chapters)
+        call_ui(worker.submit(job), self._fill, self._failed)
 
-    def _fill(self, rows: list[tuple[Document, ProgressRecord | None]]) -> None:
+    def _fill(self, rows: list[_Row]) -> None:
         self._rows = list(rows)
         self.table.setRowCount(len(self._rows))
-        for r, (doc, progress) in enumerate(self._rows):
-            for c, text in enumerate(_row(doc, progress)):
+        for r, row in enumerate(self._rows):
+            for c, text in enumerate(_row(*row)):
                 self.table.setItem(r, c, QTableWidgetItem(text))
         if self._rows:
             self.status_label.hide()
@@ -97,6 +117,6 @@ class HistoryDialog(QDialog):
 
     def _choose(self, row: int) -> None:
         if 0 <= row < len(self._rows):
-            doc, progress = self._rows[row]
-            self.document_chosen.emit(doc, progress)
+            doc, progress, title = self._rows[row]
+            self.document_chosen.emit(doc, progress, title)
             self.accept()
