@@ -84,6 +84,20 @@ def test_chapter_text_rebuilds_identically(conn):
     assert repo.get_text("doc1", ch.ref.locator) is None
 
 
+def test_purge_all_text_clears_every_document(conn):
+    repo, ch = ChapterRepo(conn), make_chapter()
+    for doc_id in ("doc1", "doc2"):
+        repo.save(doc_id, ch, True)
+    repo.purge_all_text()
+    for doc_id in ("doc1", "doc2"):
+        assert repo.get_text(doc_id, ch.ref.locator) is None
+        assert repo.title(doc_id, ch.ref.locator) == "Uno"  # el título se conserva
+    row = conn.execute(
+        "SELECT COUNT(*) FROM chapters WHERE text IS NOT NULL OR paragraphs_json IS NOT NULL"
+    ).fetchone()
+    assert row[0] == 0
+
+
 def test_store_text_false_keeps_no_text(conn):
     ch = make_chapter()
     repo = ChapterRepo(conn)

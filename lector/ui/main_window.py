@@ -41,10 +41,12 @@ from lector.services.reading_controller import SessionState
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.tts.piper_engine import PiperModelManager
 from lector.ui.history_dialog import HistoryDialog
+from lector.ui.piper_setup import FirstRunBanner, PiperDownloads, SamplePlayer
 from lector.ui.open_flow import PLAYING_STATES, OpenFlowMixin
 from lector.ui.playback_controls import PlaybackControls, VoicePanel
 from lector.ui.preview_panel import ChoicePanel, PreviewPanel
 from lector.ui.resume_dialog import ResumeDialog, ResumeOffer
+from lector.ui.settings_dialog import SettingsDialog, SettingsServices
 from lector.ui.status_panels import VoiceStatusMixin
 
 log = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ log = logging.getLogger(__name__)
 GENERIC_ERROR = (
     "Ocurrió un problema inesperado. La lectura se ha pausado y tu progreso está guardado."
 )
+MODEL_INSTALLED = "Voz sin conexión instalada: si se corta internet, la lectura sigue con ella."
 SETTINGS_LOAD_FAILED = "No se pudo cargar la configuración. Se usan los valores por defecto."
 CONTINUING = "Se sigue leyendo donde lo dejaste."
 _SETTING_KEYS = ("edge_voice", "language", "piper_voice", "piper_speaker", "speed",
@@ -239,6 +242,48 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
     def add_top_banner(self, widget: QWidget) -> None:
         """Pone `widget` arriba del todo de la ventana, sobre el aviso y la entrada (p. ej. el banner de T18)."""
         self._banner_layout.addWidget(widget)
+
+    # --- configuración y voz local (T18) ----------------------------------------------------
+
+    def enable_settings(self, edge=None, sample: SamplePlayer | None = None) -> None:
+        """Conecta «Configuración…» y el enlace de Piper con el diálogo y pone el aviso de primer arranque.
+
+        `edge` es el EdgeEngine de la app (para «Actualizar lista»); `sample`, el reproductor de
+        muestras. Se llama una vez, al montar la app (T19).
+        """
+        self._edge, self._sample = edge, sample
+        self.settings_dialog: SettingsDialog | None = None
+        self.downloads = PiperDownloads(self._worker, self._models, self)
+        self.downloads.finished.connect(self._on_model_downloaded)
+        self.settings_requested.connect(self.show_settings)
+        self.first_run_banner = FirstRunBanner(self._worker, self._settings, self._models,
+                                               self.downloads)
+        self.add_top_banner(self.first_run_banner)
+        self.first_run_banner.check()
+
+    @Slot()
+    def show_settings(self) -> None:
+        """Abre la configuración sin modalidad (si ya está abierta, la trae al frente)."""
+        dialog = self.settings_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            return
+        if dialog is not None:
+            dialog.deleteLater()
+        services = SettingsServices(
+            self._worker, self._ctl, self._settings, self._models, self._voices,
+            self._chapters, self.downloads, edge=self._edge, sample=self._sample,
+        )
+        dialog = SettingsDialog(services, self)
+        dialog.saved.connect(self.reload_settings)
+        self.settings_dialog = dialog
+        dialog.show()
+
+    @Slot(str, bool, str)
+    def _on_model_downloaded(self, _name: str, ok: bool, _message: str) -> None:
+        if ok:
+            self.reload_settings()  # el indicador de Piper pasa a «Listo»
+            self.show_notice(MODEL_INSTALLED)
 
     # --- configuración (leída en el hilo de trabajo) -------------------------------------------
 

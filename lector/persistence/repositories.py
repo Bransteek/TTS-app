@@ -296,6 +296,12 @@ class ChapterRepo(_Repo):
         self._run(lambda c: c.execute(
             "UPDATE chapters SET text=NULL, paragraphs_json=NULL WHERE doc_id=?", (doc_id,)))
 
+    def purge_all_text(self) -> None:
+        """Borra el texto guardado de todos los documentos (títulos y progreso se quedan)."""
+        self._run(lambda c: c.execute(
+            "UPDATE chapters SET text=NULL, paragraphs_json=NULL "
+            "WHERE text IS NOT NULL OR paragraphs_json IS NOT NULL"))
+
 
 class ProgressRepo(_Repo):
     def save(self, rec: ProgressRecord) -> None:
