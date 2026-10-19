@@ -8,11 +8,26 @@ import lxml.html
 
 from lector.content.base import ContentSource, doc_id_for_url, html_paragraphs
 from lector.content.segmenter import build_chapter_text
-from lector.errors import PageUnreachable
+from lector.errors import PageIncomplete, PageUnreachable
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.security.http_client import SafeFetcher
 
 _WORK_PATH = re.compile(r"^/novels/[^/]+/?$")
+_NO_TEXT = "No se encontró el texto del capítulo."  # definitivo: el sitio ha cambiado
+_NO_CHAPTERS = "No se encontraron capítulos en esa novela."
+
+
+def _incomplete(message: str) -> PageIncomplete:
+    """Página sin lo esperado: se reintenta un rato y después es `message`, definitivo."""
+    return PageIncomplete(PageUnreachable(message, recoverable=False))
+
+
+def _tree(html: str, message: str = _NO_TEXT):
+    """Árbol lxml de una respuesta; vacía o ilegible es pasajera (`PageIncomplete`)."""
+    try:
+        return lxml.html.fromstring(html)
+    except (lxml.etree.ParserError, ValueError):
+        raise _incomplete(message) from None
 
 
 def is_madara(html: str) -> bool:
@@ -52,14 +67,14 @@ class MadaraSource(ContentSource):
             self._index = None
             chapters = await self.list_chapters()
             if not chapters:
-                raise PageUnreachable("No se encontraron capítulos en esa novela.", recoverable=False)
+                raise PageUnreachable(_NO_CHAPTERS, recoverable=False)
             result = await self._fetcher.get(chapters[0].locator)
-            tree = lxml.html.fromstring(result.text)
+            tree = _tree(result.text)
             chapter = self._parse(tree, result.url)
             title = self._breadcrumb_work_title(tree) or chapter.title
             return self._document(locator, title, chapters, index_page=True), chapter
         html, url = await self._page(locator, prefetched_html)
-        tree = lxml.html.fromstring(html)
+        tree = _tree(html)
         work_url = self._find_work_url(tree, url)
         if work_url != self._work_url:
             self._work_url, self._index = work_url, None
@@ -72,7 +87,7 @@ class MadaraSource(ContentSource):
 
     async def load_chapter(self, ref: ChapterRef) -> Chapter:
         result = await self._fetcher.get(ref.locator)
-        chapter = self._parse(lxml.html.fromstring(result.text), result.url)
+        chapter = self._parse(_tree(result.text), result.url)
         if ref.index is not None:
             chapter.ref = ChapterRef(ref.index, chapter.ref.title, chapter.ref.locator)
         return chapter
@@ -83,7 +98,7 @@ class MadaraSource(ContentSource):
         if self._work_url is None:
             raise PageUnreachable("Primero hay que abrir una novela.", recoverable=False)
         result = await self._fetcher.post(f"{self._work_url}ajax/chapters/")
-        tree = lxml.html.fromstring(result.text)
+        tree = _tree(result.text, _NO_CHAPTERS)
         titles: dict[str, str] = {}
         for a in reversed(tree.cssselect("li.wp-manga-chapter a[href]")):
             href = urljoin(self._work_url, a.get("href").strip())
@@ -140,7 +155,9 @@ class MadaraSource(ContentSource):
     def _parse(self, tree, url: str) -> Chapter:
         content = tree.cssselect(".reading-content")
         if not content:
-            raise PageUnreachable("No se encontró el texto del capítulo.", recoverable=False)
+            # Un aviso pasajero del servidor o un cambio del sitio: el navegador
+            # reintenta un rato antes de darlo por definitivo.
+            raise _incomplete(_NO_TEXT)
         text, paragraphs, sentences = build_chapter_text(
             [(p, None) for p in html_paragraphs(content[0])]
         )

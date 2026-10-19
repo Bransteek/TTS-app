@@ -209,6 +209,23 @@ async def test_no_text_raises():
         await fetcher.aclose()
 
 
+@pytest.mark.parametrize("body", ["", None])
+async def test_known_chapter_without_text_is_incomplete(body):
+    """Al cargar un capítulo ya conocido, una página sin texto se reintenta un rato."""
+    from lector.errors import PageIncomplete
+    from lector.models import ChapterRef
+
+    fetcher, source = await make_source({PAGE_URL: read("no_text.html") if body is None else body})
+    try:
+        with pytest.raises(PageIncomplete) as exc:
+            await source.load_chapter(ChapterRef(4, "Capítulo 5", PAGE_URL))
+    finally:
+        await fetcher.aclose()
+    assert exc.value.recoverable is True
+    assert isinstance(exc.value.final, NoExtractableText)
+    assert exc.value.user_message == NoExtractableText.user_message
+
+
 async def test_open_extracts_chapter_and_next():
     fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
     try:

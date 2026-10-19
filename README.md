@@ -121,6 +121,7 @@ El programa guarda **lo que ya has oído**, no lo que ya está preparado. Esto i
 - Si Edge falla, el programa reintenta tres veces (esperando 1, 2 y 4 segundos) y luego pasa a Piper con el mismo fragmento. En total, la pausa suele ser de unos 7 segundos.
 - Mientras lee con Piper, prueba Edge cada cierto tiempo: la primera vez al minuto, y si sigue sin ir, espera el doble cada vez (hasta 10 minutos). Además, espera al menos 2 minutos después de cambiar a Piper. Cuando Edge responde, vuelve a él en el siguiente corte entre fragmentos.
 - **Sin internet y sin voz Piper instalada**, el programa no se rinde: pasa a «Esperando conexión», reintenta cada poco (como máximo cada 60 segundos) y **sigue solo cuando vuelve la red**.
+- **Si se va internet al cambiar de capítulo** (o al pulsar «Continuar» en el historial), pasa lo mismo: espera en «Esperando conexión» y sigue solo cuando vuelve la red. También espera si la web pide calma (demasiadas peticiones) o devuelve una página vacía. Si la página sigue sin el texto del capítulo durante un minuto, avisa de que no lo encuentra.
 - No se guarda ningún archivo de audio en el disco.
 
 ## Configuración

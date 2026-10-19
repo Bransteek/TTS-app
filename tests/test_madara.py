@@ -5,6 +5,8 @@ import pytest
 
 from lector.content.base import doc_id_for_url, html_paragraphs
 from lector.content.madara import MadaraSource, is_madara
+from lector.errors import PageIncomplete
+from lector.models import ChapterRef
 from lector.security.http_client import SafeFetcher
 
 FIX = Path(__file__).parent / "fixtures" / "madara"
@@ -170,3 +172,46 @@ async def test_open_reports_adapter_and_index_page(source):
     assert work_doc.adapter == chapter_doc.adapter == "madara"
     assert work_doc.index_page is True
     assert chapter_doc.index_page is False
+
+
+# --- Páginas sin texto: pasajeras con límite (revisión final, importante 1) ---
+
+
+def _serving(pages: dict[str, str]):
+    def serve(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in pages:
+            return httpx.Response(200, text=pages[url], headers=HTML)
+        return handler(request)
+
+    return serve
+
+
+@pytest.mark.parametrize(
+    "body", ["", " \n ", "<html><body><p>Comprobando tu navegador…</p></body></html>"]
+)
+async def test_chapter_page_without_text_is_incomplete(body):
+    url = WORK + "capitulo-100/"
+    fetcher = SafeFetcher(resolver=resolver, transport=httpx.MockTransport(_serving({url: body})))
+    try:
+        with pytest.raises(PageIncomplete) as exc:
+            await MadaraSource(fetcher).load_chapter(ChapterRef(99, "Capítulo 100", url))
+    finally:
+        await fetcher.aclose()
+    assert exc.value.recoverable is True
+    assert exc.value.final.recoverable is False
+    assert exc.value.user_message == exc.value.final.user_message == (
+        "No se encontró el texto del capítulo."
+    )
+
+
+async def test_open_chapter_survives_empty_ajax_list():
+    fetcher = SafeFetcher(
+        resolver=resolver, transport=httpx.MockTransport(_serving({WORK + "ajax/chapters/": ""}))
+    )
+    try:
+        doc, chapter = await MadaraSource(fetcher).open(WORK + "capitulo-99/")
+    finally:
+        await fetcher.aclose()
+    assert doc.chapters == []
+    assert len(chapter.paragraphs) == 117

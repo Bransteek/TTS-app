@@ -1,9 +1,13 @@
+import datetime
+import email.utils
+import socket
+
 import httpx
 import pytest
 
-from lector.errors import InvalidUrl, PageUnreachable
+from lector.errors import InvalidUrl, PageUnreachable, ServerBusy
 from lector.security.http_client import FetchResult, SafeFetcher
-from lector.security.url_validator import resolve_public, validate_url
+from lector.security.url_validator import ensure_public_ip, resolve_public, validate_url
 
 HTML = {"content-type": "text/html; charset=utf-8"}
 
@@ -217,3 +221,115 @@ async def test_resolver_oserror_is_recoverable_unreachable():
         await fetcher.get("http://a.test/")
     await fetcher.aclose()
     assert exc.value.recoverable is True
+
+
+# --- DNS sin red: error recuperable, no «dirección no válida» (revisión final, crítico 1) ---
+
+
+def _offline_getaddrinfo(*args, **kwargs):
+    # Lo que devuelven macOS y Windows con el Wi-Fi apagado.
+    raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+
+async def test_resolve_public_dns_failure_is_recoverable(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _offline_getaddrinfo)
+    with pytest.raises(PageUnreachable) as exc:
+        await resolve_public("aresscanlationovel.com", 443)
+    assert not isinstance(exc.value, InvalidUrl)
+    assert exc.value.recoverable is True
+
+
+async def test_fetcher_with_real_resolver_offline_is_recoverable(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _offline_getaddrinfo)
+
+    def handler(request):
+        raise AssertionError("sin DNS no debe haber petición")
+
+    fetcher = SafeFetcher(transport=httpx.MockTransport(handler))  # resolver real
+    with pytest.raises(PageUnreachable) as exc:
+        await fetcher.get("https://aresscanlationovel.com/novels/x/capitulo-1/")
+    await fetcher.aclose()
+    assert exc.value.recoverable is True
+
+
+async def test_resolver_returning_private_ip_still_invalid(monkeypatch):
+    def private(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", private)
+    with pytest.raises(InvalidUrl):
+        await resolve_public("evil.test", 80)
+
+
+async def test_host_that_cannot_be_encoded_is_invalid_url():
+    # Etiqueta no ASCII de más de 63 caracteres: getaddrinfo falla al codificarla en IDNA,
+    # antes de consultar la red.
+    with pytest.raises(InvalidUrl):
+        await resolve_public("ñ" * 64 + ".com", 80)
+
+
+# --- 408/425/429: el servidor pide esperar (revisión final, importante 1) ---
+
+
+@pytest.mark.parametrize("status", [408, 425, 429])
+async def test_busy_statuses_are_recoverable(status):
+    fetcher = make_fetcher(lambda request: httpx.Response(status))
+    with pytest.raises(ServerBusy) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert exc.value.recoverable is True
+    assert exc.value.retry_after is None
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_retry_after_seconds(status):
+    fetcher = make_fetcher(lambda request: httpx.Response(status, headers={"retry-after": "120"}))
+    with pytest.raises(ServerBusy) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert exc.value.retry_after == 120
+
+
+async def test_retry_after_http_date():
+    when = email.utils.format_datetime(
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30), usegmt=True
+    )
+    fetcher = make_fetcher(lambda request: httpx.Response(429, headers={"retry-after": when}))
+    with pytest.raises(ServerBusy) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert 25 <= exc.value.retry_after <= 31
+
+
+@pytest.mark.parametrize("value", ["pronto", "-5", "", "nan", "1e999", "Mon, 32 Foo 2026"])
+async def test_retry_after_garbage_is_ignored(value):
+    fetcher = make_fetcher(lambda request: httpx.Response(429, headers={"retry-after": value}))
+    with pytest.raises(ServerBusy) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert exc.value.retry_after is None
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 410])
+async def test_other_4xx_still_not_recoverable(status):
+    fetcher = make_fetcher(lambda request: httpx.Response(status))
+    with pytest.raises(PageUnreachable) as exc:
+        await fetcher.get("http://a.test/")
+    await fetcher.aclose()
+    assert exc.value.recoverable is False
+
+
+# --- Rangos no globales (CGNAT 100.64/10 y otros) (revisión final, menor 2) ---
+
+
+@pytest.mark.parametrize(
+    "ip", ["100.64.0.1", "100.127.255.254", "::ffff:100.64.0.1", "192.0.0.8", "198.18.0.1", "fc00::1"]
+)
+def test_non_global_ranges_rejected(ip):
+    with pytest.raises(InvalidUrl):
+        ensure_public_ip(ip)
+
+
+@pytest.mark.parametrize("ip", ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"])
+def test_global_ips_accepted(ip):
+    assert ensure_public_ip(ip) == ip

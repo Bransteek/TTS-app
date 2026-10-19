@@ -12,7 +12,7 @@ import trafilatura
 
 from lector.content.base import ContentSource, doc_id_for_url
 from lector.content.segmenter import build_chapter_text
-from lector.errors import NoExtractableText
+from lector.errors import NoExtractableText, PageIncomplete
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.security.http_client import SafeFetcher
 
@@ -263,7 +263,12 @@ class GenericWebSource(ContentSource):
 
     async def load_chapter(self, ref: ChapterRef) -> Chapter:
         result = await self._fetcher.get(ref.locator)
-        chapter = self._parse(result.text, result.url, keep_prefix=True)
+        try:
+            chapter = self._parse(result.text, result.url, keep_prefix=True)
+        except NoExtractableText as exc:
+            # Capítulo ya conocido: una página vacía o un aviso del servidor puede ser
+            # pasajero; el navegador reintenta un rato antes de darlo por definitivo.
+            raise PageIncomplete(exc) from exc
         if ref.index is not None:
             chapter.ref = ChapterRef(ref.index, chapter.ref.title, chapter.ref.locator)
         return chapter

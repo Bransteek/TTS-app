@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from lector.content.base import ContentSource
-from lector.errors import LectorError
+from lector.errors import LectorError, NoExtractableText, PageIncomplete
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.persistence.repositories import ChapterRepo, DocumentRepo
 from lector.services import recovery
@@ -88,7 +88,11 @@ class DeferredSource:
         async with self._lock:
             if self._real is None:
                 # Abrir por el capítulo pedido devuelve ese mismo capítulo: una sola descarga.
-                real, opened, chapter = await self._opener(ref.locator, self._fetcher)
+                try:
+                    real, opened, chapter = await self._opener(ref.locator, self._fetcher)
+                except NoExtractableText as exc:
+                    # Es un capítulo ya conocido: sin texto ahora puede ser pasajero.
+                    raise PageIncomplete(exc) from exc
                 self._opened(real, opened)
                 if ref.index is not None and chapter.ref.index is None:
                     chapter.ref = ChapterRef(ref.index, chapter.ref.title, chapter.ref.locator)

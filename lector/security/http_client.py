@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import email.utils
+import math
+import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from ..errors import InvalidUrl, LectorError, PageUnreachable
+from ..errors import InvalidUrl, LectorError, PageUnreachable, ServerBusy
 from .url_validator import ensure_public_ip, resolve_public, validate_url
 
 USER_AGENT = (
@@ -27,6 +30,8 @@ USER_AGENT = (
 )
 ALLOWED_TYPES = {"text/html", "application/xhtml+xml", "text/plain"}
 REDIRECT_CODES = {301, 302, 303, 307, 308}
+# Respuestas que piden volver a intentarlo más tarde (además de 5xx): recuperables.
+BUSY_CODES = {408, 425, 429}
 
 
 @dataclass(frozen=True)
@@ -132,8 +137,8 @@ class SafeFetcher:
 
     async def _read(self, url: str, response: httpx.Response) -> FetchResult:
         status = response.status_code
-        if status >= 500:
-            raise PageUnreachable(recoverable=True)
+        if status >= 500 or status in BUSY_CODES:
+            raise ServerBusy(retry_after(response.headers.get("retry-after")))
         if status >= 400:
             raise PageUnreachable(recoverable=False)
         content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -150,6 +155,24 @@ class SafeFetcher:
                 raise too_big
         text = bytes(body).decode(_codec(response.charset_encoding), errors="replace")
         return FetchResult(url=url, status=status, text=text, content_type=content_type)
+
+
+def retry_after(value: str | None, now: float | None = None) -> float | None:
+    """Segundos de la cabecera Retry-After (número o fecha HTTP); None si no vale."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        seconds = float(value)
+    else:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None or when.tzinfo is None:
+            return None
+        seconds = when.timestamp() - (time.time() if now is None else now)
+    return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
 def _codec(name: str | None) -> str:

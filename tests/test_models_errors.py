@@ -32,7 +32,7 @@ def _instantiate(cls):
 
 def test_every_error_has_spanish_message():
     classes = _all_error_classes()
-    assert len(classes) == 17
+    assert len(classes) == 20
     for cls in classes:
         e = _instantiate(cls)
         assert isinstance(e, LectorError)

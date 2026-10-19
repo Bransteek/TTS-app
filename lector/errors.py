@@ -98,3 +98,46 @@ class FileMovedOrChanged(LectorError):
     def __init__(self, doc_id: str, message: str | None = None, *, recoverable: bool | None = None):
         super().__init__(message, recoverable=recoverable)
         self.doc_id = doc_id
+
+
+# --- Revisión final: red y contenido ---------------------------------------------------
+
+
+class ServerBusy(PageUnreachable):
+    """El servidor pide esperar (408, 425, 429 o 5xx): se reintenta.
+
+    `retry_after`: segundos que indicó la cabecera Retry-After, o None.
+    """
+
+    user_message = "La página no responde ahora mismo. Se volverá a intentar."
+    recoverable = True
+
+    def __init__(
+        self, retry_after: float | None = None, message: str | None = None, *,
+        recoverable: bool | None = None,
+    ):
+        super().__init__(message, recoverable=recoverable)
+        self.retry_after = retry_after
+
+
+class PageIncomplete(PageUnreachable):
+    """La página de un capítulo llegó sin su texto: vacía, ilegible o sin el bloque esperado.
+
+    Puede ser pasajero (un aviso del servidor, una respuesta cortada), así que el
+    navegador lo reintenta durante `RETRY_BUDGET_S` segundos de espera en total y
+    después lanza `final`, el error definitivo (no recuperable).
+    """
+
+    recoverable = True
+    RETRY_BUDGET_S = 60.0
+
+    def __init__(self, final: LectorError | None = None, *, recoverable: bool | None = None):
+        final = final if final is not None else NoExtractableText()
+        super().__init__(final.user_message, recoverable=recoverable)
+        self.final = final
+
+
+class DocumentTooLarge(LectorError):
+    """Un PDF o EPUB supera los límites de tamaño o de páginas (protege la memoria)."""
+
+    user_message = "El archivo es demasiado grande para abrirlo."

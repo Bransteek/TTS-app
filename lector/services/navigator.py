@@ -8,7 +8,9 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from lector.content.base import ContentSource
-from lector.errors import AmbiguousNextChapter, ChapterLoopDetected, LectorError
+from lector.errors import (
+    AmbiguousNextChapter, ChapterLoopDetected, LectorError, PageIncomplete,
+)
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 from lector.persistence.repositories import ChapterRepo
 
@@ -251,20 +253,32 @@ class ChapterNavigator:
     ) -> T:
         """Reintenta sin límite los errores recuperables con espera creciente.
 
+        - Si el error trae `retry_after` (Retry-After del servidor), se espera al
+          menos eso, sin pasar nunca de `wait_max_s`.
+        - `PageIncomplete` (página sin el texto del capítulo) es la excepción al «sin
+          límite»: tras `RETRY_BUDGET_S` segundos de espera acumulada se lanza su
+          error definitivo.
+
         Con `wait` avisa (una vez) de que empieza la espera; el que creó `wait`
         avisa del final. Sin `wait` (precarga) no avisa nunca.
         """
         delay = _FIRST_WAIT_S
+        incomplete_waited = 0.0
         while True:
             try:
                 return await attempt()
             except LectorError as exc:
                 if not exc.recoverable:
                     raise
+                pause = min(max(delay, getattr(exc, "retry_after", None) or 0), self._wait_max_s)
+                if isinstance(exc, PageIncomplete):
+                    if incomplete_waited >= exc.RETRY_BUDGET_S:
+                        raise exc.final from exc
+                    incomplete_waited += pause
             if wait is not None and not wait.waiting:
                 wait.waiting = True
                 self._notify(True)
-            await self._sleep(min(delay, self._wait_max_s))
+            await self._sleep(pause)
             delay = min(delay * 2, self._wait_max_s)
 
     async def _prefetch(self, chapter: Chapter) -> None:
