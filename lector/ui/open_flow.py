@@ -87,7 +87,12 @@ class OpenFlowMixin:
             self.show_notice(NOTHING_TO_READ)
             return
         if self._opening or self._play_pending:
-            return  # doble clic: ya hay una orden en vuelo
+            # Doble clic: ya hay una orden en vuelo. Queda en el registro: si la apertura
+            # no termina, «Leer» parece no hacer nada.
+            busy = ("aún se está abriendo otra dirección" if self._opening
+                    else "aún se está empezando a leer")
+            log.info("Se ignora «Leer» con %s: %s", locator, busy)
+            return
         preview = self._preview
         if preview is None or preview.locator != locator:
             self._open(locator, autoplay=True)
@@ -97,6 +102,7 @@ class OpenFlowMixin:
             # Ya se empezó a leer este documento: «Leer» no lo reinicia ni vuelve al
             # capítulo elegido al principio; sigue donde iba.
             if self._state in PLAYING_STATES:
+                log.info("Se ignora «Leer»: ya se está leyendo el documento %s", doc.doc_id)
                 return
             if self._state is SessionState.PAUSED:
                 self._run(self._ctl.resume())
@@ -230,6 +236,7 @@ class OpenFlowMixin:
         self._start_open(locator, save_and_open(), autoplay=True, confirmed=True)
 
     def _start_open(self, locator: str, job: Coroutine, autoplay: bool, confirmed: bool) -> None:
+        log.info("Abriendo %s", locator)
         self._clear_notice()
         self._clear_choice()
         self._resume.cancel()

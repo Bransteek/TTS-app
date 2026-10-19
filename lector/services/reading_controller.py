@@ -338,6 +338,8 @@ class ReadingController:
         )
         progress = await asyncio.to_thread(self._repos.progress.get, doc.doc_id)
         self._preview = (source, doc, chapter)
+        log.info("Abierto %s (documento %s, capítulo índice %s)",
+                 chapter.ref.locator, doc.doc_id, chapter.ref.index)
         return doc, chapter, progress
 
     async def play(self, doc_id: str, start: Position | None = None) -> None:
@@ -368,6 +370,7 @@ class ReadingController:
                 self._set_state(SessionState.IDLE)
                 raise
             self._em.reset()  # el productor anterior ya está cancelado
+            log.info("Empieza la lectura del documento %s", doc_id)
             if self._paused:
                 self._paused = False
                 self._player.resume()  # quita la pausa (y reabre la salida si falló)
@@ -805,6 +808,7 @@ class ReadingController:
                     self._finish(_End(SessionState.COMPLETED, ("info", CHAPTER_FINISHED),
                                       continuous_off=True))
                     return
+                log.info("Buscando el capítulo siguiente a %s", chapter.ref.locator)
                 try:
                     nxt = await nav.next_of(chapter)
                 except AmbiguousNextChapter as exc:
@@ -817,6 +821,7 @@ class ReadingController:
                 if nxt is None:
                     self._finish(_End(SessionState.COMPLETED, ("info", NO_MORE_CHAPTERS)))
                     return
+                log.info("Capítulo siguiente: %s", nxt.ref.locator)
                 self._chapter_index(nxt, hint=self._chapter_index(chapter) + 1)
                 nav.mark_visited(nxt.ref)
                 nav.start_prefetch(nxt)
@@ -927,6 +932,8 @@ class ReadingController:
             return
         self._active = False
         self._loading = False
+        log.info("La lectura terminó: %s (%s)", end.state,
+                 end.notice[1] if end.notice is not None else "sin aviso")
         self._set_state(end.state)
         self._request_save(force=True)
         if end.notice is not None:
@@ -1154,6 +1161,7 @@ class ReadingController:
     def _show(self, chapter: Chapter) -> None:
         if chapter.ref.locator != self._shown_locator and self._session is not None:
             self._shown_locator = chapter.ref.locator
+            log.info("Suena el capítulo %s", chapter.ref.locator)
             self._emit("on_document", self._session.doc, chapter)
 
     # --- Sesión y documentos -----------------------------------------------------------
@@ -1256,6 +1264,7 @@ class ReadingController:
     def _set_state(self, state: SessionState) -> None:
         if state is self._state:
             return
+        log.info("Estado de la lectura: %s -> %s", self._state, state)
         self._state = state
         self._emit("on_session_state", state)
         if state is SessionState.WAITING_NETWORK:

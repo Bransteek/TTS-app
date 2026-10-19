@@ -227,12 +227,14 @@ class TrayController(QObject):
         now = self._clock()
         last = self._last_balloon.get(message)
         if last is not None and now - last < BALLOON_REPEAT_S:
+            log.info("Globo repetido sin mostrar: %s", message)
             return  # el mismo globo salió hace poco: no se repite
         self._last_balloon[message] = now
         if len(self._last_balloon) > 4 * MAX_PENDING:
             self._last_balloon = {m: t for m, t in self._last_balloon.items()
                                   if now - t < BALLOON_REPEAT_S}
         icon = _LEVEL_ICONS.get(level, QSystemTrayIcon.MessageIcon.Information)
+        log.info("Globo de la bandeja: %s", message)
         self.tray.showMessage(APP_NAME, message, icon)
 
     @Slot(str, str)
