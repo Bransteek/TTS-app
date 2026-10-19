@@ -298,6 +298,9 @@ class ReadingController:
         self._planned: dict[int, _Planned] = {}  # id(chunk) -> fragmento en el reproductor
         self._mark: _Mark | None = None
         self._end: _End | None = None
+        # Época en que `_end` ya tocaba pero esperó a un capítulo elegido en camino.
+        self._end_held: int | None = None
+        self._picks = 0  # go_to_chapter() esperando su capítulo
         self._epoch = 0  # cambia con cada salto, play o stop
         self._shown_locator: str | None = None
         self._nav_tasks: set[asyncio.Task] = set()  # navegaciones manuales en curso
@@ -522,15 +525,31 @@ class ReadingController:
             await self.play(doc_id, Position(number or 0, ref.locator, 0, 0, 0, None))
             return True
         epoch = self._epoch
+        # Mientras el capítulo elegido está en camino, el final de la lectura (la cola se
+        # acabó) espera: la sesión sigue y se ve la espera de red, no «terminado».
+        self._picks += 1
         try:
-            chapter = await self._navigate(session.nav.get(ref))
-        except LectorError as exc:
-            self._notice("warn", exc.user_message)
-            return False
-        if chapter is _ABORTED:
-            return False
-        self._chapter_index(chapter, hint=number)
-        return await self._jump(chapter, epoch)
+            try:
+                chapter = await self._navigate(session.nav.get(ref))
+            except LectorError as exc:
+                self._notice("warn", exc.user_message)
+                return False
+            if chapter is _ABORTED:
+                return False
+            number = self._chapter_index(chapter, hint=number)
+            if self._end_held is None:
+                return await self._jump(chapter, epoch)
+            if epoch != self._epoch:
+                return False
+            # La lectura ya había terminado: se empieza de nuevo, con todo lo que hace play().
+            await self.play(doc_id, Position(number, chapter.ref.locator, 0, 0, 0, None))
+            return True
+        finally:
+            self._picks -= 1
+            # El salto no se hizo: ahora sí termina la lectura. Un final retenido en otra
+            # época ya no vale: stop() o play() lo borran al cambiar la sesión.
+            if not self._picks and self._end_held == self._epoch:
+                self._apply_end()
 
     async def choose_next(self, ref: ChapterRef) -> None:
         """Sigue por `ref` y lo recuerda como «siguiente» del capítulo actual (§7.4)."""
@@ -823,7 +842,7 @@ class ReadingController:
             self._player.resume()
         self._last_launch = launch
         self._next_unqueued = (launch.target, launch.sentence)
-        self._end = None
+        self._end, self._end_held = None, None
         self._relaunch = False
         self._active = True
         self._loading = not isinstance(launch.target, Chapter)
@@ -952,9 +971,13 @@ class ReadingController:
             self._apply_end()
 
     def _apply_end(self) -> None:
-        end, self._end = self._end, None
+        end = self._end
         if end is None:
             return
+        if self._picks and not end.hold:
+            self._end_held = self._epoch  # go_to_chapter() lo aplica si su salto no se hace
+            return
+        self._end, self._end_held = None, None
         if end.hold:
             self._loading = False
             self._relaunch = True
@@ -1008,7 +1031,7 @@ class ReadingController:
         playing = self._playing()
         self._player.clear()
         self._planned.clear()
-        self._end = None
+        self._end, self._end_held = None, None
         self._relaunch = False
         if playing is not None:
             self._set_mark_before(*playing)

@@ -18,7 +18,7 @@ from lector.paths import data_dir
 from lector.security.http_client import SafeFetcher
 from lector.errors import AUDIO_OUTPUT_LOST
 from lector.services.reading_controller import (
-    OUTPUT_RETRY_DELAYS_S, STALL_TIMEOUT_S, SessionState, resume_sentence,
+    CHAPTER_FINISHED, OUTPUT_RETRY_DELAYS_S, STALL_TIMEOUT_S, SessionState, resume_sentence,
 )
 from lector.tts.engine_manager import EngineState
 from tests.controller_rig import (
@@ -1298,6 +1298,106 @@ async def test_stop_and_continue_after_a_pick_waiting_for_the_network(controller
     rig.source.failures = []
     await rig.play(STORY_ID)  # «Seguir leyendo»
     await until(lambda: rig.ctl.state in (S.READING, S.COMPLETED))
+
+
+async def drain_while_a_pick_waits(rig):
+    """Lectura continua apagada, sin red: se elige el capítulo 3 y el 1 termina de sonar."""
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.source.failures = Outage(PageUnreachable())
+    pick = asyncio.create_task(go_to(rig, 3))
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+    await rig.hear(3)  # se acaba la cola: el capítulo 1 ya sonó entero
+    await settle()
+    return pick
+
+
+async def test_queue_draining_while_a_pick_waits_keeps_waiting_then_reads(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=4, prefetch_ahead=0)
+    pick = await drain_while_a_pick_waits(rig)
+
+    assert rig.ctl.state is S.WAITING_NETWORK  # sigue «Esperando conexión…», no «terminado»
+    assert S.COMPLETED not in rig.events.states
+    assert ("info", CHAPTER_FINISHED) not in rig.events.notices
+    assert not pick.done()
+    rig.settings.set("speed", 1.5)  # cambió mientras esperaba: el play() lo vuelve a leer
+    rig.source.failures = []  # vuelve la red
+
+    assert await asyncio.wait_for(pick, WAIT_S) is True
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+    assert rig.edge.calls[-1][2] == 1.5  # pasó por play(): configuración releída
+    assert rig.ctl.state is S.READING
+
+
+async def test_pick_failing_after_the_queue_drained_ends_the_reading(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=4, prefetch_ahead=0)
+    pick = await drain_while_a_pick_waits(rig)
+
+    rig.source.failures = [DamagedDocument()]  # al volver a probar, el capítulo no sirve
+
+    assert await asyncio.wait_for(pick, WAIT_S) is False
+    await until(lambda: rig.ctl.state is S.COMPLETED)  # ahora sí: terminó el capítulo
+    assert ("info", CHAPTER_FINISHED) in rig.events.notices
+    assert any(level == "warn" for level, _ in rig.events.notices)  # y por qué no se saltó
+
+
+async def test_newer_command_while_a_pick_waits_after_the_queue_drained(controller_rig):
+    """Una orden más nueva gana al salto viejo, y la lectura termina como debía."""
+    rig = story_rig(controller_rig, chapters=3, sentences=4, prefetch_ahead=0)
+    pick = await drain_while_a_pick_waits(rig)
+    await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)  # ya no queda frase: vuelve a acabar
+    await settle()
+    assert rig.ctl.state is S.WAITING_NETWORK
+
+    rig.source.failures = []
+
+    assert await asyncio.wait_for(pick, WAIT_S) is False  # el salto quedó caduco
+    await until(lambda: rig.ctl.state is S.COMPLETED)  # no se queda esperando para siempre
+    assert rig.events.heard_at[-1][0] == "Cap 1"
+
+
+async def test_missing_voice_pauses_at_once_even_while_a_pick_waits(controller_rig):
+    """La pausa por falta de voz no espera al salto: el aviso sale ya, y el salto la respeta."""
+    from lector.errors import EdgeVoiceUnavailable
+
+    rig = story_rig(controller_rig, chapters=3, sentences=20, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    await rig.fill()
+    rig.source.failures = Outage(PageUnreachable())
+    pick = asyncio.create_task(go_to(rig, 3))
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    async def no_voice(*args):
+        raise EdgeVoiceUnavailable()
+
+    rig.manager.synthesize = no_voice
+    for _ in range(20):  # suena lo que ya estaba preparado; lo siguiente no tiene voz
+        if rig.ctl.state is S.PAUSED or rig.player.queued_count() == 0:
+            break
+        await rig.hear(1)
+    await until(lambda: rig.ctl.state is S.PAUSED)
+
+    assert rig.events.notices[-1] == ("warn", EdgeVoiceUnavailable.user_message)
+    assert not pick.done()
+    rig.source.failures = []
+    assert await asyncio.wait_for(pick, WAIT_S) is True
+    await settle()
+    assert rig.ctl.state is S.PAUSED  # el salto no quita la pausa
+    assert rig.stored().position.chapter_locator == story_ref(3).locator
+
+
+async def test_stop_after_the_queue_drained_while_a_pick_waits(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=4, prefetch_ahead=0)
+    pick = await drain_while_a_pick_waits(rig)
+
+    await rig.stop()
+
+    assert await asyncio.wait_for(pick, WAIT_S) is False
+    assert rig.ctl.state is S.STOPPED and lector_tasks() == []
+    assert S.COMPLETED not in rig.events.states
+    assert rig.stored().position.chapter_locator == story_ref(1).locator
 
 
 # --- la lista de capítulos se renueva al volver a abrir ---------------------------------------

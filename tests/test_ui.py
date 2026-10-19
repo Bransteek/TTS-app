@@ -2245,6 +2245,40 @@ def test_failed_pick_forgets_an_older_chosen_start(qtbot, make_window, ctl):
     assert window.statusBar().currentMessage() == ""
 
 
+@pytest.mark.parametrize("state", ["stopped", "error"])
+def test_sent_pick_drops_an_older_chosen_start(qtbot, make_window, ctl, state):
+    """Si el capítulo elegido luego no carga, «Seguir leyendo» vuelve a lo último oído."""
+    ctl.jump_gate = threading.Event()
+    window = make_window(show=True)
+    reading_session(window, state=state)
+    window._pending_start = ("doc-1", Position(1, URL2, 0, 0, 0, None))  # de un intento anterior
+    try:
+        window.chapter_picker.activated.emit(2)
+        assert window._pending_start is None  # ya al mandarlo
+        wait_call(qtbot, ctl, "go_to_chapter", 2)
+    finally:
+        ctl.jump_gate.set()
+    qtbot.waitUntil(lambda: not window._jump_pending, timeout=WAIT_MS)
+    assert window._pending_start is None
+
+
+def test_failed_pick_keeps_a_newer_chosen_start(qtbot, make_window, ctl):
+    ctl.jump_gate = threading.Event()
+    ctl.jump_result = False
+    window = make_window(show=True)
+    reading_session(window, state="error")
+    newer = Position(0, URL, 0, 0, 0, None)
+    try:
+        window.chapter_picker.activated.emit(2)
+        wait_call(qtbot, ctl, "go_to_chapter", 2)
+        window._apply_resume(make_doc(), make_progress(make_doc()), ResumeChoice("start"))
+        assert window._pending_start == ("doc-1", newer)  # «Empezar» mientras el salto espera
+    finally:
+        ctl.jump_gate.set()
+    qtbot.waitUntil(lambda: not window._jump_pending, timeout=WAIT_MS)
+    assert window._pending_start == ("doc-1", newer)  # el salto fallido no la borra
+
+
 def test_reopening_while_reading_refreshes_the_dropdown(qtbot, make_window, ctl):
     window = make_window(show=True)
     reading_session(window, make_doc(numbered_chapters(3)), locator=URL2, title="Capítulo 2")

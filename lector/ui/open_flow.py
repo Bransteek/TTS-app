@@ -373,6 +373,9 @@ class OpenFlowMixin:
         ref = picker.chapters[index]
         starts = self._state not in PLAYING_STATES and self._state is not SessionState.PAUSED
         self._clear_choice()  # una elección de «siguiente» pendiente ya no vale
+        # Una posición elegida antes ya no vale: si este capítulo no llega a cargar, «Seguir
+        # leyendo» vuelve a lo último oído. Lo que se elija después (p. ej. «Empezar») sí vale.
+        self._pending_start = None
         picker.begin_pick(index)
         message = JUMPING_TEXT.format(title=picker.itemText(index))
         self.statusBar().showMessage(message)
@@ -381,8 +384,6 @@ class OpenFlowMixin:
             self._jump_pending = False
             if starts:
                 self._play_pending = False
-            if not jumped:
-                self._pending_start = None  # «Seguir leyendo» vuelve a lo último oído
             picker.end_pick(jumped)
             if self.statusBar().currentMessage() == message:
                 self.statusBar().clearMessage()
