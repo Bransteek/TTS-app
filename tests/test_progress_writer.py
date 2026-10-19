@@ -24,7 +24,8 @@ async def test_flush_waits_for_a_replaced_deferred_write_to_finish():
         saved.append, lambda: len(saved) + 1,
         clock=clock.now, sleep=slow_to_cancel, on_error=lambda exc: None,
     )
-    await asyncio.wait_for(writer.save_now(), WAIT_S)  # primera escritura
+    writer.request(force=True)
+    await asyncio.wait_for(writer.flush(), WAIT_S)  # primera escritura
     writer.request()  # dentro del intervalo: queda diferida, durmiendo
     await settle()
     assert saved == [1]

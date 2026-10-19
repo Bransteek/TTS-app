@@ -11,7 +11,7 @@ from lector.errors import (
     PageUnreachable,
 )
 from lector.models import Chunk, Sentence, make_chunk_id
-from lector.paths import data_dir, db_path, models_dir
+from lector.paths import data_dir
 
 
 def _all_error_classes():
@@ -32,7 +32,7 @@ def _instantiate(cls):
 
 def test_every_error_has_spanish_message():
     classes = _all_error_classes()
-    assert len(classes) == 21
+    assert len(classes) == 20
     for cls in classes:
         e = _instantiate(cls)
         assert isinstance(e, LectorError)
@@ -57,9 +57,7 @@ def test_data_dir_honours_env(tmp_path, monkeypatch):
     target = tmp_path / "datos"
     monkeypatch.setenv("LECTOR_DATA_DIR", str(target))
     assert data_dir() == target
-    assert db_path() == target / "lector.db"
-    assert models_dir().is_dir()
-    assert models_dir() == target / "piper-voices"
+    assert target.is_dir()
 
 
 def _sentence(i):

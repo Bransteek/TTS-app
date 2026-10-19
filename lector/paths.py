@@ -22,13 +22,3 @@ def data_dir() -> Path:
         path = Path(base) / APP_DIRNAME
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def models_dir() -> Path:
-    path = data_dir() / "piper-voices"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def db_path() -> Path:
-    return data_dir() / "lector.db"

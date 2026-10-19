@@ -29,10 +29,6 @@ class NoExtractableText(LectorError):
     user_message = "No se encontró texto para leer en esta página."
 
 
-class NextChapterNotFound(LectorError):
-    user_message = "No se encontró el capítulo siguiente."
-
-
 class ChapterLoopDetected(LectorError):
     user_message = "Se detectó un ciclo de capítulos y se detuvo la lectura."
 

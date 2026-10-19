@@ -92,10 +92,6 @@ class ProgressWriter:
         self._sleeping = delay > 0
         self._task = asyncio.create_task(self._run(delay), name="lector:save")
 
-    async def save_now(self) -> None:
-        self.request(force=True)
-        await self.flush()
-
     async def flush(self) -> None:
         """Espera a que se escriba lo último pedido (adelanta una escritura diferida)."""
         while True:
