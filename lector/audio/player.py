@@ -158,8 +158,9 @@ class AudioPlayer:
 
     Ciclo de vida de la salida:
     - El primer `enqueue` arranca la salida (un solo intento).
-    - Si la salida falla, se para y se avisa una vez con `on_output_error`. La cola se
-      conserva y **solo** `resume()` (lo llama el controlador) vuelve a arrancarla.
+    - Si la salida falla (o se atasca: `restart_output()`), se para y se avisa una vez con
+      `on_output_error`. La cola se conserva, el clip actual vuelve al inicio de la frase
+      que sonaba y **solo** `resume()` (lo llama el controlador) vuelve a arrancarla.
     - `close()` es definitivo: para la salida, descarta el audio y desde entonces
       `enqueue` lanza `AudioOutputError(recoverable=False)` (también a quien estaba
       esperando) y `resume()` no hace nada.
@@ -189,6 +190,7 @@ class AudioPlayer:
         self._pending_samples = 0  # muestras de _current + _queue (clips completos)
         self._paused = False
         self._generation = 0  # cambia en clear()/close(): invalida eventos y enqueues previos
+        self._played = 0  # muestras de audio entregadas a la salida (no el silencio)
 
         # Solo en el bucle asyncio.
         self._cond: asyncio.Condition | None = None
@@ -289,6 +291,29 @@ class AudioPlayer:
                 return None
             return self._current.chunk, self._sentence
 
+    def played_samples(self) -> int:
+        """Muestras de audio entregadas a la salida desde que se creó (el silencio no cuenta).
+
+        Si hay audio pendiente, sin pausa y la salida en marcha, y este número no crece,
+        la salida se atascó sin avisar (lo vigila el controlador).
+        """
+        with self._lock:
+            return self._played
+
+    def restart_output(self) -> None:
+        """La salida dejó de pedir audio sin avisar: se trata como un fallo de la salida.
+
+        Se para, se marca para reabrirla de cero (como tras desenchufar el dispositivo) y
+        se avisa con `on_output_error`; quien la vuelva a abrir con `resume()` sigue desde
+        el inicio de la frase que sonaba.
+        """
+        if self._closed or not self._output_running:
+            return
+        invalidate = getattr(self._output, "invalidate", None)
+        if invalidate is not None:
+            invalidate()
+        self._handle_output_failure(self._output_gen, AudioOutputError())
+
     def queued_count(self) -> int:
         """Clips pendientes: el que suena (si hay) más los que esperan."""
         with self._lock:
@@ -342,6 +367,7 @@ class AudioPlayer:
                     self._promote_locked()
                     clip = self._current
             clip = None
+            self._played += written
         if written < frames:
             out[written:] = 0
         finished = None  # última referencia a los clips terminados: se liberan aquí
@@ -431,11 +457,23 @@ class AudioPlayer:
         if self._output_running:
             self._output_running = False
             self._stop_output()
+        self._rewind_to_sentence()
         if not isinstance(exc, LectorError):
             err = AudioOutputError()
             err.__cause__ = exc
             exc = err
         self._events.on_output_error(exc)
+
+    def _rewind_to_sentence(self) -> None:
+        """Tras un corte, el clip actual vuelve al inicio de la frase que sonaba (§5.6).
+
+        Lo ya entregado a la salida pudo no oírse (búfer del dispositivo). No se vuelve a
+        emitir el inicio de la frase: ya se avisó.
+        """
+        with self._lock:
+            clip = self._current
+            if clip is not None and self._next_mark > 0:
+                self._pos = clip.marks[self._next_mark - 1][0]
 
     def _stop_output(self) -> None:
         try:

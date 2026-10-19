@@ -155,3 +155,10 @@ EDGE_VOICE_MISSING = (
     "No se encontró la voz en línea elegida. Elige otra en la configuración; "
     "mientras tanto se lee con la voz sin conexión."
 )
+
+
+# La salida de audio no volvió tras unos 2 minutos de reintentos: la lectura queda en pausa.
+AUDIO_OUTPUT_LOST = (
+    "No se pudo recuperar la salida de audio y la lectura quedó en pausa. Revisa tus "
+    "altavoces o auriculares y pulsa «Reanudar»."
+)

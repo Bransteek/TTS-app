@@ -29,8 +29,8 @@ from lector.content import registry
 from lector.content.base import ContentSource
 from lector.content.segmenter import make_chunks
 from lector.errors import (
+    AUDIO_OUTPUT_LOST,
     AmbiguousNextChapter,
-    AudioOutputError,
     ChapterLoopDetected,
     LectorError,
 )
@@ -51,7 +51,13 @@ from lector.tts.engine_manager import EngineManager, EngineState
 log = logging.getLogger(__name__)
 
 CHARS_PER_SECOND = 14.0
-OUTPUT_RETRY_DELAY_S = 1.0
+# Esperas antes de cada reintento de abrir la salida de audio (unos 2 min en total): al
+# despertar el equipo o cambiar de dispositivo, la salida puede tardar en volver.
+OUTPUT_RETRY_DELAYS_S = (1, 2, 4, 8, 16, 30, 30, 30)
+# Vigilancia de la salida: con audio que debería estar sonando, tantos segundos sin que
+# la salida pida muestras es que se atascó sin avisar (p. ej. al quitar el dispositivo).
+STALL_TIMEOUT_S = 5.0
+STALL_CHECK_S = 1.0
 NO_MORE_CHAPTERS = "No hay más capítulos publicados"
 CHAPTER_FINISHED = "Terminó el capítulo."
 FIRST_CHAPTER = "Este ya es el primer capítulo."
@@ -285,9 +291,10 @@ class ReadingController:
         self._paused = False
         self._nav_waits = 0
         self._engine_waiting = False
-        self._output_retry_used = False
+        self._output_retries = 0  # reintentos de abrir la salida desde el último audio
         self._output_failed = False  # la salida falló y nadie la ha vuelto a abrir
         self._output_retry: asyncio.Task | None = None
+        self._watchdog: asyncio.Task | None = None  # vigila que la salida no se atasque
 
         self._progress = ProgressWriter(
             save=lambda record: self._repos.progress.save(record),
@@ -350,7 +357,7 @@ class ReadingController:
             if self._paused:
                 self._paused = False
                 self._player.resume()  # quita la pausa (y reabre la salida si falló)
-            self._output_retry_used = False
+            self._output_retries = 0
             self._shown_locator = None
             self._mark = None
             if start is not None:
@@ -377,7 +384,7 @@ class ReadingController:
         if not self._active or not self._paused:
             return
         self._paused = False
-        self._output_retry_used = False
+        self._output_retries = 0
         self._output_failed = False
         self._player.resume()  # también reabre la salida si estaba parada por un fallo
         self._refresh()
@@ -637,30 +644,90 @@ class ReadingController:
             self._output_failed = True
             if not self._active or self._paused:
                 return  # sin sesión, o en pausa: play() o resume() la vuelven a abrir
-            if not self._output_retry_used:
-                self._output_retry_used = True
+            if self._output_retry is not None and not self._output_retry.done():
+                return  # ya hay un reintento esperando
+            if self._output_retries < len(OUTPUT_RETRY_DELAYS_S):
+                delay = OUTPUT_RETRY_DELAYS_S[self._output_retries]
+                self._output_retries += 1
+                log.info("Se reintenta abrir la salida de audio en %s s (intento %d de %d)",
+                         delay, self._output_retries, len(OUTPUT_RETRY_DELAYS_S))
                 self._output_retry = asyncio.create_task(
-                    self._retry_output(), name="lector:output-retry"
+                    self._retry_output(delay), name="lector:output-retry"
                 )
                 return
+            log.warning("La salida de audio no volvió tras los reintentos; se pausa la lectura")
             self._paused = True
             self._player.pause()
             self._refresh()
             self._request_save(force=True)
-            message = err.user_message if isinstance(err, LectorError) else AudioOutputError.user_message
-            self._notice("warn", message)
+            self._notice("warn", AUDIO_OUTPUT_LOST)
         except Exception:
             log.exception("Fallo al procesar un error de la salida de audio")
 
-    async def _retry_output(self) -> None:
-        """Único reintento: espera un poco y cierra y vuelve a abrir la salida."""
-        await self._sleep(OUTPUT_RETRY_DELAY_S)
-        if not self._closed and not self._paused:
+    async def _retry_output(self, delay: float) -> None:
+        """Espera `delay` y vuelve a abrir la salida; si falla, llega otro on_output_error."""
+        await self._sleep(delay)
+        if not self._closed and not self._paused and self._active:
+            self._output_failed = False  # se vuelve a abrir: la vigilancia cuenta desde aquí
             self._player.resume()
 
     def _audio_ok(self) -> None:
-        self._output_retry_used = False
+        self._output_retries = 0
         self._output_failed = False
+
+    # --- Vigilancia de la salida --------------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        if self._closed or (self._watchdog is not None and not self._watchdog.done()):
+            return
+        self._watchdog = asyncio.create_task(self._watch_output(), name="lector:audio-watchdog")
+
+    async def _stop_watchdog(self) -> None:
+        task, self._watchdog = self._watchdog, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})
+
+    def _audio_expected(self) -> bool:
+        """¿Debería estar sonando audio ahora mismo?
+
+        Solo leyendo (no en pausa ni esperando la red), con la salida abierta y algo en
+        el reproductor. Mientras se sintetiza o se espera un capítulo la cola está vacía.
+        """
+        retrying = self._output_retry is not None and not self._output_retry.done()
+        return (
+            self._active
+            and self._state is SessionState.READING
+            and not self._paused
+            and not self._output_failed
+            and not retrying
+            and self._player.current() is not None
+        )
+
+    async def _watch_output(self) -> None:
+        """Mientras hay sesión, mira cada STALL_CHECK_S que la salida siga pidiendo audio.
+
+        Si con audio pendiente no avanza en STALL_TIMEOUT_S, la reinicia como tras un fallo
+        (reintentos incluidos) y la lectura sigue desde el inicio de la frase que sonaba.
+        """
+        seen: tuple[int, float] | None = None  # (muestras entregadas, desde cuándo)
+        while self._active and not self._closed:
+            await self._sleep(STALL_CHECK_S)
+            try:
+                if not self._audio_expected():
+                    seen = None
+                    continue
+                played, now = self._player.played_samples(), self._deps.clock()
+                if seen is None or played != seen[0]:
+                    seen = (played, now)
+                    continue
+                if now - seen[1] >= STALL_TIMEOUT_S:
+                    log.warning("La salida de audio no pide muestras desde hace %.0f s; "
+                                "se reinicia", now - seen[1])
+                    seen = None
+                    self._player.restart_output()
+            except Exception:
+                log.exception("Fallo en la vigilancia de la salida de audio")
 
     # --- Avisos del gestor de motores y del navegador ----------------------------------
 
@@ -681,7 +748,7 @@ class ReadingController:
         if self._output_failed and not self._paused:
             # La salida cayó sin sesión (COMPLETED, NEEDS_ATTENTION, ERROR…): todo lo
             # que vuelve a leer la reabre. Si falla otra vez, sigue el camino normal
-            # de on_output_error (un reintento y luego pausa con aviso).
+            # de on_output_error (reintentos con espera creciente y luego pausa con aviso).
             self._output_failed = False
             self._player.resume()
         self._last_launch = launch
@@ -691,6 +758,7 @@ class ReadingController:
         self._loading = not isinstance(launch.target, Chapter)
         self._refresh()
         self._producer = asyncio.create_task(self._produce(launch), name="lector:producer")
+        self._start_watchdog()
 
     async def _produce(self, launch: _Launch) -> None:
         nav = self._session.nav
@@ -844,6 +912,7 @@ class ReadingController:
         if retry is not None and not retry.done():
             retry.cancel()  # play() o resume() reabren la salida si hace falta
             await asyncio.wait({retry})
+        await self._stop_watchdog()
         playing = self._playing()
         self._player.clear()
         self._planned.clear()

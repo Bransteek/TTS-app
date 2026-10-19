@@ -15,7 +15,10 @@ from lector.errors import (
 from lector.models import Position
 from lector.paths import data_dir
 from lector.security.http_client import SafeFetcher
-from lector.services.reading_controller import SessionState, resume_sentence
+from lector.errors import AUDIO_OUTPUT_LOST
+from lector.services.reading_controller import (
+    OUTPUT_RETRY_DELAYS_S, STALL_TIMEOUT_S, SessionState, resume_sentence,
+)
 from lector.tts.engine_manager import EngineState
 from tests.controller_rig import (
     STORY_ID, WAIT_S, Outage, lector_tasks, settle, story_chapter, story_ref, story_rig, until,
@@ -363,25 +366,71 @@ async def test_chapter_loop_needs_attention(controller_rig):
 # --- errores -----------------------------------------------------------------------
 
 
-async def test_output_error_reopens_once_then_pauses(controller_rig):
-    rig = story_rig(controller_rig, chapters=1)
+async def exhaust_output_retries(rig) -> None:
+    """Con la salida sin volver, deja pasar todas las esperas de reintento (unos 2 min)."""
+    for delay in OUTPUT_RETRY_DELAYS_S:
+        await settle()
+        attempts = rig.out.attempts
+        rig.save_clock.advance(delay)
+        await until(lambda: rig.out.attempts == attempts + 1 or rig.ctl.state is S.PAUSED)
+
+
+async def test_output_retries_back_off_for_two_minutes_then_pause(controller_rig):
+    assert OUTPUT_RETRY_DELAYS_S[:6] == (1, 2, 4, 8, 16, 30)
+    assert 110 <= sum(OUTPUT_RETRY_DELAYS_S) <= 130  # unos 2 minutos en total
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
     await rig.start(story_ref(1).locator)
     await rig.hear(1)
 
+    rig.out.start_error = AudioOutputError()  # el dispositivo tarda en volver (p. ej. al despertar)
     rig.out.fail(AudioOutputError())
-    await settle()
-    assert rig.out.starts == 1  # espera 1 s antes de reabrir
-    rig.save_clock.advance(1.0)
-    await until(lambda: rig.out.starts == 2)  # se reabre una vez
-    assert rig.ctl.state is S.READING
+    for delay in OUTPUT_RETRY_DELAYS_S:
+        await settle()
+        assert rig.ctl.state is S.READING  # sin pausa ni aviso mientras reintenta
+        attempts = rig.out.attempts
+        rig.save_clock.advance(delay - 0.01)
+        await settle()
+        assert rig.out.attempts == attempts  # aún no: espera creciente
+        rig.save_clock.advance(0.01)
+        await until(lambda: rig.out.attempts == attempts + 1)
 
-    rig.out.fail(AudioOutputError())
     await until(lambda: rig.ctl.state is S.PAUSED)
-    assert rig.events.notices[-1] == ("warn", AudioOutputError.user_message)
+    assert rig.events.notices[-1] == ("warn", AUDIO_OUTPUT_LOST)
+    assert [n for n in rig.events.notices if n[0] == "warn"] == [("warn", AUDIO_OUTPUT_LOST)]
 
+    rig.out.start_error = None
     await asyncio.wait_for(rig.ctl.resume(), WAIT_S)  # el usuario reanuda: se reabre la salida
     await rig.hear(1)
     assert rig.events.heard == [0, 1]
+
+
+async def test_output_that_comes_back_resets_the_back_off(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+
+    rig.out.start_error = AudioOutputError()
+    rig.out.fail(AudioOutputError())
+    await settle()
+    rig.save_clock.advance(1)
+    await until(lambda: rig.out.attempts == 2)
+    rig.out.start_error = None  # vuelve el dispositivo
+    rig.save_clock.advance(2)
+    await until(lambda: rig.out.running)
+    await rig.hear(1)  # suena: la cuenta de reintentos vuelve a cero
+
+    rig.out.fail(AudioOutputError())
+    await settle()
+    rig.save_clock.advance(1)  # otra vez la primera espera, no la de 4 s
+    await until(lambda: rig.out.running)
+    # La frase 1 ya había salido entera, pero la 2 aún no empezó: se repite la 1 (lo que
+    # quedaba en el búfer del dispositivo pudo perderse) y luego sigue la 2.
+    rig.out.pull(SAMPLES_PER_SENTENCE)
+    await settle()
+    assert rig.events.heard == [0, 1]
+    await rig.hear(1)
+    assert rig.events.heard == [0, 1, 2]
+    assert rig.ctl.state is S.READING
 
 
 async def test_missing_edge_voice_is_notified_once_and_reading_goes_on(controller_rig):
@@ -694,11 +743,11 @@ async def test_failed_reopen_on_relaunch_follows_output_error_path(controller_ri
     await asyncio.wait_for(rig.ctl.next_chapter(), WAIT_S)
     await settle()
     attempts = rig.out.attempts
-    assert rig.ctl.state is S.READING  # primer fallo: un reintento al cabo de 1 s
-    rig.save_clock.advance(1.0)
+    assert rig.ctl.state is S.READING  # primer fallo: reintentos con espera creciente
+    await exhaust_output_retries(rig)
     await until(lambda: rig.ctl.state is S.PAUSED)
-    assert rig.out.attempts == attempts + 1
-    assert rig.events.notices[-1] == ("warn", AudioOutputError.user_message)
+    assert rig.out.attempts == attempts + len(OUTPUT_RETRY_DELAYS_S)
+    assert rig.events.notices[-1] == ("warn", AUDIO_OUTPUT_LOST)
 
     rig.out.start_error = None
     await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
@@ -807,12 +856,11 @@ async def test_seek_while_paused_after_output_failure_stays_paused(controller_ri
     rig = story_rig(controller_rig, chapters=1, sentences=20)
     await rig.start(story_ref(1).locator)
     await rig.hear(1)
+    rig.out.start_error = AudioOutputError()
     rig.out.fail(AudioOutputError())
-    await settle()
-    rig.save_clock.advance(1.0)
-    await until(lambda: rig.out.running)
-    rig.out.fail(AudioOutputError())  # segundo fallo: pausa con aviso
+    await exhaust_output_retries(rig)  # no vuelve: pausa con aviso
     await until(lambda: rig.ctl.state is S.PAUSED)
+    rig.out.start_error = None
 
     await asyncio.wait_for(rig.ctl.next_sentence(), WAIT_S)
     await settle()
@@ -905,3 +953,111 @@ async def test_open_applies_saved_prefix_override_only_to_its_work(controller_ri
         await rig.close()
     finally:
         await fetcher.aclose()
+
+
+# --- salida de audio atascada (vigilancia) ---------------------------------------------
+
+
+async def tick(rig, seconds: float, step: float = 1.0) -> None:
+    """Hace pasar `seconds` del reloj del controlador de `step` en `step`."""
+    elapsed = 0.0
+    while elapsed < seconds:
+        rig.save_clock.advance(step)
+        elapsed += step
+        await settle()
+
+
+async def test_stalled_output_is_restarted_and_resumes_the_current_sentence(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2, partial=True)  # la frase 1 va por la mitad…
+    assert rig.events.heard == [0, 1]
+
+    # …y PortAudio deja de pedir audio sin avisar (dispositivo quitado en CoreAudio).
+    await tick(rig, STALL_TIMEOUT_S - 1)
+    assert rig.out.starts == 1  # todavía no: unos segundos sin progreso
+    await tick(rig, 2)
+    await until(lambda: rig.out.stops == 1)  # la vigilancia para la salida…
+    await tick(rig, 1)
+    await until(lambda: rig.out.running and rig.out.starts == 2)  # …y la vuelve a abrir
+    assert rig.ctl.state is S.READING
+    assert rig.events.notices == []
+
+    rig.out.pull(SAMPLES_PER_SENTENCE // 2 + 1)  # desde el inicio de la frase 1
+    await settle()
+    assert rig.events.heard == [0, 1]
+    await rig.hear(1)
+    assert rig.events.heard == [0, 1, 2]
+
+
+async def test_watchdog_ignores_synthesis_waits(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.fill()
+    rig.engine_gate = asyncio.Event()  # los reintentos de Edge quedan en espera
+    rig.edge.error = EdgeUnavailable
+    while rig.player.queued_count():  # se vacía la cola: no hay audio que deba sonar
+        await rig.hear(1)
+    await settle()
+    assert rig.player.queued_count() == 0
+
+    await tick(rig, 3 * STALL_TIMEOUT_S)
+    assert rig.out.stops == 0 and rig.out.starts == 1
+    assert rig.ctl.state is S.READING
+    rig.engine_gate.set()
+
+
+async def test_watchdog_ignores_network_waits_and_pause(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.fill()
+    rig.edge.error = EdgeUnavailable
+    rig.piper.error = PiperModelMissing
+    await rig.hear(1)  # hay hueco: el siguiente fragmento no se puede sintetizar
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    await tick(rig, 3 * STALL_TIMEOUT_S)  # queda audio en cola, pero se espera la red
+    assert rig.out.stops == 0
+
+    rig.edge.error = rig.piper.error = None
+    await until(lambda: rig.ctl.state is S.READING)
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
+    await tick(rig, 3 * STALL_TIMEOUT_S)  # en pausa no se espera progreso
+    assert rig.out.stops == 0
+    assert rig.events.notices == []
+
+
+async def test_watchdog_does_not_fire_while_audio_plays(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=30)
+    await rig.start(story_ref(1).locator)
+    for _ in range(3 * int(STALL_TIMEOUT_S)):
+        await rig.hear(1)
+        await tick(rig, 1)
+    assert rig.out.stops == 0 and rig.out.starts == 1
+
+
+async def test_stop_cancels_the_watchdog(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    assert any(t.get_name() == "lector:audio-watchdog" for t in lector_tasks())
+    await rig.stop()
+    assert lector_tasks() == []
+
+
+async def test_output_that_stalls_again_after_a_restart_is_restarted_again(controller_rig):
+    rig = story_rig(controller_rig, chapters=1, sentences=20)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2, partial=True)
+
+    await tick(rig, STALL_TIMEOUT_S + 2)
+    await until(lambda: rig.out.stops == 1)
+    await tick(rig, 1)
+    await until(lambda: rig.out.starts == 2)  # se reabrió, pero tampoco pide audio
+    await tick(rig, STALL_TIMEOUT_S + 2)
+    await until(lambda: rig.out.stops == 2)
+    await tick(rig, 2)  # segunda espera de la serie
+    await until(lambda: rig.out.starts == 3)
+    rig.out.pull(SAMPLES_PER_SENTENCE)  # la frase 1 otra vez desde su inicio
+    await rig.hear(1)
+    assert rig.events.heard == [0, 1, 2] and rig.ctl.state is S.READING

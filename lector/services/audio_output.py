@@ -163,6 +163,10 @@ class LazyOutput:
             self._failed = True
             raise AudioOutputError() from exc
 
+    def invalidate(self) -> None:
+        """El stream se atascó sin avisar: el próximo `start` reabre de cero."""
+        self._failed = True
+
     def stop(self) -> None:
         with self._lock:
             attempt, self._attempt = self._attempt, None

@@ -364,3 +364,35 @@ def test_output_opened_after_the_timeout_is_discarded():
 
     assert reopen(lazy) == []  # el siguiente intento abre una salida nueva
     assert len(factory.outputs) == 2 and factory.outputs[1].running
+
+
+def test_invalidated_output_is_reopened_from_scratch():
+    """Un stream atascado sin avisar (vigilancia del controlador) se rehace de cero."""
+    events: list[str] = []
+    stuck = FakeOutput()
+    factory = Factory(failures=0)
+    lazy = LazyOutput(factory, output=stuck, reset=lambda: events.append("reset"))
+    lazy.start(lambda block: None)
+    lazy.invalidate()
+    lazy.stop()
+    assert reopen(lazy) == []
+    assert events == ["reset"] and stuck.starts == 1 and factory.outputs[0].running
+
+
+async def test_player_restart_after_a_stall_reopens_portaudio_from_scratch():
+    events: list[str] = []
+    stuck = FakeOutput()
+    factory = Factory(failures=0)
+    lazy = LazyOutput(factory, output=stuck, reset=lambda: events.append("reset"))
+    rec = Recorder()
+    player = AudioPlayer(lazy, asyncio.get_running_loop(), rec)
+    await player.enqueue(make_clip())
+    assert stuck.running
+
+    player.restart_output()  # la vigilancia del controlador vio la salida atascada
+    assert len(rec.errors) == 1 and not stuck.running
+    player.resume()
+    await asyncio.to_thread(wait_until, lambda: bool(factory.outputs) and factory.outputs[0].running)
+    assert events == ["reset"]  # se reinició PortAudio: el dispositivo nuevo es visible
+    assert stuck.starts == 1
+    player.close()

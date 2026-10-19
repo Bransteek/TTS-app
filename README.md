@@ -96,11 +96,11 @@ Piper funciona en tu propio equipo. Nada de lo que lee sale de él. Necesita un 
 
 ### En la bandeja del sistema
 
-Al cerrar o minimizar la ventana, el programa **sigue leyendo** desde la bandeja. Una vez te lo avisa con un globo («Sigo leyendo en la bandeja del sistema»). Si pasas el ratón sobre el icono, ves la obra, el capítulo y la voz en uso.
+Al cerrar o minimizar la ventana, el programa **sigue leyendo** desde la bandeja. Una vez te lo avisa con un globo («Sigo leyendo en la bandeja del sistema»). Si pasas el ratón sobre el icono, ves la obra, el capítulo y la voz en uso, o «Esperando conexión…» si está esperando a que vuelva internet (también te lo avisa con un globo).
 
 Con clic derecho en el icono tienes:
 
-- Pausar / Reanudar (el mismo elemento cambia de nombre)
+- Pausar / Reanudar (el mismo elemento cambia de nombre). Si la lectura terminó, se detuvo o hubo un error, dice «Seguir leyendo» y vuelve a leer desde la última frase que oíste.
 - Frase siguiente
 - Capítulo siguiente
 - Detener
@@ -122,6 +122,8 @@ El programa guarda **lo que ya has oído**, no lo que ya está preparado. Esto i
 - Mientras lee con Piper, prueba Edge cada cierto tiempo: la primera vez al minuto, y si sigue sin ir, espera el doble cada vez (hasta 10 minutos). Además, espera al menos 2 minutos después de cambiar a Piper. Cuando Edge responde, vuelve a él en el siguiente corte entre fragmentos.
 - **Sin internet y sin voz Piper instalada**, el programa no se rinde: pasa a «Esperando conexión», reintenta cada poco (como máximo cada 60 segundos) y **sigue solo cuando vuelve la red**.
 - **Si se va internet al cambiar de capítulo** (o al pulsar «Continuar» en el historial), pasa lo mismo: espera en «Esperando conexión» y sigue solo cuando vuelve la red. También espera si la web pide calma (demasiadas peticiones) o devuelve una página vacía. Si la página sigue sin el texto del capítulo durante un minuto, avisa de que no lo encuentra.
+- Si la salida de audio falla o se queda muda (por ejemplo, al desconectar los auriculares o al despertar el equipo), el programa la vuelve a abrir solo y sigue desde el inicio de la frase que sonaba. Lo reintenta durante unos 2 minutos, esperando cada vez un poco más; si no lo consigue, pone la lectura en pausa y te avisa.
+- Los separadores de escena sin palabras («***», «◆◆◆», «~~~»…) se saltan en silencio.
 - No se guarda ningún archivo de audio en el disco.
 
 ## Configuración

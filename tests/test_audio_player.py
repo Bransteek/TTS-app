@@ -475,3 +475,64 @@ async def test_drop_queued_keeps_current_clip_and_its_events(rig):
         ("sentence", "doc:0:0:0", 0), ("sentence", "doc:0:0:0", 1), ("finished", "doc:0:0:0"),
     ]
     assert player.current() is None and player.drop_queued() == []
+
+
+# --- salida atascada: progreso visible y reinicio desde la frase que sonaba --------------
+
+
+async def test_played_samples_counts_only_real_audio(rig):
+    player, out, rec = rig()
+    assert player.played_samples() == 0
+    await player.enqueue(make_clip(0, 1000))
+    out.pull(300)
+    assert player.played_samples() == 300
+    player.pause()
+    out.pull(300)  # en pausa sale silencio: no es progreso
+    assert player.played_samples() == 300
+    player.resume()
+    out.pull(2000)  # solo quedaban 700 muestras
+    assert player.played_samples() == 1000
+
+
+async def test_restart_output_restarts_from_the_start_of_the_current_sentence(rig):
+    player, out, rec = rig()
+    clip = make_clip(0, 1000, [(0, 0), (400, 1)], base=1)
+    await player.enqueue(clip)
+    out.pull(600)  # suena la frase 1, a medias
+    await settle()
+
+    player.restart_output()
+    await settle()
+    errors = [e[1] for e in rec.events if e[0] == "error"]
+    assert len(errors) == 1 and isinstance(errors[0], AudioOutputError)
+    assert out.stops == 1 and not out.running
+
+    player.resume()  # el controlador la vuelve a abrir
+    np.testing.assert_array_equal(out.pull(100), clip.pcm[400:500])  # desde el inicio de la frase
+    assert player.current() == (clip.chunk, 1)
+    await settle()
+    assert [e for e in rec.events if e[0] == "sentence"] == [
+        ("sentence", "doc:0:0:0", 0), ("sentence", "doc:0:0:0", 1),
+    ]
+
+
+async def test_output_failure_also_restarts_from_the_current_sentence(rig):
+    player, out, rec = rig()
+    clip = make_clip(0, 1000, [(0, 0), (400, 1)], base=1)
+    await player.enqueue(clip)
+    out.pull(700)
+    await asyncio.to_thread(out.fail, RuntimeError("device lost"))
+    await settle()
+    player.resume()
+    np.testing.assert_array_equal(out.pull(50), clip.pcm[400:450])
+
+
+async def test_restart_output_without_a_running_output_does_nothing(rig):
+    player, out, rec = rig()
+    player.restart_output()
+    await settle()
+    assert rec.events == []
+    player.close()
+    player.restart_output()
+    await settle()
+    assert rec.events == []
