@@ -146,13 +146,14 @@ class EventLog:
 
 
 class ControllerRig:
-    def __init__(self, db_path, *, opener=None, fetcher=None, clock=None, **nav_options):
+    def __init__(self, db_path, *, opener=None, fetcher=None, clock=None, edge=None, piper=None,
+                 **nav_options):
         self.clock = clock or FakeClock()
         self.conn = open_database(db_path)
         self.repos = Repos.from_connection(self.conn)
         self.settings = SettingsRepo(self.conn)
-        self.edge = FakeEdge(clock=self.clock)
-        self.piper = FakePiper()
+        self.edge = edge if edge is not None else FakeEdge(clock=self.clock)
+        self.piper = piper if piper is not None else FakePiper()
         # Si se activa, las esperas del gestor (reintentos) se quedan bloqueadas hasta abrirla.
         self.engine_gate: asyncio.Event | None = None
 

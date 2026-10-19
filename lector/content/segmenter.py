@@ -118,6 +118,15 @@ def build_chapter_text(
     return "\n\n".join(parts), paragraphs, sentences
 
 
+def is_speakable(text: str) -> bool:
+    """¿Tiene alguna letra o cifra (de cualquier alfabeto)?
+
+    Un separador de escena («***», «…», «—», «◆◆◆», «~~~», «* * *») no la tiene: Edge
+    responde sin audio y no hay nada que leer.
+    """
+    return any(ch.isalnum() for ch in text)
+
+
 def make_chunks(
     doc_id: str,
     chapter_index: int,
@@ -129,7 +138,9 @@ def make_chunks(
     """Agrupa frases en fragmentos sin cruzar párrafos.
 
     El primer fragmento lleva una sola frase para empezar a sonar rápido. Una
-    frase más larga que max_chars va sola en su fragmento.
+    frase más larga que max_chars va sola en su fragmento. Las frases sin letras ni
+    cifras (separadores de escena) no van en ningún fragmento: se saltan sin cambiar
+    los índices, y la frase siguiente que suene confirma el progreso por encima de ellas.
     """
     chunks: list[Chunk] = []
     group: list[Sentence] = []
@@ -154,7 +165,7 @@ def make_chunks(
         group.clear()
 
     for s in sentences:
-        if s.index < first_sentence:
+        if s.index < first_sentence or not is_speakable(s.text):
             continue
         if group:
             limit = 1 if not chunks else max_sentences

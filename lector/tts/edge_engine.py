@@ -5,24 +5,17 @@ import asyncio
 import logging
 import re
 
-import aiohttp
 import edge_tts
 import edge_tts.exceptions
 
 from ..audio.pcm import OUTPUT_RATE, decode_mp3
-from ..errors import EdgeUnavailable, EdgeVoiceNotFound
+from ..errors import EdgeNoAudio, EdgeUnavailable, EdgeVoiceNotFound
 from ..models import Chunk, Sentence
 from .base import AudioClip, edge_rate
 
 log = logging.getLogger(__name__)
 
 _TICKS_PER_SECOND = 10_000_000
-_NETWORK_ERRORS = (
-    aiohttp.ClientError,
-    asyncio.TimeoutError,
-    OSError,
-    edge_tts.exceptions.EdgeTTSException,
-)
 _NON_ALNUM = re.compile(r"[\W_]+")
 
 
@@ -142,6 +135,10 @@ class EdgeEngine:
                     elif kind == "SentenceBoundary":
                         offset = int(item["offset"] / _TICKS_PER_SECOND * OUTPUT_RATE)
                         boundaries.append((offset, item["text"]))
+        except edge_tts.exceptions.NoAudioReceived as exc:
+            # Edge respondió, pero no hay nada que decir en este texto: problema del
+            # fragmento, no del servicio (no debe abrir el circuito).
+            raise EdgeNoAudio() from exc
         except Exception as exc:  # nada crudo debe escapar de synthesize()
             raise EdgeUnavailable() from exc
         audio = b"".join(parts)

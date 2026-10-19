@@ -15,7 +15,9 @@ from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING
 
-from ..errors import EdgeVoiceNotFound
+import numpy as np
+
+from ..errors import EdgeNoAudio, EdgeVoiceNotFound
 from ..models import Chunk
 from .base import AudioClip, TtsEngine
 
@@ -46,6 +48,10 @@ _ACTIVE_LABEL = {
     EngineState.EDGE_RECOVERY_TEST: PIPER_LABEL,
     EngineState.WAITING_NETWORK: EDGE_LABEL,
 }
+
+
+class _ContentFailure(Exception):
+    """Edge no dio audio para el texto de este fragmento: no cuenta como caída de Edge."""
 
 
 @dataclass(frozen=True)
@@ -157,11 +163,18 @@ class EngineManager:
 
         No devuelve hasta conseguir audio de algún motor. Solo sale con
         `CancelledError` si se cancela la tarea.
+
+        Si Edge responde sin audio para el texto (`EdgeNoAudio`, p. ej. «***»), es un
+        problema del fragmento: se prueba Piper solo para él y, si tampoco puede, se
+        devuelve un clip vacío (el fragmento se salta). Ni se reintenta ni se abre el
+        circuito ni cambia el motor de la sesión.
         """
         async with self._lock:
             c = self._c
             try:
                 return await self._synthesize(c, chunk, edge_voice, piper_voice, speed)
+            except _ContentFailure:
+                return await self._content_fallback(chunk, piper_voice, speed)
             except asyncio.CancelledError:
                 # Los reintentos no deben sobrevivir a la cancelación.
                 if c.state is EngineState.EDGE_RETRYING:
@@ -219,6 +232,11 @@ class EngineManager:
                 await self._sleep(cfg.backoff[min(attempt - 1, len(cfg.backoff) - 1)])
             try:
                 clip = await self._edge.synthesize(chunk, voice, speed)
+            except EdgeNoAudio as exc:
+                await self._record_error(chunk, self._edge, exc)
+                if c.state is EngineState.EDGE_RETRYING:
+                    self._set_state(c, EngineState.EDGE_ACTIVE)  # Edge sí respondió
+                raise _ContentFailure() from exc
             except EdgeVoiceNotFound as exc:
                 log.warning("Voz de Edge no encontrada (%s); se usa Piper", voice)
                 self._open_circuit(c, failed_voice=voice)
@@ -301,11 +319,26 @@ class EngineManager:
             await self._sleep(min(delay, wait_max))
             delay = min(delay * 2, wait_max)
 
+    async def _content_fallback(
+        self, chunk: Chunk, piper_voice: str, speed: float
+    ) -> tuple[AudioClip, str]:
+        """Edge no pudo decir este texto: Piper solo para este fragmento o, si no, se salta."""
+        log.warning("Edge no dio audio para el fragmento %s (texto sin voz); se prueba Piper",
+                    chunk.chunk_id)
+        clip = await self._attempt(self._piper, chunk, piper_voice, speed)
+        if clip is not None:
+            return clip, self._piper.name
+        log.warning("Se salta el fragmento %s: ningún motor pudo leerlo", chunk.chunk_id)
+        return AudioClip(pcm=np.zeros(0, dtype=np.int16), marks=[]), self._edge.name
+
     async def _attempt(
         self, engine: TtsEngine, chunk: Chunk, voice: str, speed: float
     ) -> AudioClip | None:
         try:
             clip = await engine.synthesize(chunk, voice, speed)
+        except EdgeNoAudio as exc:
+            await self._record_error(chunk, engine, exc)
+            raise _ContentFailure() from exc
         except Exception as exc:
             self._log_failure(engine, exc)
             await self._record_error(chunk, engine, exc)

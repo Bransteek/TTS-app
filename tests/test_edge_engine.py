@@ -122,7 +122,7 @@ async def test_empty_audio_raises_unavailable():
         aiohttp.ClientConnectionError("x"),
         TimeoutError(),
         OSError("red"),
-        edge_tts.exceptions.NoAudioReceived("x"),
+        edge_tts.exceptions.WebSocketError("x"),
     ],
     ids=["aiohttp", "timeout", "oserror", "edge"],
 )

@@ -141,3 +141,10 @@ class DocumentTooLarge(LectorError):
     """Un PDF o EPUB supera los límites de tamaño o de páginas (protege la memoria)."""
 
     user_message = "El archivo es demasiado grande para abrirlo."
+
+
+class EdgeNoAudio(LectorError):
+    """Edge respondió sin audio para este fragmento (p. ej. «***»): es el texto, no la red."""
+
+    user_message = "La voz en línea no pudo leer este fragmento; se salta."
+    recoverable = True
