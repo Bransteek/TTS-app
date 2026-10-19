@@ -20,7 +20,7 @@ from lector.models import Chapter, Chunk, Sentence
 from lector.services.reading_controller import SessionState
 from lector.tts.edge_engine import EdgeEngine
 from lector.tts.engine_manager import EngineConfig, EngineManager, EngineState
-from tests.controller_rig import WAIT_S, settle, story_document, story_ref, until
+from tests.controller_rig import WAIT_S, settle, story_document, story_ref, story_rig, until
 from tests.controller_rig import fake_opener
 from tests.fakes import FakeClock, FakePiper, FakeSource
 
@@ -230,5 +230,162 @@ async def test_reading_skips_a_sentence_edge_cannot_voice(controller_rig, edge_s
 
     assert rig.events.heard == [0, 2]
     assert edge_service.calls.count("Frase muda.") == 1  # un intento, sin reintentos
+    assert [n for n in rig.events.notices if n[0] != "info"] == []  # no es una voz perdida
     assert SessionState.WAITING_NETWORK not in rig.events.states
     assert rig.manager.state is EngineState.EDGE_ACTIVE
+
+
+# --- voz de Edge retirada o inexistente: el mismo NoAudioReceived que «***» ------------------
+#
+# Microsoft responde NoAudioReceived para cualquier texto si la voz no existe. Los separadores
+# ya no llegan a Edge, así que dos fallos seguidos con texto que tiene letras (o un fallo y la
+# comprobación con un texto conocido) significan que falta la voz: nunca se salta nada.
+
+
+def _texts(n: int) -> list[str]:
+    return [f"Frase número {k}." for k in range(n)]
+
+
+async def test_retired_voice_without_piper_stops_instead_of_skipping(edge_service):
+    from lector.errors import EdgeVoiceUnavailable
+
+    edge_service.mute = lambda text: True  # la voz ya no existe: nada da audio
+    manager, states, clock = make_manager(FakePiper(error=PiperModelMissing))
+    notices: list = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    async with asyncio.timeout(5):
+        with pytest.raises(EdgeVoiceUnavailable):
+            await manager.synthesize(chunk_of("Frase número 0."), EDGE_VOICE, PIPER_VOICE, 1.0)
+    # Un intento con el fragmento y uno con un texto conocido; sin reintentos sin fin.
+    assert edge_service.calls == ["Frase número 0.", "Hola."]
+    assert notices == []  # el aviso de pausa lo da el controlador (no «se lee sin conexión»)
+    assert manager.state is EngineState.PIPER_ACTIVE  # circuito abierto con la voz fallida
+
+    with pytest.raises(EdgeVoiceUnavailable):  # el siguiente tampoco se salta
+        await manager.synthesize(chunk_of("Frase número 1.", 1), EDGE_VOICE, PIPER_VOICE, 1.0)
+
+
+async def test_retired_voice_with_piper_reads_every_chunk_and_notifies_once(edge_service):
+    from lector.errors import EDGE_VOICE_MISSING
+
+    edge_service.mute = lambda text: True
+    piper = FakePiper()
+    manager, states, clock = make_manager(piper)
+    notices: list = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    engines = []
+    for k, text in enumerate(_texts(5)):
+        clip, engine = await manager.synthesize(chunk_of(text, k), EDGE_VOICE, PIPER_VOICE, 1.0)
+        assert len(clip.pcm) > 0  # nunca un clip vacío: nada se salta
+        engines.append(engine)
+    assert engines == ["piper"] * 5
+    assert notices == [("warn", EDGE_VOICE_MISSING)]
+    assert edge_service.calls == ["Frase número 0.", "Frase número 1."]  # después, solo Piper
+    assert manager.state is EngineState.PIPER_ACTIVE
+
+    # Cambiar de voz vuelve a probar Edge.
+    edge_service.mute = lambda text: False
+    clip, engine = await manager.synthesize(chunk_of("Otra voz.", 9), "es-ES-ElviraNeural",
+                                            PIPER_VOICE, 1.0)
+    assert engine == "edge"
+
+
+@pytest.mark.parametrize("piper_installed", [False, True], ids=["sin_piper", "con_piper"])
+async def test_a_single_miss_followed_by_success_is_not_a_missing_voice(edge_service,
+                                                                         piper_installed):
+    edge_service.mute = lambda text: text == "Frase rara."
+    piper = FakePiper() if piper_installed else FakePiper(error=PiperModelMissing)
+    manager, states, clock = make_manager(piper)
+    notices: list = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    clip, engine = await manager.synthesize(chunk_of("Frase rara."), EDGE_VOICE, PIPER_VOICE, 1.0)
+    assert (engine, len(clip.pcm) > 0) == (("piper", True) if piper_installed else ("edge", False))
+    for k in range(1, 4):
+        if k == 2:
+            edge_service.mute = lambda text: text in ("Frase rara.", "Frase número 2.")
+        clip, engine = await manager.synthesize(chunk_of(f"Frase número {k}.", k),
+                                                EDGE_VOICE, PIPER_VOICE, 1.0)
+    # Fallos aislados (con éxitos de Edge entre medias): nunca se da la voz por perdida.
+    assert notices == []
+    assert manager.state is EngineState.EDGE_ACTIVE
+
+
+async def test_reading_pauses_when_the_voice_is_gone_and_no_piper(controller_rig, edge_service):
+    from lector.errors import EdgeVoiceUnavailable
+
+    edge_service.mute = lambda text: True
+    rig = story_rig(controller_rig, chapters=3, sentences=4, edge=EdgeEngine(),
+                    piper=FakePiper(error=PiperModelMissing))
+    await asyncio.wait_for(rig.ctl.set_chunk_limits(600, 1, 300), WAIT_S)
+    await rig.start(story_ref(1).locator)
+
+    await until(lambda: rig.ctl.state is SessionState.PAUSED)
+    assert rig.events.notices == [("warn", EdgeVoiceUnavailable.user_message)]
+    assert rig.events.heard == []
+    assert SessionState.COMPLETED not in rig.events.states
+    assert [c.ref.locator for _, c in rig.events.documents] == [story_ref(1).locator]
+    record = await rig.saved()
+    assert record.position.chapter_locator == story_ref(1).locator
+    assert record.position.sentence_index == -1  # no avanzó más allá de la primera frase
+
+    # Reanudar sin arreglar nada: vuelve a pausar, sin saltar.
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await until(lambda: rig.ctl.state is SessionState.PAUSED and len(rig.events.notices) == 2)
+    assert rig.events.heard == []
+
+    # Con una voz local instalada, «Reanudar» sigue justo donde se quedó.
+    rig.piper.error = None
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await until(lambda: rig.player.queued_count() > 0)
+    rig.out.pull(48_000)
+    await until(lambda: rig.events.heard[:1] == [0])
+    assert rig.ctl.state is SessionState.READING
+
+
+async def test_reading_with_piper_when_the_voice_is_gone_reads_everything(controller_rig,
+                                                                         edge_service):
+    from lector.errors import EDGE_VOICE_MISSING
+
+    edge_service.mute = lambda text: True
+    rig = story_rig(controller_rig, chapters=1, sentences=6, edge=EdgeEngine(), piper=FakePiper())
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(6)
+    await until(lambda: rig.ctl.state is SessionState.COMPLETED)
+
+    assert rig.events.heard == list(range(6))
+    assert rig.events.notices.count(("warn", EDGE_VOICE_MISSING)) == 1
+
+
+# --- «Frase anterior» al otro lado de un separador ------------------------------------------
+
+
+async def test_previous_sentence_jumps_over_a_dropped_scene_break(controller_rig):
+    chapter = _chapter(["Primera escena.", "***", "◆◆◆", "Segunda escena.", "Tercera."])
+    source = FakeSource({chapter.ref.locator: chapter})
+    rig = controller_rig(opener=fake_opener(source, story_document({chapter.ref.locator: chapter})))
+    await rig.start(chapter.ref.locator)
+    await rig.hear(2, partial=True)
+    assert rig.events.heard == [0, 3]  # suena (a medias) la frase justo tras los separadores
+
+    await asyncio.wait_for(rig.ctl.prev_sentence(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard == [0, 3, 0]  # la frase anterior que suena, no la actual otra vez
+    record = await rig.saved()
+    assert record.position.sentence_index == 0  # volvió a sonar entera la primera frase
+
+
+async def test_previous_sentence_from_the_first_sentence_stays_there(controller_rig):
+    chapter = _chapter(["***", "Primera escena.", "Segunda."])
+    source = FakeSource({chapter.ref.locator: chapter})
+    rig = controller_rig(opener=fake_opener(source, story_document({chapter.ref.locator: chapter})))
+    await rig.start(chapter.ref.locator)
+    await rig.hear(1)
+    assert rig.events.heard == [1]
+
+    await asyncio.wait_for(rig.ctl.prev_sentence(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard == [1, 1]

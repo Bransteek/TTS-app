@@ -251,46 +251,28 @@ async def test_missing_edge_voice_is_notified_once(clock):
     assert notices == [("warn", EDGE_VOICE_MISSING)] * 2
 
 
-async def test_missing_edge_voice_without_piper_is_notified_once(clock):
-    from lector.errors import EDGE_VOICE_MISSING
-    from lector.tts.edge_engine import EdgeEngine
+@pytest.mark.parametrize("preferred", ["edge", "piper"])
+async def test_missing_edge_voice_without_piper_stops_instead_of_waiting(clock, preferred):
+    """Error de configuración sin voz local: no se espera sin fin (§5.5) ni se salta nada.
 
-    edge = EdgeEngine()
-    edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])
-    manager, _ = make_manager(edge, FakePiper(error=PiperModelMissing), clock)
-    notices: list[tuple[str, str]] = []
-    manager.set_on_notice(lambda level, message: notices.append((level, message)))
-
-    task = asyncio.create_task(manager.synthesize(make_chunk(0), EDGE_VOICE, PIPER_VOICE, 1.0))
-    async with asyncio.timeout(5):
-        while len(clock.sleeps) < 10:  # la espera sin red sigue probando Edge
-            await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert notices == [("warn", EDGE_VOICE_MISSING)]
-
-
-async def test_missing_edge_voice_as_backup_of_piper_is_notified_once(clock):
-    """Con Piper preferido y sin modelo, Edge es el respaldo: si su voz falta, se avisa."""
-    from lector.errors import EDGE_VOICE_MISSING
+    Con Piper preferido y sin modelo, Edge es el respaldo; si su voz falta, igual.
+    """
+    from lector.errors import EdgeVoiceUnavailable
     from lector.tts.edge_engine import EdgeEngine
 
     edge = EdgeEngine()
     edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])
     manager, _ = make_manager(edge, FakePiper(error=PiperModelMissing), clock,
-                              EngineConfig(preferred="piper"))
+                              EngineConfig(preferred=preferred))
     notices: list[tuple[str, str]] = []
     manager.set_on_notice(lambda level, message: notices.append((level, message)))
 
-    task = asyncio.create_task(manager.synthesize(make_chunk(0), EDGE_VOICE, PIPER_VOICE, 1.0))
-    async with asyncio.timeout(5):
-        while len(clock.sleeps) < 5:
-            await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert notices == [("warn", EDGE_VOICE_MISSING)]
+    for n in range(2):
+        with pytest.raises(EdgeVoiceUnavailable):
+            await synth(manager, n)
+    assert clock.sleeps == []  # sin esperas: no es la red
+    # «Se lee con la voz sin conexión» sería falso: el aviso es el de la pausa.
+    assert notices == []
 
 
 async def test_chunk_log_records_engine_per_chunk(clock, tmp_path):

@@ -158,3 +158,12 @@ AUDIO_OUTPUT_LOST = (
     "No se pudo recuperar la salida de audio y la lectura quedó en pausa. Revisa tus "
     "altavoces o auriculares y pulsa «Reanudar»."
 )
+
+
+class EdgeVoiceUnavailable(LectorError):
+    """La voz de Edge no existe (o se retiró) y no hay voz local: la lectura se pausa."""
+
+    user_message = (
+        "La voz en línea elegida no está disponible. Elige otra voz en Configuración "
+        "o instala una voz local."
+    )

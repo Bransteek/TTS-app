@@ -27,11 +27,12 @@ from typing import Any, Protocol
 from lector.audio.player import AudioPlayer, QueuedClip
 from lector.content import registry
 from lector.content.base import ContentSource
-from lector.content.segmenter import make_chunks
+from lector.content.segmenter import is_speakable, make_chunks
 from lector.errors import (
     AUDIO_OUTPUT_LOST,
     AmbiguousNextChapter,
     ChapterLoopDetected,
+    EdgeVoiceUnavailable,
     LectorError,
 )
 from lector.models import Chapter, ChapterRef, Chunk, Document, Position, Sentence, SourceKind
@@ -206,6 +207,9 @@ class _End:
     notice: tuple[str, str] | None
     candidates: list[ChapterRef] | None = None
     continuous_off: bool = False
+    # La sesión no termina: queda en pausa y «Reanudar» vuelve a lanzar el productor
+    # desde el primer fragmento que no llegó a la cola (nada se salta).
+    hold: bool = False
 
 
 def _queued_clip(chunk: Chunk, clip: AudioClip, engine: str) -> QueuedClip | None:
@@ -232,6 +236,15 @@ def _page_range_has(locator: str, page: int) -> bool:
     """¿El capítulo de PDF «pages:<inicio>-<fin>» contiene `page`?"""
     match = _PAGES_LOCATOR.match(locator)
     return bool(match) and int(match.group(1)) <= page <= int(match.group(2))
+
+
+def _previous_spoken(sentences: list[Sentence], index: int) -> int:
+    """La frase anterior a `index` que suena: los separadores sin voz no están en ningún
+    fragmento, así que volver a uno sería volver a la frase actual."""
+    index -= 1
+    while 0 < index < len(sentences) and not is_speakable(sentences[index].text):
+        index -= 1
+    return index
 
 
 def _skip_index(sentences: list[Sentence], start: int, delta: float, speed: float) -> int:
@@ -295,6 +308,7 @@ class ReadingController:
         self._output_failed = False  # la salida falló y nadie la ha vuelto a abrir
         self._output_retry: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None  # vigila que la salida no se atasque
+        self._relaunch = False  # en pausa sin productor: «Reanudar» lo vuelve a lanzar
 
         self._progress = ProgressWriter(
             save=lambda record: self._repos.progress.save(record),
@@ -388,6 +402,21 @@ class ReadingController:
         self._output_failed = False
         self._player.resume()  # también reabre la salida si estaba parada por un fallo
         self._refresh()
+        if self._relaunch:
+            await self._relaunch_held()
+
+    async def _relaunch_held(self) -> None:
+        """Tras una pausa por falta de voz: se vuelve a probar todo desde lo que no sonó."""
+        async with self._lock:
+            if not self._relaunch or not self._active or self._closed or self._paused:
+                return
+            self._relaunch = False
+            self._em.reset()  # quizá cambió la voz o se instaló Piper: se prueba de nuevo
+            target, index = self._next_unqueued
+            if isinstance(target, Chapter):
+                self._launch(_Launch(target, index, False, False))
+            elif self._last_launch is not None:
+                self._launch(self._last_launch)
 
     async def stop(self) -> None:
         async with self._lock:
@@ -402,7 +431,9 @@ class ReadingController:
         await self._seek(lambda base: (base[0], base[1] + 1) if base else None)
 
     async def prev_sentence(self) -> None:
-        await self._seek(lambda base: (base[0], base[1] - 1) if base else None)
+        await self._seek(
+            lambda base: (base[0], _previous_spoken(base[0].sentences, base[1])) if base else None
+        )
 
     async def restart_chapter(self) -> None:
         await self._seek(lambda base: (base[0], 0) if base else None)
@@ -754,6 +785,7 @@ class ReadingController:
         self._last_launch = launch
         self._next_unqueued = (launch.target, launch.sentence)
         self._end = None
+        self._relaunch = False
         self._active = True
         self._loading = not isinstance(launch.target, Chapter)
         self._refresh()
@@ -795,6 +827,12 @@ class ReadingController:
         except Exception as exc:
             if self._closed:
                 log.debug("Productor detenido durante el cierre: %s", exc)
+                return
+            if isinstance(exc, EdgeVoiceUnavailable):
+                # Sin voz que pueda leer: se pausa al acabar la cola, sin saltar nada.
+                log.warning("No hay voz disponible para seguir; la lectura queda en pausa")
+                self._request_save(force=True)
+                self._finish(_End(SessionState.PAUSED, ("warn", exc.user_message), hold=True))
                 return
             await self._fail(exc)
 
@@ -876,6 +914,17 @@ class ReadingController:
         end, self._end = self._end, None
         if end is None:
             return
+        if end.hold:
+            self._loading = False
+            self._relaunch = True
+            if not self._paused:
+                self._paused = True
+                self._player.pause()
+            self._refresh()
+            self._request_save(force=True)
+            if end.notice is not None:
+                self._notice(*end.notice)
+            return
         self._active = False
         self._loading = False
         self._set_state(end.state)
@@ -917,6 +966,7 @@ class ReadingController:
         self._player.clear()
         self._planned.clear()
         self._end = None
+        self._relaunch = False
         if playing is not None:
             self._set_mark_before(*playing)
         self._active = False
