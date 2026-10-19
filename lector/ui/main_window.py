@@ -358,6 +358,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.notice_label.setFont(font)
         self.notice_label.setText(message)
         self.notice_label.show()
+        self._hide_relocate(keep_offer=self._relocating)  # solo el aviso de archivo movido lo ofrece
         self._notice_level = level
 
     def _clear_notice(self) -> None:
@@ -483,9 +484,11 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
             # Igual que la app sin foco: un diálogo propio con el foco no cuenta (user_present).
             if self.isActiveWindow():
                 self._leave_timer.stop()
-                # Lo que esperaba al usuario (oferta de reanudar, «Buscar el archivo…») sale ya.
-                self._resume.window_shown()
-                self._show_relocate_if_present()
+                # Lo que esperaba al usuario (oferta de reanudar, «Buscar el archivo…») sale ya,
+                # salvo mientras hay un diálogo nativo propio abierto.
+                if not self._own_dialogs:
+                    self._resume.window_shown()
+                    self._show_relocate_if_present()
             elif self.isVisible():
                 self._leave_timer.start()
 

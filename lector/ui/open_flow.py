@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 NOTHING_TO_READ = "Pega la dirección de un capítulo o abre un archivo PDF o EPUB."
 RELOCATE_MISMATCH = "Ese archivo no es el mismo documento. Elige el original."
+DOCUMENT_GONE = ('Ese documento ya no está en tu historial. Ábrelo otra vez con "Abrir PDF/EPUB".')
 RELOCATED_TEXT = "Archivo localizado. Se sigue leyendo donde lo dejaste."
 STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
 LEAVE_CHECK_MS = 300  # la app sin foco tanto tiempo: el usuario se fue (no es un parpadeo)
@@ -70,6 +71,8 @@ class OpenFlowMixin:
         # Posición elegida (capítulo, «empezar», …) que aún no cargó: un reintento vuelve a ella.
         self._pending_start: tuple[str, Position] | None = None
         self._relocate_doc: str | None = None  # documento cuyo archivo hay que volver a localizar
+        self._relocating = False  # buscando el archivo (diálogo abierto o comprobando): un solo intento
+        self._start_gen = 0  # sube con cada apertura o lectura nueva: una búsqueda vieja ya no lee
         self._own_dialogs = 0  # diálogos nativos propios abiertos (no cuentan como irse)
         self._leave_timer = QTimer(self)
         self._leave_timer.setSingleShot(True)
@@ -127,46 +130,67 @@ class OpenFlowMixin:
 
     def _show_relocate_if_present(self) -> None:
         if self._relocate_doc is not None and self.user_present():
-            self.relocate_button.setEnabled(True)
+            self.relocate_button.setEnabled(not self._relocating)
             self.relocate_button.show()
 
-    def _hide_relocate(self) -> None:
-        self._relocate_doc = None
+    def _hide_relocate(self, *, keep_offer: bool = False) -> None:
+        if not keep_offer:
+            self._relocate_doc = None
         self.relocate_button.hide()
 
     def _on_relocate_clicked(self) -> None:
         doc_id = self._relocate_doc
-        if doc_id is None:
+        if doc_id is None or self._relocating:
             return
-        with self.own_native_dialog():
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Buscar el archivo", "", "Libros PDF o EPUB (*.pdf *.epub)"
-            )
-        if not path:
-            return
+        self._relocating = True
         self.relocate_button.setEnabled(False)
-        documents = self._documents
+        try:
+            with self.own_native_dialog():
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Buscar el archivo", "", "Libros PDF o EPUB (*.pdf *.epub)"
+                )
+        except BaseException:
+            self._relocating = False
+            self.relocate_button.setEnabled(True)
+            raise
+        if not path:
+            self._relocating = False
+            self.relocate_button.setEnabled(True)
+            return
+        documents, gen = self._documents, self._start_gen
 
-        async def relocate():
+        async def relocate() -> bool:
             doc = await asyncio.to_thread(documents.get, doc_id)
             if doc is None:
-                raise LookupError(doc_id)
+                return False
             repos = SimpleNamespace(documents=documents)
             await asyncio.to_thread(relocate_and_store, repos, doc, path)
+            return True
 
-        def relocated(_result) -> None:
+        def relocated(found: bool) -> None:
+            self._relocating = False
+            if not found:
+                self._hide_relocate()
+                self.show_notice(DOCUMENT_GONE, "warn")
+                return
+            if self._relocate_doc != doc_id or gen != self._start_gen:
+                return  # ya se abrió otra cosa: el archivo queda guardado y no se lee nada
             self._hide_relocate()
             self._play(doc_id, None)  # retoma del progreso guardado
             self.show_notice(RELOCATED_TEXT)
 
         def failed(exc: BaseException) -> None:
+            self._relocating = False
             self.relocate_button.setEnabled(True)
             if isinstance(exc, FileMovedOrChanged):
-                self.show_notice(RELOCATE_MISMATCH, "warn")  # puede elegir otro
+                if self._relocate_doc == doc_id and gen == self._start_gen:
+                    self.show_notice(RELOCATE_MISMATCH, "warn")  # puede elegir otro
+                    self._offer_relocate(doc_id)
             else:
                 self._on_error(exc)
 
         if not self._run(relocate(), relocated, failed):
+            self._relocating = False
             self.relocate_button.setEnabled(True)
 
     def _open(self, locator: str, autoplay: bool) -> None:
@@ -212,6 +236,7 @@ class OpenFlowMixin:
         self._confirm_after_leer = False
         self._pending_start = None
         self._open_gen += 1
+        self._start_gen += 1
         gen = self._open_gen
         self._set_opening(True)
 
@@ -271,6 +296,7 @@ class OpenFlowMixin:
         elección explícita (reanudar, historial) sí se manda.
         """
         self._session_doc = doc_id
+        self._start_gen += 1
         self._clear_choice()  # una elección pendiente era de la lectura anterior
         self._confirm_after_leer = False
         self.preview.settle()  # ya no se espera confirmar el prefijo ni el capítulo
@@ -416,6 +442,7 @@ class OpenFlowMixin:
         self._resume.cancel()
         self._confirm_after_leer = False
         self._pending_start = None
+        self._start_gen += 1
         self._open_gen += 1  # lo que se estuviera abriendo ya no vale: manda el historial
         self._set_opening(False)
         self.url_edit.setText(doc.origin)

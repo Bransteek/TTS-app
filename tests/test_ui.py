@@ -1863,3 +1863,112 @@ def test_focusing_window_shows_pending_startup_resume_dialog(qtbot, make_window,
     wait_dialog(qtbot, window)
     qtbot.wait(100)
     assert ctl.calls == []  # nunca lee solo
+
+
+def gate_relocation(monkeypatch):
+    """relocate_and_store que espera una señal: la búsqueda queda «en vuelo»."""
+    from lector.ui import open_flow as mw
+
+    gate, calls = threading.Event(), []
+    real = mw.relocate_and_store
+
+    def slow(repos, doc, path):
+        calls.append(path)
+        gate.wait(3)
+        return real(repos, doc, path)
+
+    monkeypatch.setattr(mw, "relocate_and_store", slow)
+    return gate, calls
+
+
+def test_activation_while_relocating_keeps_button_disabled(qtbot, make_window, ctl, conn, tmp_path,
+                                                           monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [str(new)])
+    gate, calls = gate_relocation(monkeypatch)
+    fail_moved(qtbot, window, ctl)
+
+    window.relocate_button.click()
+    qtbot.waitUntil(lambda: bool(calls), timeout=WAIT_MS)
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+    window.hide()
+    window.show()
+    assert window.relocate_button.isVisible() and not window.relocate_button.isEnabled()
+    window.relocate_button.click()  # aunque se pulse: no se manda otra
+    gate.set()
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert len(calls) == 1
+
+
+def test_relocation_finishing_after_another_open_does_not_play(qtbot, make_window, ctl, conn,
+                                                               tmp_path, monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [str(new)])
+    gate, calls = gate_relocation(monkeypatch)
+    fail_moved(qtbot, window, ctl)
+
+    window.relocate_button.click()
+    qtbot.waitUntil(lambda: bool(calls), timeout=WAIT_MS)
+    ctl.open_result = (make_doc(doc_id="otro"), make_chapter(), None)
+    read(qtbot, window, URL2)
+    wait_call(qtbot, ctl, "open", URL2)
+    gate.set()
+
+    qtbot.waitUntil(lambda: spy.get("doc-1").origin == str(new), timeout=WAIT_MS)  # guardado
+    qtbot.wait(150)
+    assert ("play", "doc-1", None) not in ctl.calls
+    assert not window.relocate_button.isVisible()
+
+
+def test_relocate_document_gone_from_history(qtbot, make_window, ctl, conn, tmp_path, monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [str(new)])
+    fail_moved(qtbot, window, ctl)
+    conn.execute("DELETE FROM documents WHERE doc_id = ?", ("doc-1",))
+    conn.commit()
+
+    window.relocate_button.click()
+
+    qtbot.waitUntil(lambda: "ya no está en tu historial" in window.notice_label.text(),
+                    timeout=WAIT_MS)
+    assert not window.relocate_button.isVisible() and window._relocate_doc is None
+    assert window.notice_label.text() != GENERIC_ERROR and ctl.calls == []
+
+
+def test_unrelated_notice_hides_relocate_button(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    fail_moved(qtbot, window, ctl)
+    assert window.relocate_button.isVisible()
+
+    window.show_notice("Otro aviso")
+
+    assert not window.relocate_button.isVisible()
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+    assert not window.relocate_button.isVisible()
+
+
+def test_resume_dialog_not_repeated_nor_shown_during_own_dialog(qtbot, make_window, ctl,
+                                                                monkeypatch):
+    doc = make_doc()
+    window = make_window(show=True)
+    with monkeypatch.context() as away:
+        away.setattr(window, "isActiveWindow", lambda: False)
+        away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        window.offer_resume(doc, make_progress(doc), auto_continue_when_hidden=False)
+        qtbot.wait(50)
+    with window.own_native_dialog():
+        QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+        qtbot.wait(50)
+        assert window.resume_dialog is None
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+    first = wait_dialog(qtbot, window)
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
+    qtbot.wait(50)
+    assert window.resume_dialog is first and ctl.calls == []
