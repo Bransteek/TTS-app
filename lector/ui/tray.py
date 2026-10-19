@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QEvent, QEventLoop, QObject, QPointF, QRectF, Qt, QTimer, Slot
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -22,14 +22,13 @@ from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.ui.main_window import MainWindow
 from lector.tts.engine_manager import EDGE_LABEL, PIPER_LABEL
 from lector.ui.open_flow import PLAYING_STATES
+from lector.ui.quit_flow import SHUTDOWN_TIMEOUT_S, WORKER_STOP_TIMEOUT_S, shutdown_and_stop
 
 log = logging.getLogger(__name__)
 
 STILL_READING = "Sigo leyendo en la bandeja del sistema"
 CHOICE_PENDING = "Hay que elegir el capítulo siguiente. Abre la ventana para decidir."
 APP_NAME = "Lector"
-SHUTDOWN_TIMEOUT_S = 5.0
-WORKER_STOP_TIMEOUT_S = 2.0  # peor caso al salir: 5 s de cierre + 2 s aquí
 MAX_PENDING = 20
 BALLOON_REPEAT_S = 30.0
 
@@ -283,40 +282,8 @@ class TrayController(QObject):
         if self._quitting:
             return
         self._quitting = True
-        self._window.allow_close()
-        self._shutdown_controller()
-        try:
-            self._worker.stop(timeout=WORKER_STOP_TIMEOUT_S)
-        except Exception:
-            log.exception("No se pudo detener el trabajador al salir")
+        shutdown_and_stop(self._window, self._worker, self._ctl,
+                          shutdown_timeout_s=self._shutdown_timeout_s,
+                          worker_timeout_s=WORKER_STOP_TIMEOUT_S)
         self.tray.hide()
         self._quit_app()
-
-    def _shutdown_controller(self) -> None:
-        """Cierra el controlador con tope de tiempo; si falla o tarda, se sale igual."""
-        try:
-            future = self._worker.submit(self._ctl.shutdown())
-        except RuntimeError:
-            log.warning("El trabajador ya no está en marcha; no hay nada que cerrar")
-            return
-        loop = QEventLoop()
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(loop.quit)
-        outcome: list[BaseException | None] = []
-
-        def finished(result: BaseException | None) -> None:
-            outcome.append(result)
-            loop.quit()
-
-        call_ui(future, lambda _r: finished(None), finished)
-        timer.start(int(self._shutdown_timeout_s * 1000))
-        loop.exec()
-        timer.stop()
-        if not outcome:
-            log.error("El cierre del controlador tardó más de %s s; se sale igualmente",
-                      self._shutdown_timeout_s)
-        elif outcome[0] is not None:
-            exc = outcome[0]
-            log.error("El cierre del controlador falló; se sale igualmente",
-                      exc_info=(type(exc), exc, exc.__traceback__))

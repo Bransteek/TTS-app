@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 
 import pytest
@@ -15,6 +17,12 @@ from PySide6.QtCore import QTimer
 
 import main
 from lector.errors import AudioOutputError
+from lector.services import audio_output
+from lector.services.app_builder import DB_RECOVERED, DB_UNAVAILABLE
+from lector.services.app_errors import UNEXPECTED_ERROR
+from lector.ui import app as app_module
+from lector.ui.app import APP_USER_MODEL_ID, AlreadyRunning, StartupError, set_windows_app_id
+from lector.ui.single_instance import SingleInstance
 from lector.models import ChapterRef, Document, Position, SourceKind
 from lector.persistence.database import open_database
 from lector.persistence.repositories import DocumentRepo, ProgressRecord, ProgressRepo
@@ -67,7 +75,7 @@ def make_app(qapp, tmp_path):
             return TrayController(window, bridge, worker, controller, icon,
                                   tray=FakeTray(), quit_app=quit_app)
 
-        ctx = main.build_app(
+        ctx = app_module.build_app(
             [],
             data_dir=tmp_path,
             output_factory=output_factory or outputs,
@@ -215,7 +223,7 @@ def test_corrupt_database_is_replaced_with_a_notice(make_app, qtbot, tmp_path):
     (tmp_path / "lector.db").write_bytes(b"esto no es una base de datos" * 200)
     ctx, _ = make_app()
 
-    assert main.DB_RECOVERED in ctx.window.notice_label.text()
+    assert DB_RECOVERED in ctx.window.notice_label.text()
     assert list(tmp_path.glob("lector.db.corrupt-*"))
     assert worker_alive(ctx)
 
@@ -234,7 +242,7 @@ def test_uncaught_ui_exception_is_logged_saved_and_notified(make_app, qtbot, cap
     with caplog.at_level(logging.ERROR):
         QTimer.singleShot(0, boom)
         qtbot.waitUntil(lambda: saves == [True], timeout=WAIT_MS)
-        qtbot.waitUntil(lambda: ctx.window.notice_label.text() == main.UNEXPECTED_ERROR,
+        qtbot.waitUntil(lambda: ctx.window.notice_label.text() == UNEXPECTED_ERROR,
                         timeout=WAIT_MS)
 
     record = next(r for r in caplog.records if r.exc_info and r.exc_info[0] is ValueError)
@@ -263,7 +271,7 @@ def test_exception_in_worker_task_is_logged_saved_and_notified(make_app, qtbot, 
     with caplog.at_level(logging.ERROR):
         ctx.worker.submit(fire_and_forget()).result(timeout=2)
         qtbot.waitUntil(lambda: saves == [True], timeout=WAIT_MS)
-        qtbot.waitUntil(lambda: ctx.window.notice_label.text() == main.UNEXPECTED_ERROR,
+        qtbot.waitUntil(lambda: ctx.window.notice_label.text() == UNEXPECTED_ERROR,
                         timeout=WAIT_MS)
 
     assert any(r.exc_info and "fallo en una tarea del trabajador" in str(r.exc_info[1])
@@ -310,14 +318,15 @@ def test_failing_handler_does_not_recurse(make_app, qtbot, caplog):
         qtbot.wait(200)
 
     del ctx.window.show_notice, ctx.controller.shutdown  # vuelven los reales para salir
-    assert notices == [main.UNEXPECTED_ERROR]  # una sola vez: no hay recursión
+    assert notices == [UNEXPECTED_ERROR]  # una sola vez: no hay recursión
     assert any(r.exc_info and r.exc_info[0] is ValueError for r in caplog.records)
     assert ctx.window.isVisible()
     assert worker_alive(ctx)
 
 
-def test_exceptions_in_other_threads_are_logged(make_app, caplog):
+def test_exceptions_in_other_threads_are_logged_saved_and_notified(make_app, qtbot, caplog):
     ctx, _ = make_app()
+    saves = spy_shutdown(ctx)
 
     def boom():
         raise ValueError("fallo en otro hilo")
@@ -326,9 +335,29 @@ def test_exceptions_in_other_threads_are_logged(make_app, caplog):
         thread = threading.Thread(target=boom, name="hilo-de-prueba")
         thread.start()
         thread.join(timeout=2)
+        qtbot.waitUntil(lambda: saves == [True], timeout=WAIT_MS)
+        qtbot.waitUntil(lambda: ctx.window.notice_label.text() == UNEXPECTED_ERROR,
+                        timeout=WAIT_MS)
 
-    assert any(r.exc_info and "fallo en otro hilo" in str(r.exc_info[1]) for r in caplog.records)
+    record = next(r for r in caplog.records if r.exc_info and r.exc_info[0] is ValueError)
+    assert "fallo en otro hilo" in str(record.exc_info[1])
+    assert "hilo-de-prueba" in record.getMessage()
     assert worker_alive(ctx)
+
+
+def test_system_exit_in_a_thread_is_ignored(make_app, qtbot):
+    ctx, _ = make_app()
+    saves = spy_shutdown(ctx)
+    thread = threading.Thread(target=lambda: (_ for _ in ()).throw(SystemExit(0)))
+    thread.start()
+    thread.join(timeout=2)
+    qtbot.wait(200)
+    assert saves == []
+
+
+def test_unexpected_error_text_does_not_claim_the_save_already_finished():
+    assert "Se guardó" not in UNEXPECTED_ERROR
+    assert "guardando" in UNEXPECTED_ERROR
 
 
 def test_close_restores_previous_hooks(make_app):
@@ -372,10 +401,10 @@ class FakeShell32:
 
 def test_app_user_model_id_only_on_windows():
     shell = FakeShell32()
-    assert main.set_windows_app_id(platform="darwin", shell32=shell) is False
+    assert set_windows_app_id(platform="darwin", shell32=shell) is False
     assert shell.ids == []
-    assert main.set_windows_app_id(platform="win32", shell32=shell) is True
-    assert shell.ids == [main.APP_USER_MODEL_ID]
+    assert set_windows_app_id(platform="win32", shell32=shell) is True
+    assert shell.ids == [APP_USER_MODEL_ID]
 
 
 # --- main() ---------------------------------------------------------------------------------
@@ -391,3 +420,169 @@ def test_main_runs_the_event_loop_until_quit(make_app, monkeypatch):
 
     with pytest.raises(RuntimeError):
         ctx.worker.submit(asyncio.sleep(0))
+
+
+# --- una sola instancia ---------------------------------------------------------------------
+
+
+def test_second_launch_shows_the_first_window_and_opens_nothing(make_app, qtbot, tmp_path,
+                                                                monkeypatch):
+    ctx, _ = make_app()
+    ctx.window.hide()
+    opened = []
+    monkeypatch.setattr(app_module, "open_app_database",
+                        lambda *a, **k: opened.append(a) or pytest.fail("abrió la base"))
+    with pytest.raises(AlreadyRunning):
+        app_module.build_app([], data_dir=tmp_path)
+
+    qtbot.waitUntil(lambda: ctx.window.isVisible(), timeout=WAIT_MS)
+    assert opened == []
+    workers = [t for t in threading.enumerate() if t.name == "lector-worker" and t.is_alive()]
+    assert len(workers) == 1  # la segunda no arrancó trabajador
+    assert len([w for w in ctx.app.topLevelWidgets()
+                if type(w).__name__ == "MainWindow" and w.isVisible()]) == 1
+
+
+def test_lock_is_released_on_close(make_app, tmp_path):
+    ctx, _ = make_app()
+    probe = SingleInstance(tmp_path / "lector.lock", "sin-uso")
+    assert not probe.acquire()
+    ctx.quit()
+    ctx.close()
+    assert probe.acquire()
+    probe.release()
+
+
+def test_main_returns_zero_when_another_instance_runs(monkeypatch):
+    def already(argv):
+        raise AlreadyRunning()
+
+    monkeypatch.setattr(main, "build_app", already)
+    monkeypatch.setattr(main, "_show_startup_failure", lambda: pytest.fail("no es un fallo"))
+    assert main.main() == 0
+
+
+# --- fallos al arrancar -----------------------------------------------------------------------
+
+
+def _no_worker_left() -> bool:
+    return not any(t.name == "lector-worker" and t.is_alive() for t in threading.enumerate())
+
+
+def test_failed_build_cleans_up_and_raises_startup_error(qapp, qtbot, tmp_path):
+    import sys
+
+    hooks = (sys.excepthook, threading.excepthook)
+    handlers = list(logging.getLogger().handlers)
+
+    def broken_engines(settings, models):
+        raise RuntimeError("motores rotos")
+
+    with pytest.raises(StartupError):
+        app_module.build_app([], data_dir=tmp_path, output_factory=FakeOutput,
+                             fetcher_factory=lambda s: None, engine_factory=broken_engines,
+                             tray_factory=lambda *a: None)
+
+    qtbot.waitUntil(_no_worker_left, timeout=WAIT_MS)
+    assert (sys.excepthook, threading.excepthook) == hooks
+    assert logging.getLogger().handlers == handlers
+    probe = SingleInstance(tmp_path / "lector.lock", "sin-uso")
+    assert probe.acquire()  # el cerrojo se soltó
+    probe.release()
+    assert "motores rotos" in (tmp_path / "lector.log").read_text(encoding="utf-8")
+
+
+def test_build_timeout_cleans_up_and_raises_startup_error(qapp, qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "BUILD_TIMEOUT_S", 0.2)
+
+    def slow_engines(settings, models):
+        time.sleep(0.6)  # bloquea el bucle del trabajador más que el tope
+        return StubEdge(), FakePiper()
+
+    started = time.monotonic()
+    with pytest.raises(StartupError):
+        app_module.build_app([], data_dir=tmp_path, output_factory=FakeOutput,
+                             fetcher_factory=lambda s: None, engine_factory=slow_engines,
+                             tray_factory=lambda *a: None)
+    assert time.monotonic() - started < 5
+    qtbot.waitUntil(_no_worker_left, timeout=WAIT_MS)
+
+
+def test_main_returns_one_and_warns_when_startup_fails(monkeypatch):
+    shown = []
+
+    def broken(argv):
+        raise StartupError("no se pudo")
+
+    monkeypatch.setattr(main, "build_app", broken)
+    monkeypatch.setattr(main, "_show_startup_failure", lambda: shown.append(True))
+    assert main.main() == 1
+    assert shown == [True]
+
+
+def test_unopenable_database_still_opens_the_app(make_app, tmp_path):
+    (tmp_path / "lector.db").mkdir()
+    ctx, _ = make_app()
+    assert ctx.window.isVisible()
+    assert DB_UNAVAILABLE in ctx.window.notice_label.text()
+    assert worker_alive(ctx)
+
+
+def test_hanging_audio_probe_does_not_block_startup(make_app, monkeypatch):
+    monkeypatch.setattr(audio_output, "AUDIO_PROBE_TIMEOUT_S", 0.2)
+    release = threading.Event()
+
+    def hangs():
+        release.wait(3)
+        return FakeOutput()
+
+    started = time.monotonic()
+    try:
+        ctx, _ = make_app(output_factory=hangs)
+        assert time.monotonic() - started < 5
+        assert ctx.window.isVisible()
+        assert AudioOutputError.user_message in ctx.window.notice_label.text()
+    finally:
+        release.set()
+
+
+# --- montaje ------------------------------------------------------------------------------------
+
+
+def test_old_chunk_log_rows_are_pruned_at_startup(make_app, tmp_path):
+    conn = open_database(tmp_path / "lector.db")
+    now = time.time()
+    conn.executemany("INSERT INTO chunk_log(chunk_id, engine, outcome, at) VALUES(?,?,?,?)",
+                     [("viejo", "edge", "ok", now - 40 * 86400), ("nuevo", "edge", "ok", now)])
+    conn.commit()
+    conn.close()
+
+    make_app()
+
+    check = sqlite3.connect(tmp_path / "lector.db")
+    try:
+        rows = [r[0] for r in check.execute("SELECT chunk_id FROM chunk_log")]
+    finally:
+        check.close()
+    assert rows == ["nuevo"]
+
+
+def test_cached_voices_reach_the_edge_engine(make_app, tmp_path):
+    from lector.persistence.repositories import VoicesCacheRepo
+
+    conn = open_database(tmp_path / "lector.db")
+    voices = [{"ShortName": "es-MX-DaliaNeural", "Locale": "es-MX", "Gender": "Female"}]
+    VoicesCacheRepo(conn).save(voices)
+    conn.close()
+
+    _, built = make_app()
+    assert built.edge.known == voices
+
+
+def test_same_engines_go_to_manager_settings_and_sample(make_app):
+    ctx, built = make_app()
+    manager = ctx.services.engine_manager
+    assert manager._edge is built.edge and manager._piper is built.piper
+    assert ctx.services.edge is built.edge and ctx.services.piper is built.piper
+    assert ctx.window._edge is built.edge  # «Actualizar lista» de la configuración
+    assert ctx.window._sample._engine is built.piper  # «Escuchar muestra»
