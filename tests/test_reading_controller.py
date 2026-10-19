@@ -384,6 +384,20 @@ async def test_output_error_reopens_once_then_pauses(controller_rig):
     assert rig.events.heard == [0, 1]
 
 
+async def test_missing_edge_voice_is_notified_once_and_reading_goes_on(controller_rig):
+    from lector.errors import EDGE_VOICE_MISSING
+    from lector.tts.edge_engine import EdgeEngine
+
+    edge = EdgeEngine()
+    edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])  # la voz elegida no existe
+    rig = story_rig(controller_rig, chapters=1, sentences=6, edge=edge)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(4)
+
+    assert rig.events.heard == [0, 1, 2, 3]  # sigue con Piper
+    assert rig.events.notices.count(("warn", EDGE_VOICE_MISSING)) == 1
+
+
 async def test_unexpected_producer_error_goes_to_error_state(controller_rig, caplog):
     rig = story_rig(controller_rig, chapters=1)
 

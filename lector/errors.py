@@ -148,3 +148,10 @@ class EdgeNoAudio(LectorError):
 
     user_message = "La voz en línea no pudo leer este fragmento; se salta."
     recoverable = True
+
+
+# Aviso (una sola vez) cuando la voz de Edge elegida no existe (§5.5).
+EDGE_VOICE_MISSING = (
+    "No se encontró la voz en línea elegida. Elige otra en la configuración; "
+    "mientras tanto se lee con la voz sin conexión."
+)

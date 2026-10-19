@@ -20,9 +20,9 @@ from lector.errors import LectorError
 from lector.services.reading_controller import SessionState
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.ui.main_window import MainWindow
-from lector.tts.engine_manager import EDGE_LABEL, PIPER_LABEL
 from lector.ui.open_flow import PLAYING_STATES
 from lector.ui.quit_flow import SHUTDOWN_TIMEOUT_S, WORKER_STOP_TIMEOUT_S, shutdown_and_stop
+from lector.ui.status_panels import WAITING_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -31,8 +31,11 @@ CHOICE_PENDING = "Hay que elegir el capítulo siguiente. Abre la ventana para de
 APP_NAME = "Lector"
 MAX_PENDING = 20
 BALLOON_REPEAT_S = 30.0
+RESTART_TEXT = "Seguir leyendo"
+WAITING_NOTICE = "Esperando conexión… La lectura seguirá sola cuando vuelva."
 
-_ENGINE_NAMES = {"edge": EDGE_LABEL, "piper": PIPER_LABEL}
+# La sesión terminó (error, final o detenida): el botón vuelve a leer desde lo confirmado.
+_RESTART_STATES = frozenset({SessionState.ERROR, SessionState.COMPLETED, SessionState.STOPPED})
 
 _LEVEL_ICONS = {
     "info": QSystemTrayIcon.MessageIcon.Information,
@@ -164,26 +167,41 @@ class TrayController(QObject):
             self._run(self._ctl.pause())
         elif self._state is SessionState.PAUSED:
             self._run(self._ctl.resume())
+        elif self._state in _RESTART_STATES and not self._quitting:
+            # El mismo camino que «Leer» en la ventana: play() desde el progreso confirmado.
+            self._window.restart_reading()
 
     # --- estado, texto del menú y tooltip -------------------------------------------------------
 
     def _update_texts(self) -> None:
         paused = self._state is SessionState.PAUSED
-        self.toggle_action.setText("Reanudar" if paused else "Pausar")
+        if paused:
+            label, enabled = "Reanudar", True
+        elif self._state in _RESTART_STATES:
+            label, enabled = RESTART_TEXT, True
+        else:  # leyendo, o sin nada que pausar (sin sesión o esperando una elección)
+            label, enabled = "Pausar", self._state in PLAYING_STATES
+        self.toggle_action.setText(label)
+        self.toggle_action.setEnabled(enabled)
         self.tray.setIcon(self._paused_icon if paused else self._icon)
         where = " — ".join(part for part in (self._title, self._chapter) if part)
-        engine = _ENGINE_NAMES.get(self._engine, self._engine)
-        tip = " · ".join(part for part in (where, engine) if part) or APP_NAME
+        status = WAITING_TEXT if self._state is SessionState.WAITING_NETWORK else self._engine
+        tip = " · ".join(part for part in (where, status) if part) or APP_NAME
         self.tray.setToolTip(tip)
 
     @Slot(str)
     def _on_session_state(self, value: str) -> None:
         try:
-            self._state = SessionState(value)
+            state = SessionState(value)
         except ValueError:
             log.warning("Estado de sesión desconocido: %s", value)
             return
+        previous, self._state = self._state, state
         self._update_texts()
+        if state is SessionState.WAITING_NETWORK and previous is not state:
+            # En el juego solo se oye silencio: se avisa (una vez cada BALLOON_REPEAT_S).
+            if not self._window.user_present():
+                self.notify("warn", WAITING_NOTICE)
 
     @Slot(str, str)
     def _on_engine_state(self, _state: str, active: str) -> None:

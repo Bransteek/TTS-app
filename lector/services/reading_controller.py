@@ -297,6 +297,7 @@ class ReadingController:
             on_error=self._on_save_error,
         )
         self._em.set_on_state(self._on_engine_state)
+        self._em.set_on_notice(self._notice)
         self._player.set_events(self)
 
     @property

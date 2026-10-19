@@ -229,6 +229,70 @@ async def test_voice_not_found_no_retries(clock):
     assert manager.state is S.EDGE_ACTIVE
 
 
+async def test_missing_edge_voice_is_notified_once(clock):
+    """Error de configuración (§5.5): se pasa a Piper y se avisa una sola vez."""
+    from lector.errors import EDGE_VOICE_MISSING
+    from lector.tts.edge_engine import EdgeEngine
+
+    edge = EdgeEngine()
+    edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])  # Dalia no está
+    piper = FakePiper()
+    manager, _ = make_manager(edge, piper, clock)
+    notices: list[tuple[str, str]] = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    for n in range(3):
+        assert (await synth(manager, n))[1] == "piper"
+    assert notices == [("warn", EDGE_VOICE_MISSING)]
+
+    # Otra voz que tampoco existe: es otro problema y se avisa otra vez (una).
+    for n in range(3, 5):
+        assert (await synth(manager, n, voice="es-AR-ElenaNeural"))[1] == "piper"
+    assert notices == [("warn", EDGE_VOICE_MISSING)] * 2
+
+
+async def test_missing_edge_voice_without_piper_is_notified_once(clock):
+    from lector.errors import EDGE_VOICE_MISSING
+    from lector.tts.edge_engine import EdgeEngine
+
+    edge = EdgeEngine()
+    edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])
+    manager, _ = make_manager(edge, FakePiper(error=PiperModelMissing), clock)
+    notices: list[tuple[str, str]] = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    task = asyncio.create_task(manager.synthesize(make_chunk(0), EDGE_VOICE, PIPER_VOICE, 1.0))
+    async with asyncio.timeout(5):
+        while len(clock.sleeps) < 10:  # la espera sin red sigue probando Edge
+            await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert notices == [("warn", EDGE_VOICE_MISSING)]
+
+
+async def test_missing_edge_voice_as_backup_of_piper_is_notified_once(clock):
+    """Con Piper preferido y sin modelo, Edge es el respaldo: si su voz falta, se avisa."""
+    from lector.errors import EDGE_VOICE_MISSING
+    from lector.tts.edge_engine import EdgeEngine
+
+    edge = EdgeEngine()
+    edge.set_known_voices([{"ShortName": "es-ES-ElviraNeural"}])
+    manager, _ = make_manager(edge, FakePiper(error=PiperModelMissing), clock,
+                              EngineConfig(preferred="piper"))
+    notices: list[tuple[str, str]] = []
+    manager.set_on_notice(lambda level, message: notices.append((level, message)))
+
+    task = asyncio.create_task(manager.synthesize(make_chunk(0), EDGE_VOICE, PIPER_VOICE, 1.0))
+    async with asyncio.timeout(5):
+        while len(clock.sleeps) < 5:
+            await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert notices == [("warn", EDGE_VOICE_MISSING)]
+
+
 async def test_chunk_log_records_engine_per_chunk(clock, tmp_path):
     conn = open_database(tmp_path / "lector.db")
     try:

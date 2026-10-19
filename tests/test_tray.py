@@ -17,7 +17,9 @@ from lector.ui.main_window import MainWindow
 from lector.ui.tray import (
     CHOICE_PENDING,
     MAX_PENDING,
+    RESTART_TEXT,
     STILL_READING,
+    WAITING_NOTICE,
     TrayController,
     draw_icon,
 )
@@ -244,7 +246,7 @@ def test_icon_click_shows_window(qtbot, rig):
 def test_tooltip_and_icon_follow_state(qtbot, rig):
     doc = make_doc()
     rig.bridge.document_sig.emit(doc, make_chapter(title="Capítulo 3"))
-    rig.bridge.engine_state_sig.emit("edge_active", "edge")
+    rig.bridge.engine_state_sig.emit("edge_active", "Edge TTS")  # lo que envía el gestor
     qtbot.waitUntil(lambda: rig.fake.tooltip == "La novela — Capítulo 3 · Edge TTS", timeout=WAIT_MS)
     normal = rig.fake.icon
     rig.bridge.session_state_sig.emit("paused")
@@ -327,3 +329,62 @@ def test_quit_still_quits_when_shutdown_hangs(qtbot, rig, caplog):
         rig.tray.quit()
     assert rig.quits == [True]
     assert "tardó" in caplog.text
+
+
+# --- reanudar desde la bandeja y «Esperando conexión…» ------------------------------------
+
+
+@pytest.mark.parametrize("state", ["error", "completed", "stopped"])
+def test_toggle_restarts_reading_after_the_session_ended(qtbot, rig, state):
+    t, ctl = rig.tray, rig.ctl
+    rig.bridge.document_sig.emit(make_doc(), make_chapter(title="Capítulo 3"))
+    rig.bridge.session_state_sig.emit("reading")
+    qtbot.waitUntil(lambda: t.toggle_action.text() == "Pausar", timeout=WAIT_MS)
+    rig.bridge.session_state_sig.emit(state)
+    qtbot.waitUntil(lambda: t.toggle_action.text() == RESTART_TEXT, timeout=WAIT_MS)
+    assert t.toggle_action.isEnabled()
+
+    t.toggle_action.trigger()
+    # Desde el progreso confirmado: play() sin posición, como «Leer» en la ventana.
+    assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)
+    assert not any(c[0] in ("pause", "resume") for c in ctl.calls)
+
+
+def test_toggle_is_not_a_dead_pause_without_a_session(qtbot, rig):
+    t = rig.tray
+    assert t.toggle_action.text() == "Pausar" and not t.toggle_action.isEnabled()
+    rig.bridge.session_state_sig.emit("stopped")  # sin documento: no hay qué reanudar
+    qtbot.waitUntil(lambda: t.toggle_action.text() == RESTART_TEXT, timeout=WAIT_MS)
+    t.toggle_action.trigger()
+    qtbot.wait(100)
+    assert not any(c[0] == "play" for c in rig.ctl.calls)
+
+
+def test_tooltip_shows_waiting_for_connection(qtbot, rig):
+    rig.bridge.document_sig.emit(make_doc(), make_chapter(title="Capítulo 3"))
+    rig.bridge.engine_state_sig.emit("waiting_network", "Edge TTS")
+    rig.bridge.session_state_sig.emit("waiting_network")
+    qtbot.waitUntil(lambda: rig.fake.tooltip == "La novela — Capítulo 3 · Esperando conexión…",
+                    timeout=WAIT_MS)
+    assert rig.tray.toggle_action.text() == "Pausar"  # se puede pausar mientras espera
+    rig.bridge.engine_state_sig.emit("edge_active", "Edge TTS")
+    rig.bridge.session_state_sig.emit("reading")
+    qtbot.waitUntil(lambda: rig.fake.tooltip == "La novela — Capítulo 3 · Edge TTS",
+                    timeout=WAIT_MS)
+
+
+def test_waiting_for_connection_shows_a_balloon_while_away(qtbot, rig):
+    rig.bridge.session_state_sig.emit("waiting_network")
+    qtbot.waitUntil(lambda: bool(rig.fake.messages), timeout=WAIT_MS)
+    assert rig.fake.messages == [("Lector", WAITING_NOTICE)]
+    rig.bridge.session_state_sig.emit("reading")
+    rig.bridge.session_state_sig.emit("waiting_network")  # parpadeo: no se repite el globo
+    qtbot.wait(100)
+    assert len(rig.fake.messages) == 1
+
+
+def test_waiting_for_connection_balloon_not_shown_to_a_present_user(qtbot, rig):
+    show(qtbot, rig.window)
+    rig.bridge.session_state_sig.emit("waiting_network")
+    qtbot.waitUntil(lambda: "Esperando" in rig.fake.tooltip, timeout=WAIT_MS)
+    assert rig.fake.messages == []

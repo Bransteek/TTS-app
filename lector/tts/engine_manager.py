@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..errors import EdgeNoAudio, EdgeVoiceNotFound
+from ..errors import EDGE_VOICE_MISSING, EdgeNoAudio, EdgeVoiceNotFound
 from ..models import Chunk
 from .base import AudioClip, TtsEngine
 
@@ -118,6 +118,8 @@ class EngineManager:
         self._chunk_log = chunk_log
         self._lock = asyncio.Lock()
         self._failing: set[str] = set()  # motores con una racha de fallos en curso
+        self._on_notice: Callable[[str, str], None] = lambda level, message: None
+        self._missing_voice: str | None = None  # voz de Edge inexistente ya avisada
         self._c = self._new_circuit()
 
     @property
@@ -127,6 +129,10 @@ class EngineManager:
     def set_on_state(self, on_state: Callable[[EngineState, str], None]) -> None:
         """Sustituye el aviso de cambio de estado (lo registra el controlador de lectura)."""
         self._on_state = on_state
+
+    def set_on_notice(self, on_notice: Callable[[str, str], None]) -> None:
+        """Aviso para el usuario (nivel, mensaje); lo registra el controlador de lectura."""
+        self._on_notice = on_notice
 
     @property
     def preferred(self) -> str:
@@ -239,6 +245,7 @@ class EngineManager:
                 raise _ContentFailure() from exc
             except EdgeVoiceNotFound as exc:
                 log.warning("Voz de Edge no encontrada (%s); se usa Piper", voice)
+                self._voice_missing(voice)
                 self._open_circuit(c, failed_voice=voice)
                 self._set_state(c, EngineState.PIPER_ACTIVE)
                 await self._record_error(chunk, self._edge, exc)
@@ -247,7 +254,7 @@ class EngineManager:
                 self._log_failure(self._edge, exc)
                 await self._record_error(chunk, self._edge, exc)
                 continue
-            self._log_success(self._edge)
+            self._edge_ok()
             self._close_circuit(c)  # un fragmento real por Edge: intervalo a cero
             self._set_state(c, EngineState.EDGE_ACTIVE)
             await self._record(chunk, self._edge, "ok")
@@ -340,10 +347,15 @@ class EngineManager:
             await self._record_error(chunk, engine, exc)
             raise _ContentFailure() from exc
         except Exception as exc:
+            if isinstance(exc, EdgeVoiceNotFound) and engine is self._edge:
+                self._voice_missing(voice)
             self._log_failure(engine, exc)
             await self._record_error(chunk, engine, exc)
             return None
-        self._log_success(engine)
+        if engine is self._edge:
+            self._edge_ok()
+        else:
+            self._log_success(engine)
         await self._record(chunk, engine, "ok")
         return clip
 
@@ -400,6 +412,20 @@ class EngineManager:
             self._on_state(state, _ACTIVE_LABEL[state])
         except Exception:
             log.exception("Fallo en el aviso de cambio de estado del motor")
+
+    def _voice_missing(self, voice: str) -> None:
+        """La voz de Edge no existe: error de configuración, se avisa una vez por voz."""
+        if voice == self._missing_voice:
+            return
+        self._missing_voice = voice
+        try:
+            self._on_notice("warn", EDGE_VOICE_MISSING)
+        except Exception:
+            log.exception("Fallo en el aviso de voz de Edge inexistente")
+
+    def _edge_ok(self) -> None:
+        self._missing_voice = None  # si vuelve a faltar más tarde, se avisa de nuevo
+        self._log_success(self._edge)
 
     def _log_failure(self, engine: TtsEngine, exc: Exception) -> None:
         """Traza completa solo en el primer fallo de una racha; después, una línea DEBUG."""

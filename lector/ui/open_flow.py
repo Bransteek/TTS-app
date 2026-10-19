@@ -318,10 +318,20 @@ class OpenFlowMixin:
             self._run(self._ctl.resume())
         elif self._play_pending or self._opening:
             return
-        elif self._session_doc is not None:
-            self._play(self._session_doc, None)
-        else:
+        elif not self.restart_reading():
             self._on_read_clicked()
+
+    def restart_reading(self) -> bool:
+        """Vuelve a leer el documento de la sesión desde el progreso confirmado.
+
+        Es el camino de «Leer» tras un error, el final o «Detener», también desde la
+        bandeja. Devuelve False (sin hacer nada) si no hay sesión o ya hay un play() o
+        una apertura en vuelo.
+        """
+        if self._play_pending or self._opening or self._session_doc is None:
+            return False
+        self._play(self._session_doc, None)
+        return True
 
     # --- reanudación y presencia del usuario ----------------------------------------------------
 
