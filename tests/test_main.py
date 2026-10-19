@@ -586,3 +586,89 @@ def test_same_engines_go_to_manager_settings_and_sample(make_app):
     assert ctx.services.edge is built.edge and ctx.services.piper is built.piper
     assert ctx.window._edge is built.edge  # «Actualizar lista» de la configuración
     assert ctx.window._sample._engine is built.piper  # «Escuchar muestra»
+
+
+# --- un sondeo de audio colgado no retiene el proceso ------------------------------------------
+
+
+def test_hung_audio_probe_leaves_no_blocking_thread_after_quit(make_app, monkeypatch, qtbot):
+    monkeypatch.setattr(audio_output, "AUDIO_PROBE_TIMEOUT_S", 0.2)
+    before = set(threading.enumerate())
+    never = threading.Event()
+
+    def never_returns():
+        never.wait(30)  # como un PortAudio colgado
+        return FakeOutput()
+
+    try:
+        ctx, _ = make_app(output_factory=never_returns)
+        assert AudioOutputError.user_message in ctx.window.notice_label.text()
+        ctx.quit()
+        ctx.close()
+        # Python espera al salir a los hilos de los executors (aunque sean daemon); solo
+        # puede quedar el hilo propio del sondeo, que es daemon y no se espera.
+        def left():
+            return [t for t in threading.enumerate() if t not in before and t.is_alive()]
+
+        qtbot.waitUntil(lambda: all(t.name == audio_output.PROBE_THREAD_NAME for t in left()),
+                        timeout=WAIT_MS)
+        assert all(t.daemon for t in left())
+    finally:
+        never.set()
+
+
+_EXIT_SCRIPT = """
+import sys, threading
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+from lector.services import audio_output
+from lector.ui import app as app_module
+from tests.fakes import FakeEdge, FakePiper
+
+class Edge(FakeEdge):
+    def set_known_voices(self, voices):
+        pass
+
+audio_output.AUDIO_PROBE_TIMEOUT_S = 0.2
+
+def never_returns():
+    threading.Event().wait()  # nunca vuelve
+
+ctx = app_module.build_app([], data_dir=sys.argv[1], output_factory=never_returns,
+                           fetcher_factory=lambda s: None,
+                           engine_factory=lambda s, m: (Edge(), FakePiper()),
+                           tray_factory=lambda *a: None)
+QTimer.singleShot(200, ctx.quit)
+code = ctx.app.exec()
+ctx.close()
+print("salida", code, flush=True)
+"""
+
+
+def test_process_exits_after_quit_even_with_a_hung_audio_probe(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONPATH=str(repo))
+    started = time.monotonic()
+    result = subprocess.run([sys.executable, "-c", _EXIT_SCRIPT, str(tmp_path)], cwd=repo,
+                            env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "salida 0" in result.stdout
+    assert time.monotonic() - started < 30
+
+
+def test_second_launch_does_not_touch_the_first_instance_log(make_app, tmp_path):
+    ctx, _ = make_app()
+    ctx.log_handler.flush()
+    before = ctx.log_path.read_bytes()
+
+    with pytest.raises(AlreadyRunning):
+        app_module.build_app([], data_dir=tmp_path)
+
+    ctx.log_handler.flush()
+    assert ctx.log_path.read_bytes() == before
+    assert not (tmp_path / "lector.log.1").exists()

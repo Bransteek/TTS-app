@@ -1,9 +1,9 @@
 """Montaje de la app completa (`build_app`) y su ciclo de vida (`AppContext`).
 
 Orden de arranque:
-1. Registro rotativo en `<datos>/lector.log`.
-2. Instancia única: si ya hay un lector abierto, se le pide que muestre su ventana y se
-   lanza `AlreadyRunning` sin abrir la base de datos.
+1. Instancia única: si ya hay un lector abierto, se le pide que muestre su ventana y se
+   lanza `AlreadyRunning` sin tocar su registro ni abrir la base de datos.
+2. Registro rotativo en `<datos>/lector.log`.
 3. Base de datos (si estaba dañada se renombra y se avisa).
 4. `QApplication`, sin salir al cerrar la última ventana (la app vive en la bandeja).
 5. Hilo de trabajo (`AsyncWorker`).
@@ -253,18 +253,21 @@ def build_app(
     """
     root_dir = Path(data_dir) if data_dir is not None else paths.data_dir()
     root_dir.mkdir(parents=True, exist_ok=True)
+
+    # Antes que el registro: una segunda copia no debe escribir ni rotar el lector.log
+    # de la que ya está abierta.
+    instance = SingleInstance(lock_path or root_dir / LOCK_NAME,
+                              server_name or default_server_name(root_dir))
+    if not instance.acquire():
+        instance.notify_running()
+        raise AlreadyRunning()
+
     previous_level = logging.getLogger().level
     log_path = root_dir / LOG_NAME
     handler = setup_logging(log_path)
     log.info("Arrancando el lector (datos en %s)", root_dir)
-
-    instance = SingleInstance(lock_path or root_dir / LOCK_NAME,
-                              server_name or default_server_name(root_dir))
-    if not instance.acquire():
-        log.info("Ya hay un lector abierto: se le pide que muestre su ventana")
-        instance.notify_running()
-        _remove_logging(handler, previous_level)
-        raise AlreadyRunning()
+    if instance.unusable:
+        log.warning("Sin cerrojo de instancia única: no se puede evitar abrir dos lectores")
 
     guard = ErrorGuard()
     guard.install()
@@ -308,7 +311,7 @@ def build_app(
                             documents=DocumentRepo(conn), voices=VoicesCacheRepo(conn))
         sample = SamplePlayer(
             services.piper,
-            output_factory=sample_output_factory(output_factory),
+            output_factory=sample_output_factory(output_factory, services.audio_probe),
             is_busy=lambda: controller.state in PLAYING_STATES,  # se evalúa en el trabajador
         )
         window.enable_settings(services.edge, sample)

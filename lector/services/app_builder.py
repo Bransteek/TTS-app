@@ -27,6 +27,7 @@ from lector.services.app_errors import ErrorGuard
 from lector.services.audio_output import (
     LazyOutput,
     OutputFactory,
+    ProbeState,
     default_output,
     open_output,
     reinit_portaudio,
@@ -135,6 +136,7 @@ class Services:
     player: AudioPlayer
     controller: ReadingController
     audio_failed: bool
+    audio_probe: ProbeState  # compartido con las muestras: nada toca PortAudio si está colgado
 
 
 async def build_services(
@@ -165,7 +167,8 @@ async def build_services(
 
     # Reiniciar PortAudio solo tiene sentido con la salida real.
     reset = reinit_portaudio if output_factory is default_output else None
-    output, audio_failed = await open_output(output_factory, reset=reset)
+    probe = ProbeState()
+    output, audio_failed = await open_output(output_factory, reset=reset, probe=probe)
     player = AudioPlayer(
         output, loop,
         max_ahead=int(settings.get("queue_ahead_chunks")),
@@ -175,12 +178,13 @@ async def build_services(
         ControllerDeps(fetcher, Repos.from_connection(conn), manager, player, settings),
         events,
     )
-    return Services(fetcher, edge, piper, manager, player, controller, audio_failed)
+    return Services(fetcher, edge, piper, manager, player, controller, audio_failed, probe)
 
 
-def sample_output_factory(output_factory: OutputFactory) -> OutputFactory:
+def sample_output_factory(output_factory: OutputFactory, probe: ProbeState) -> OutputFactory:
     """Salida de «Escuchar muestra»: una nueva cada vez; un fallo llega como `AudioOutputError`.
 
-    Sin reiniciar PortAudio: la lectura podría tener su stream abierto (en pausa).
+    Sin reiniciar PortAudio: la lectura podría tener su stream abierto (en pausa). Con el
+    mismo `probe`: si un sondeo sigue colgado, la muestra falla en el acto.
     """
-    return lambda: LazyOutput(output_factory)
+    return lambda: LazyOutput(output_factory, probe=probe)
