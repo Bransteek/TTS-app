@@ -38,11 +38,12 @@ from lector.persistence.repositories import (
     VoicesCacheRepo,
 )
 from lector.services.reading_controller import SessionState
+from lector.services.sample_player import SamplePlayer
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.tts.piper_engine import PiperModelManager
 from lector.ui.history_dialog import HistoryDialog
-from lector.ui.piper_setup import FirstRunBanner, PiperDownloads, SamplePlayer
 from lector.ui.open_flow import PLAYING_STATES, OpenFlowMixin
+from lector.ui.piper_setup import FirstRunBanner, PiperDownloads
 from lector.ui.playback_controls import PlaybackControls, VoicePanel
 from lector.ui.preview_panel import ChoicePanel, PreviewPanel
 from lector.ui.resume_dialog import ResumeDialog, ResumeOffer
@@ -283,7 +284,8 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
     def _on_model_downloaded(self, _name: str, ok: bool, _message: str) -> None:
         if ok:
             self.reload_settings()  # el indicador de Piper pasa a «Listo»
-            self.show_notice(MODEL_INSTALLED)
+            if self._notice_level not in ("warn", "error"):  # no tapa un aviso importante
+                self.show_notice(MODEL_INSTALLED)
 
     # --- configuración (leída en el hilo de trabajo) -------------------------------------------
 

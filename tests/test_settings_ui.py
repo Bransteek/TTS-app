@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import threading
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -16,6 +18,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from lector.models import Chapter, ChapterRef, Document, Paragraph, Sentence, SourceKind
+from lector.paths import data_dir
 from lector.persistence.database import open_database
 from lector.persistence.repositories import (
     ChapterRepo,
@@ -23,6 +26,7 @@ from lector.persistence.repositories import (
     SettingsRepo,
     VoicesCacheRepo,
 )
+from lector.services.sample_player import SamplePlayer, SampleResult
 from lector.services.worker import AsyncWorker, QtEventBridge
 from lector.tts.piper_engine import PiperModelManager
 from lector.ui.main_window import MainWindow
@@ -31,11 +35,18 @@ from lector.ui.piper_setup import (
     DEFAULT_MODEL,
     DOWNLOAD_FAILED,
     SAMPLE_BUSY,
+    SAMPLE_CUT,
     FirstRunBanner,
     PiperSetupPanel,
-    SamplePlayer,
 )
-from lector.ui.settings_dialog import DALIA_MISSING, PRIVACY_TEXT, SettingsDialog
+from lector.ui.settings_dialog import (
+    DALIA_MISSING,
+    LATER_NOTE,
+    OTHER_LANGUAGE,
+    PRIVACY_TEXT,
+    RESTART_GROUP,
+    SettingsDialog,
+)
 from tests.fakes import FakeOutput, FakePiper
 
 WAIT_MS = 3000
@@ -68,7 +79,7 @@ def _recorder(name: str):
 
 
 for _name in ("play", "pause", "resume", "stop", "set_voice", "set_speed", "set_continuous",
-              "set_preferred_engine", "skip_seconds"):
+              "set_preferred_engine", "skip_seconds", "set_store_text", "set_chunk_limits"):
     setattr(FakeController, _name, _recorder(_name))
 
 
@@ -111,15 +122,35 @@ class FakeSample:
         self.played: list[tuple[str, float]] = []
         self.threads: set[threading.Thread] = set()
 
-    async def play(self, voice: str, speed: float = 1.0) -> bool:
+    async def play(self, voice: str, speed: float = 1.0) -> SampleResult:
         self.threads.add(threading.current_thread())
         if self.busy:
-            return False
+            return SampleResult.BUSY
         self.played.append((voice, speed))
-        return True
+        return SampleResult.PLAYED
 
     async def stop(self) -> None:
         pass
+
+
+class GatedPiper(FakePiper):
+    """Piper falso cuya síntesis espera (en un hilo, como la real) hasta que se suelte."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def synthesize(self, chunk, voice, speed):
+        self.started.set()
+        await asyncio.to_thread(self.release.wait, WAIT_MS / 1000)
+        return await super().synthesize(chunk, voice, speed)
+
+
+def audio_files(*directories) -> set:
+    """Audio en esas carpetas y un nivel por debajo (la carpeta temporal del sistema es enorme)."""
+    patterns = ("*.wav", "*.mp3", "*/*.wav", "*/*.mp3")
+    return {p for d in directories for pattern in patterns for p in d.glob(pattern)}
 
 
 class SlowBody(httpx.AsyncByteStream):
@@ -303,6 +334,8 @@ def test_settings_persist(qtbot, make_window, ctl, conn):
     qtbot.waitUntil(lambda: ("set_continuous", False) in ctl.calls, timeout=WAIT_MS)
     assert ("set_voice", "es-MX-JorgeNeural", None, False) in ctl.calls
     assert ("set_speed", 1.25, False) in ctl.calls
+    # El tamaño de los fragmentos llega a la sesión en marcha (vale desde el siguiente capítulo).
+    assert ("set_chunk_limits", 450, 3, 250) in ctl.calls
     assert threading.main_thread() not in ctl.threads
     assert threading.main_thread() not in spy.threads  # toda la E/S fuera del hilo de Qt
 
@@ -376,7 +409,14 @@ def test_banner_hidden_when_model_installed(qtbot, make_window, models_dir):
     assert window.first_run_banner.isHidden()
 
 
-def test_privacy_toggle_purges_text(qtbot, make_window, conn):
+def test_privacy_toggle_purges_text(qtbot, make_window, conn, ctl, monkeypatch):
+    original = ChapterRepo.purge_all_text
+
+    def purge(self):
+        ctl.calls.append(("purge_all_text",))
+        original(self)
+
+    monkeypatch.setattr(ChapterRepo, "purge_all_text", purge)
     docs, chapters = DocumentRepo(conn), ChapterRepo(conn)
     for doc_id in ("a", "b"):
         doc = make_doc(doc_id)
@@ -407,6 +447,13 @@ def test_privacy_toggle_purges_text(qtbot, make_window, conn):
     qtbot.waitUntil(lambda: stored() == 0, timeout=WAIT_MS)
     qtbot.waitUntil(lambda: dialog.purge_frame.isHidden(), timeout=WAIT_MS)
     assert "borró" in dialog.privacy_status.text()
+    # La sesión en marcha deja de guardar texto ANTES del borrado (si no, lo volvería a escribir).
+    names = [c[0] for c in ctl.calls]
+    assert ("set_store_text", False) in ctl.calls
+    assert names.index("set_store_text") < names.index("purge_all_text")
+    assert names.count("set_store_text") >= 2  # al cambiar la casilla y otra vez en el borrado
+    last_off = max(i for i, c in enumerate(ctl.calls) if c == ("set_store_text", False))
+    assert last_off < names.index("purge_all_text")
     # Los títulos, el historial y el progreso se conservan.
     assert chapters.title("a", "https://example.com/a/1/") == "Uno"
     assert len(docs.list_recent()) == 2
@@ -417,7 +464,13 @@ def test_download_runs_off_ui_thread(qtbot, make_window, models_dir, conn):
     window = make_window(transport=make_transport(threads=handler_threads))
     banner = window.first_run_banner
     seen: list[float] = []
-    window.downloads.progress.connect(lambda name, fraction: seen.append(fraction))
+    slot_threads: set[threading.Thread] = set()
+
+    def on_progress(_name, fraction):
+        slot_threads.add(threading.current_thread())
+        seen.append(fraction)
+
+    window.downloads.progress.connect(on_progress)
     ticks: list[bool] = []
     timer = QTimer()
     timer.setInterval(10)
@@ -437,6 +490,7 @@ def test_download_runs_off_ui_thread(qtbot, make_window, models_dir, conn):
     assert handler_threads and threading.main_thread() not in handler_threads
     assert sum(ticks) >= 10  # la interfaz siguió respondiendo durante la descarga
     assert any(0 < f < 1 for f in seen)
+    assert slot_threads == {threading.main_thread()}  # el progreso llega en el hilo de Qt
     assert PiperModelManager(models_dir).installed() == [DEFAULT_MODEL]
     assert not list(models_dir.glob(".part-*"))
     qtbot.waitUntil(lambda: window.piper_label.text().startswith("Piper: Listo ("), timeout=WAIT_MS)
@@ -486,6 +540,8 @@ def test_banner_cancel_stops_download(qtbot, make_window, models_dir):
     qtbot.waitUntil(lambda: not (models_dir / f".part-{DEFAULT_MODEL}").exists(), timeout=WAIT_MS)
     assert not banner.isHidden() and banner.download_button.isEnabled()
     assert banner.later_button.text() == "Ahora no"
+    assert banner.error_label.isHidden()  # cancelar no es un fallo
+    assert banner.progress_bar.isHidden()
     assert PiperModelManager(models_dir).installed() == []
 
 
@@ -522,7 +578,29 @@ def test_piper_tab_lists_catalog_and_downloads(qtbot, make_window, models_dir):
     qtbot.waitUntil(lambda: window.first_run_banner.isHidden(), timeout=WAIT_MS)
 
 
-def test_closing_dialog_cancels_download(qtbot, make_window, models_dir):
+def test_closing_dialog_keeps_download(qtbot, make_window, models_dir):
+    window = make_window(transport=make_transport(delay=0.05))
+    banner = window.first_run_banner
+    dialog = open_dialog(qtbot, window)
+    panel = dialog.piper_panel
+    row = panel_row(panel, DEFAULT_MODEL)
+    panel.table.selectRow(row)
+    panel.download_button.click()
+    qtbot.waitUntil(lambda: not banner.progress_bar.isHidden(), timeout=WAIT_MS)
+
+    dialog.close()  # cerrar no cancela: la voz de respaldo es lo que protege la lectura
+
+    assert window.downloads.is_active(DEFAULT_MODEL)
+    assert not banner.isHidden() and not banner.progress_bar.isHidden()
+    assert banner.later_button.text() == "Cancelar"  # el aviso no vuelve a la oferta
+    assert not banner.download_button.isEnabled()
+    qtbot.waitUntil(lambda: PiperModelManager(models_dir).installed() == [DEFAULT_MODEL],
+                    timeout=WAIT_MS)
+    qtbot.waitUntil(lambda: banner.isHidden(), timeout=WAIT_MS)
+    assert banner.error_label.isHidden()
+
+
+def test_cancel_button_in_dialog_cancels(qtbot, make_window, models_dir):
     window = make_window(transport=make_transport(hang=True))
     dialog = open_dialog(qtbot, window)
     panel = dialog.piper_panel
@@ -534,10 +612,11 @@ def test_closing_dialog_cancels_download(qtbot, make_window, models_dir):
     qtbot.waitUntil(lambda: panel.table.item(row, 3).text().startswith("Descargando"), timeout=WAIT_MS)
     assert not panel.cancel_button.isHidden()
 
-    dialog.close()
+    panel.cancel_button.click()
 
     qtbot.waitUntil(lambda: not window.downloads.is_active(name), timeout=WAIT_MS)
     qtbot.waitUntil(lambda: not (models_dir / f".part-{name}").exists(), timeout=WAIT_MS)
+    assert panel.table.item(row, 3).text() == "Sin descargar"
     assert PiperModelManager(models_dir).installed() == []
 
 
@@ -599,7 +678,10 @@ def test_privacy_keep_text_does_not_purge(qtbot, make_window, conn):
 # --- muestra de voz --------------------------------------------------------------------
 
 
-async def test_sample_plays_in_memory_only_when_idle():
+async def test_sample_plays_in_memory_only_when_idle(tmp_path, monkeypatch):
+    monkeypatch.setenv("LECTOR_DATA_DIR", str(tmp_path / "datos"))
+    places = (tmp_path, data_dir(), Path(tempfile.gettempdir()))
+    before = audio_files(*places)
     output = FakeOutput()
     engine = FakePiper()
     busy = False
@@ -613,11 +695,128 @@ async def test_sample_plays_in_memory_only_when_idle():
         while not task.done():
             heard.append(output.pull(240))
             await asyncio.sleep(0.01)
-    assert await task is True
+    assert await task is SampleResult.PLAYED
     assert engine.calls and engine.calls[0][1] == "es_ES-sharvard-medium#F"
     assert any(np.any(block == 1000) for block in heard)  # sonó lo sintetizado
     assert not output.running  # su salida se cierra al terminar
+    assert audio_files(*places) == before  # ningún .wav ni .mp3 nuevo, en ningún sitio
 
     busy = True
-    assert await player.play("es_ES-sharvard-medium#F") is False
+    assert await player.play("es_ES-sharvard-medium#F") is SampleResult.BUSY
     assert len(engine.calls) == 1  # con la lectura en marcha ni siquiera sintetiza
+
+
+async def test_sample_stopped_during_synthesis_plays_nothing():
+    output = FakeOutput()
+    engine = GatedPiper()
+    player = SamplePlayer(engine, output_factory=lambda: output)
+    task = asyncio.ensure_future(player.play("es_ES-sharvard-medium#F"))
+    async with asyncio.timeout(2):
+        while not engine.started.is_set():
+            await asyncio.sleep(0.01)
+    await player.stop()  # p. ej. se cerró la configuración
+    engine.release.set()
+    assert await asyncio.wait_for(task, 2) is SampleResult.STOPPED
+    assert output.attempts == 0  # nunca se abrió la salida
+
+
+async def test_sample_cut_when_reading_resumes():
+    output = FakeOutput()
+    busy = False
+    player = SamplePlayer(FakePiper(), output_factory=lambda: output, is_busy=lambda: busy)
+    task = asyncio.ensure_future(player.play("es_ES-sharvard-medium#F"))
+    async with asyncio.timeout(2):
+        while not output.running:
+            await asyncio.sleep(0.01)
+    busy = True  # vuelve la lectura: la muestra se corta sola (sin que nadie saque audio)
+    started = asyncio.get_running_loop().time()
+    assert await asyncio.wait_for(task, 2) is SampleResult.CUT
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert not output.running
+
+
+def test_closing_dialog_during_sample_synthesis_plays_nothing(qtbot, worker, conn, ctl, edge,
+                                                               models_dir):
+    install_piper(models_dir, speakers={"F": 0, "M": 1})
+    output = FakeOutput()
+    engine = GatedPiper()
+    sample = SamplePlayer(engine, output_factory=lambda: output)
+    window = MainWindow(worker, QtEventBridge(), ctl, SettingsRepo(conn),
+                        PiperModelManager(models_dir))
+    qtbot.addWidget(window)
+    qtbot.waitUntil(lambda: window.settings_loaded, timeout=WAIT_MS)
+    window.enable_settings(edge, sample)
+    dialog = open_dialog(qtbot, window)
+    panel = dialog.piper_panel
+    panel.table.selectRow(panel_row(panel, DEFAULT_MODEL))
+
+    panel.sample_button.click()
+    qtbot.waitUntil(engine.started.is_set, timeout=WAIT_MS)
+    dialog.close()
+    qtbot.wait(50)  # la orden de parar llega al trabajador antes de que acabe la síntesis
+    engine.release.set()
+    qtbot.wait(300)
+    assert output.attempts == 0
+
+
+def test_sample_cut_message(qtbot, make_window, models_dir, sample, monkeypatch):
+    install_piper(models_dir)
+    window = make_window()
+    dialog = open_dialog(qtbot, window)
+    panel = dialog.piper_panel
+    panel.table.selectRow(panel_row(panel, DEFAULT_MODEL))
+
+    async def cut(voice, speed=1.0):
+        return SampleResult.CUT
+
+    monkeypatch.setattr(sample, "play", cut)
+    panel.sample_button.click()
+    qtbot.waitUntil(lambda: panel.status_label.text() == SAMPLE_CUT, timeout=WAIT_MS)
+
+
+def test_restart_settings_grouped_and_named(qtbot, make_window):
+    window = make_window()
+    dialog = open_dialog(qtbot, window)
+    group = dialog.restart_group
+    assert group.title() == RESTART_GROUP
+    restart_keys = ("edge_retries", "edge_timeout_s", "recovery_initial_s", "recovery_max_s",
+                    "piper_cooldown_s")
+    for key in restart_keys:
+        assert group.isAncestorOf(dialog.spins[key]), key
+    for key in ("edge_max_chars", "edge_max_sentences", "piper_max_chars", "skip_seconds"):
+        assert not group.isAncestorOf(dialog.spins[key]), key
+    for words in ("Reintentos de Edge", "espera máxima de Edge", "volver a probar Edge",
+                  "Tiempo mínimo con Piper", "siguiente capítulo"):
+        assert words.lower() in LATER_NOTE.lower(), words
+
+
+def test_language_change_keeps_or_hints_voice(qtbot, make_window, conn):
+    VoicesCacheRepo(conn).save([DALIA, JORGE, ELVIRA])
+    window = make_window()
+    dialog = open_dialog(qtbot, window)
+    assert dialog.voice_hint.isHidden()
+
+    choose(dialog.language_combo, "es-ES")
+    assert [dialog.edge_combo.itemData(i) for i in range(dialog.edge_combo.count())] == [
+        "es-ES-ElviraNeural"]
+    assert dialog.edge_combo.currentIndex() == -1
+    assert dialog.voice_hint.text() == OTHER_LANGUAGE
+    assert not dialog.voice_hint.isHidden()
+
+    choose(dialog.language_combo, "es-MX")  # vuelve el idioma de la voz actual: se marca
+    assert dialog.edge_combo.currentData() == "es-MX-DaliaNeural"
+    assert dialog.voice_hint.isHidden()
+
+    choose(dialog.language_combo, "es-ES")
+    choose(dialog.edge_combo, "es-ES-ElviraNeural")  # elegir una voz quita el aviso
+    assert dialog.voice_hint.isHidden()
+
+
+def test_model_installed_notice_keeps_warning(qtbot, make_window):
+    window = make_window(transport=make_transport(delay=0))
+    window.show_notice("Sin conexión: se sigue con la voz local.", "warn")
+    with qtbot.waitSignal(window.downloads.finished, timeout=WAIT_MS):
+        window.first_run_banner.download_button.click()
+    qtbot.wait(50)
+    assert window.notice_label.text() == "Sin conexión: se sigue con la voz local."
+    qtbot.waitUntil(lambda: window.piper_label.text().startswith("Piper: Listo ("), timeout=WAIT_MS)

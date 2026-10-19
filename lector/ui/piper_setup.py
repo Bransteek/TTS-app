@@ -10,8 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-from collections.abc import Callable, Coroutine
-from typing import Any
+from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -29,13 +28,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from lector.audio.pcm import OUTPUT_RATE
-from lector.audio.player import AudioOutput, AudioPlayer, QueuedClip, SoundDeviceOutput
-from lector.errors import LectorError
-from lector.models import Chunk, Sentence
 from lector.persistence.repositories import DEFAULT_SETTINGS, SettingsRepo
-from lector.services.worker import AsyncWorker, call_ui
+from lector.services.sample_player import SamplePlayer, SampleResult
+from lector.services.worker import AsyncWorker
 from lector.tts.piper_engine import PiperModelManager
+from lector.ui.jobs import error_text, run_job
+
+__all__ = [  # SamplePlayer se reexporta: antes vivía aquí
+    "BANNER_TEXT", "DEFAULT_MODEL", "DOWNLOAD_FAILED", "FirstRunBanner", "PiperDownloads",
+    "PiperSetupPanel", "SAMPLE_BUSY", "SAMPLE_CUT", "SamplePlayer",
+]
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +49,8 @@ BANNER_TEXT = (
 DOWNLOAD_FAILED = (
     "No se pudo descargar la voz. Revisa tu conexión a internet e inténtalo de nuevo."
 )
-UNEXPECTED = "Ocurrió un problema inesperado. Inténtalo de nuevo."
 SAMPLE_BUSY = "Pausa o detén la lectura para escuchar una muestra."
+SAMPLE_CUT = "La muestra se cortó porque siguió la lectura."
 SAMPLE_PLAYING = "Escuchando la muestra…"
 HELP_TEXT = (
     "Piper es una voz que funciona en tu equipo, sin internet: si se corta la conexión, "
@@ -62,39 +64,6 @@ STATUS_INSTALLED = "Instalada"
 STATUS_IN_USE = "En uso"
 STATUS_DOWNLOADING = "Descargando… {pct} %"
 GENDER_TEXT = {"F": "Mujer", "M": "Hombre", "F/M": "Mujer y hombre", "?": "Sin confirmar"}
-
-# Frases de la muestra: sin nada que se parezca a una promesa sobre la voz.
-SAMPLE_SENTENCES = (
-    "Hola, esta es una muestra de la voz sin conexión.",
-    "Así sonará la lectura cuando no haya internet.",
-)
-SAMPLE_GRACE_S = 3.0  # margen sobre la duración de la muestra antes de darla por terminada
-
-
-def run_job(
-    worker: AsyncWorker,
-    coro: Coroutine[Any, Any, Any],
-    on_ok: Callable[[Any], None],
-    on_err: Callable[[BaseException], None],
-) -> concurrent.futures.Future | None:
-    """Manda `coro` al trabajador y entrega su resultado en el hilo de Qt (None si ya paró)."""
-    try:
-        future = worker.submit(coro)
-    except RuntimeError:
-        log.warning("El trabajador ya no está en marcha; se ignora la orden")
-        return None
-    call_ui(future, on_ok, on_err)
-    return future
-
-
-def error_text(exc: BaseException) -> str | None:
-    """Texto para el usuario (None si fue una cancelación, que no se avisa)."""
-    if isinstance(exc, asyncio.CancelledError):
-        return None
-    if isinstance(exc, LectorError):
-        return exc.user_message
-    log.error("Error inesperado en la configuración", exc_info=(type(exc), exc, exc.__traceback__))
-    return UNEXPECTED
 
 
 # --- descargas -----------------------------------------------------------------------------
@@ -176,91 +145,6 @@ class PiperDownloads(QObject):
             log.warning("No se pudo descargar la voz %s", name,
                         exc_info=(type(exc), exc, exc.__traceback__))
             self.finished.emit(name, False, DOWNLOAD_FAILED)
-
-
-# --- muestra -------------------------------------------------------------------------------
-
-
-def _sample_chunk() -> Chunk:
-    sentences, start = [], 0
-    for index, text in enumerate(SAMPLE_SENTENCES):
-        sentences.append(Sentence(index, 0, text, start, start + len(text), None))
-        start += len(text) + 1
-    text = " ".join(SAMPLE_SENTENCES)
-    return Chunk("muestra", "muestra", 0, 0, tuple(sentences), text, 0, len(text))
-
-
-class _SampleEvents:
-    def __init__(self, finished: asyncio.Future):
-        self.finished = finished
-
-    def on_sentence_started(self, chunk: Chunk, sentence_index: int) -> None:
-        pass
-
-    def on_chunk_finished(self, chunk: Chunk) -> None:
-        if not self.finished.done():
-            self.finished.set_result(None)
-
-    def on_output_error(self, err: Exception) -> None:
-        if not self.finished.done():
-            self.finished.set_exception(err)
-
-
-class SamplePlayer:
-    """«Escuchar muestra»: sintetiza con Piper y lo reproduce en memoria.
-
-    Corre en el hilo de trabajo. Solo suena con la lectura principal parada o en pausa
-    (`is_busy()` se consulta en el trabajador antes de sintetizar y antes de reproducir),
-    así que nunca la interrumpe. Usa su propio `AudioPlayer` con su propia salida, que se
-    cierra al terminar; el audio nunca se escribe en disco.
-    """
-
-    def __init__(
-        self,
-        engine,
-        output_factory: Callable[[], AudioOutput] = SoundDeviceOutput,
-        is_busy: Callable[[], bool] = lambda: False,
-    ):
-        self._engine = engine  # el PiperEngine de la app (un solo modelo cargado en memoria)
-        self._output_factory = output_factory
-        self._is_busy = is_busy
-        self._player: AudioPlayer | None = None
-        self._finished: asyncio.Future | None = None
-
-    async def play(self, voice: str, speed: float = 1.0) -> bool:
-        """Reproduce la muestra y vuelve al terminar. False si la lectura está en marcha."""
-        if self._is_busy():
-            return False
-        await self.stop()
-        chunk = _sample_chunk()
-        clip = await self._engine.synthesize(chunk, voice, speed)
-        if self._is_busy():
-            return False
-        loop = asyncio.get_running_loop()
-        finished = loop.create_future()
-        player = AudioPlayer(self._output_factory(), loop, events=_SampleEvents(finished))
-        self._player, self._finished = player, finished
-        try:
-            await player.enqueue(QueuedClip(chunk, clip.pcm, clip.marks, "piper"))
-            seconds = len(clip.pcm) / OUTPUT_RATE
-            try:
-                await asyncio.wait_for(asyncio.shield(finished), seconds + SAMPLE_GRACE_S)
-            except TimeoutError:
-                log.warning("La muestra no terminó de sonar a tiempo; se corta")
-        finally:
-            player.close()
-            if self._player is player:
-                self._player = self._finished = None
-        return True
-
-    async def stop(self) -> None:
-        """Corta la muestra que suene (al cerrar la configuración o al pedir otra)."""
-        player, finished = self._player, self._finished
-        self._player = self._finished = None
-        if player is not None:
-            player.close()
-        if finished is not None and not finished.done():
-            finished.set_result(None)
 
 
 # --- aviso de primer arranque ------------------------------------------------------------
@@ -420,7 +304,6 @@ class PiperSetupPanel(QWidget):
         self._speed = speed
         self._installed: dict[str, list[str]] = {}  # modelo instalado -> hablantes
         self._current: tuple[str | None, str | None] = (None, None)
-        self._started: set[str] = set()  # descargas pedidas desde aquí (se cancelan al cerrar)
         self._sampling = False
         self.loaded = False
 
@@ -568,8 +451,7 @@ class PiperSetupPanel(QWidget):
         if name is None:
             return
         self.status_label.clear()
-        if self._downloads.start(name):
-            self._started.add(name)
+        self._downloads.start(name)
         self._refresh_row(name)
         self._update_selection()
 
@@ -577,12 +459,6 @@ class PiperSetupPanel(QWidget):
         name = self.selected_model()
         if name is not None:
             self._downloads.cancel(name)
-
-    def cancel_downloads(self) -> None:
-        """Cancela las descargas pedidas desde este panel (al cerrar la configuración)."""
-        for name in list(self._started):
-            self._downloads.cancel(name)
-        self._started.clear()
 
     def stop_sample(self) -> None:
         if self._sample is not None and self._sampling:
@@ -599,11 +475,12 @@ class PiperSetupPanel(QWidget):
         future = run_job(self._worker, self._sample.play(voice, self._speed()),
                          self._on_sample_done, self._on_sample_failed)
         if future is None:
-            self._on_sample_done(True)
+            self._on_sample_done(SampleResult.STOPPED)
 
-    def _on_sample_done(self, played: bool) -> None:
+    def _on_sample_done(self, result: SampleResult) -> None:
         self._sampling = False
-        self.status_label.setText("" if played else SAMPLE_BUSY)
+        messages = {SampleResult.BUSY: SAMPLE_BUSY, SampleResult.CUT: SAMPLE_CUT}
+        self.status_label.setText(messages.get(result, ""))
         self._update_selection()
 
     def _on_sample_failed(self, exc: BaseException) -> None:
@@ -650,7 +527,6 @@ class PiperSetupPanel(QWidget):
 
     @Slot(str, bool, str)
     def _on_finished(self, name: str, ok: bool, message: str) -> None:
-        self._started.discard(name)
         self._refresh_row(name)
         if message:
             self.status_label.setText(message)

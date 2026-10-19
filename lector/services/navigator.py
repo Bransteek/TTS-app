@@ -17,6 +17,34 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _FIRST_WAIT_S = 1.0
+TEXT_WRITE_DRAIN_S = 5.0  # tope de espera de las escrituras con texto al dejar de guardarlo
+
+
+class TextWrites:
+    """Escrituras en un hilo que pueden llevar el texto del capítulo.
+
+    Al dejar de guardar el texto se esperan las que ya estaban en marcha con el valor
+    anterior: así un borrado posterior no lo ve reaparecer.
+    """
+
+    def __init__(self) -> None:
+        self._pending: set[asyncio.Future] = set()
+
+    async def run(self, fn: Callable[..., T], *args, with_text: bool) -> T:
+        future = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+        # Si quien espera se cancela, el hilo sigue: su error no debe quedar sin recoger.
+        future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        if with_text:
+            self._pending.add(future)
+            future.add_done_callback(self._pending.discard)
+        return await asyncio.shield(future)
+
+    async def drain(self, timeout: float = TEXT_WRITE_DRAIN_S) -> None:
+        if not self._pending:
+            return
+        _done, pending = await asyncio.wait(set(self._pending), timeout=timeout)
+        if pending:
+            log.warning("Quedan %d escrituras de texto sin terminar", len(pending))
 
 
 class _Wait:
@@ -44,6 +72,7 @@ class ChapterNavigator:
         self._document = document
         self._repo = chapter_repo
         self._store_text = store_text
+        self._writes = TextWrites()
         self._prefetch_ahead = prefetch_ahead
         self._wait_max_s = wait_max_s
         self._sleep = sleep
@@ -92,6 +121,12 @@ class ChapterNavigator:
 
     def mark_visited(self, ref: ChapterRef) -> None:
         self.visited.add(ref.locator)
+
+    async def set_store_text(self, on: bool) -> None:
+        """Guardar o no el texto desde ya; al desactivarlo espera lo que se estaba guardando."""
+        self._store_text = on
+        if not on:
+            await self._writes.drain()
 
     def reset_visited(self, ref: ChapterRef | None = None) -> None:
         self.visited.clear()
@@ -183,9 +218,10 @@ class ChapterNavigator:
             return None
 
     async def _persist(self, chapter: Chapter) -> None:
+        store = self._store_text  # el valor vivo: puede cambiar durante la lectura
         try:
-            await asyncio.to_thread(
-                self._repo.save, self._document.doc_id, chapter, self._store_text
+            await self._writes.run(
+                self._repo.save, self._document.doc_id, chapter, store, with_text=store
             )
         except LectorError as exc:
             log.warning("No se pudo guardar el capítulo %s: %s", chapter.ref.locator, exc)

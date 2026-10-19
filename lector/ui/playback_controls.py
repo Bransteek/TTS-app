@@ -177,18 +177,28 @@ class VoicePanel(QGroupBox):
 _GENDER = {"Female": "mujer", "Male": "hombre"}
 
 
-def edge_voice_items(voices: list[dict], language: str, current: str) -> list[tuple[str, str]]:
-    """(texto, ShortName) de las voces de Edge del idioma; la voz elegida siempre aparece."""
-    family = (language or "es").split("-")[0].lower()
+def edge_voice_items(voices: list[dict], language: str, current: str | None, *,
+                     exact_locale: bool = False) -> list[tuple[str, str]]:
+    """(texto, ShortName) de las voces de Edge del idioma.
+
+    Por defecto filtra por familia («es» abarca es-MX, es-ES…) y la voz elegida siempre
+    aparece. Con `exact_locale` filtra por la variante exacta (p. ej. «es-MX») y la voz
+    elegida solo se añade si es de esa variante.
+    """
+    language = language or "es"
+    family = language.split("-")[0].lower()
     items = []
     for v in sorted(voices, key=lambda v: (v.get("Locale", ""), v.get("ShortName", ""))):
         short, locale = v.get("ShortName", ""), v.get("Locale", "")
-        if not short or locale.split("-")[0].lower() != family:
+        matches = (locale.lower() == language.lower() if exact_locale
+                   else locale.split("-")[0].lower() == family)
+        if not short or not matches:
             continue
         name = short.rsplit("-", 1)[-1].removesuffix("Neural") or short
         gender = _GENDER.get(v.get("Gender", ""))
         items.append((f"{name} — {locale}" + (f", {gender}" if gender else ""), short))
-    if current and all(data != current for _, data in items):
+    own = not exact_locale or (current or "").lower().startswith(f"{language.lower()}-")
+    if current and own and all(data != current for _, data in items):
         items.insert(0, (current, current))
     return items
 

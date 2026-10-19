@@ -3,8 +3,9 @@
 Sin modalidad y sin botón «Guardar»: cada cambio se guarda solo, poco después de hacerlo
 (y al cerrar). Hilos: la lectura inicial, el guardado, la lista de voces de Edge y el
 borrado del texto van al hilo de trabajo con `worker.submit`, y vuelven con `call_ui`.
-La voz, la velocidad y la lectura continua se aplican con el controlador
-(`apply_now=False`: lo que ya suena no se corta) y se guardan en `SettingsRepo`.
+Lo que también cambia la sesión en marcha (voz, velocidad, lectura continua, guardar el
+texto y tamaño de los fragmentos) se aplica además con el controlador; voz y velocidad con
+`apply_now=False`, para no cortar lo que ya suena. Todo se guarda en `SettingsRepo`.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -35,13 +37,10 @@ from lector.persistence.repositories import ChapterRepo, SettingsRepo, VoicesCac
 from lector.services.worker import AsyncWorker
 from lector.tts.base import EDGE_SPEED_RANGE
 from lector.tts.piper_engine import PiperModelManager
-from lector.ui.piper_setup import (
-    PiperDownloads,
-    PiperSetupPanel,
-    SamplePlayer,
-    error_text,
-    run_job,
-)
+from lector.services.sample_player import SamplePlayer
+from lector.ui.jobs import error_text, run_job
+from lector.ui.piper_setup import PiperDownloads, PiperSetupPanel
+from lector.ui.playback_controls import edge_voice_items
 
 log = logging.getLogger(__name__)
 
@@ -59,27 +58,32 @@ PURGED = "Se borró el texto guardado de los capítulos. El historial y el progr
 NO_VOICES = "No llegó ninguna voz. Inténtalo de nuevo más tarde."
 NEEDS_REFRESH = "Pulsa «Actualizar lista» para ver las voces disponibles."
 SAVED = "Cambios guardados."
+OTHER_LANGUAGE = "Tu voz actual no es de este idioma; elige una."
+RESTART_GROUP = "Se aplican al volver a abrir la app"
 LATER_NOTE = (
-    "El tamaño de los fragmentos se aplica al empezar a leer. Los reintentos y los "
-    "tiempos de Edge, la próxima vez que abras la app."
+    "El tamaño de los fragmentos vale desde el siguiente capítulo (o al volver a pulsar "
+    "Leer). Los reintentos de Edge, la espera máxima de Edge, cuándo volver a probar Edge "
+    "y el tiempo mínimo con Piper solo se aplican al volver a abrir la app."
 )
 SAVE_DELAY_MS = 400
 DEFAULT_LANGUAGE = "es-MX"
-# Ajustes que también cambian la lectura en curso: van por el controlador.
-_CONTROLLER_KEYS = ("edge_voice", "speed", "continuous")
 # (clave, etiqueta, mínimo, máximo, paso, sufijo)
-_SPINS = (
+_CHUNK_SPINS = (
     ("edge_max_chars", "Fragmento de Edge (caracteres)", 100, 3000, 50, ""),
     ("edge_max_sentences", "Fragmento de Edge (frases)", 1, 10, 1, ""),
     ("piper_max_chars", "Fragmento de Piper (caracteres)", 50, 1500, 50, ""),
+    ("skip_seconds", "Avance y retroceso", 1, 120, 1, " s"),
+)
+# EngineConfig y EdgeEngine se montan al arrancar la app: estos no llegan a la sesión.
+_RESTART_SPINS = (
     ("edge_retries", "Reintentos de Edge", 0, 10, 1, ""),
     ("edge_timeout_s", "Espera máxima de Edge", 5, 120, 1, " s"),
     ("recovery_initial_s", "Volver a probar Edge tras", 10, 3600, 10, " s"),
     ("recovery_max_s", "Espera máxima entre pruebas de Edge", 10, 7200, 10, " s"),
     ("piper_cooldown_s", "Tiempo mínimo con Piper", 0, 3600, 10, " s"),
-    ("skip_seconds", "Avance y retroceso", 1, 120, 1, " s"),
 )
-_KEYS = (tuple(key for key, *_ in _SPINS)
+_CHUNK_KEYS = ("edge_max_chars", "edge_max_sentences", "piper_max_chars")
+_KEYS = (tuple(key for key, *_ in _CHUNK_SPINS + _RESTART_SPINS)
          + ("edge_voice", "language", "speed", "continuous", "highlight_sentence", "store_text"))
 
 
@@ -114,29 +118,12 @@ def _locales(voices: list[dict], current: str) -> list[str]:
     return sorted(found, key=lambda loc: (not loc.lower().startswith("es-"), loc))
 
 
-_GENDER = {"Female": "mujer", "Male": "hombre"}
-
-
-def _voice_items(voices: list[dict], locale: str, current: str | None) -> list[tuple[str, str]]:
-    items = []
-    for v in sorted(voices, key=lambda v: v.get("ShortName", "")):
-        short = v.get("ShortName", "")
-        if not short or v.get("Locale") != locale:
-            continue
-        name = short.rsplit("-", 1)[-1].removesuffix("Neural") or short
-        gender = _GENDER.get(v.get("Gender", ""))
-        items.append((name + (f", {gender}" if gender else ""), short))
-    if current and current.startswith(f"{locale}-") and all(d != current for _, d in items):
-        items.insert(0, (current, current))
-    return items
-
-
 class SettingsDialog(QDialog):
     """Pestañas «Voces», «Voces locales (Piper)», «Lectura» y «Privacidad».
 
     `saved` sale tras guardar algo que la ventana muestra (ella vuelve a leer la
-    configuración). Al cerrarse guarda lo pendiente, cancela las descargas que se
-    pidieron aquí y corta la muestra.
+    configuración). Al cerrarse guarda lo pendiente y corta la muestra; las descargas
+    siguen (solo «Cancelar» las para).
     """
 
     saved = Signal()
@@ -197,12 +184,15 @@ class SettingsDialog(QDialog):
         self.dalia_label.hide()
         self.voices_status = QLabel()
         self.voices_status.setWordWrap(True)
+        self.voice_hint = QLabel(OTHER_LANGUAGE)
+        self.voice_hint.hide()
         form = QFormLayout(page)
         form.addRow("Idioma", self.language_combo)
         row = QHBoxLayout()
         row.addWidget(self.edge_combo, 1)
         row.addWidget(self.refresh_button)
         form.addRow("Voz en línea (Edge)", row)
+        form.addRow(self.voice_hint)
         form.addRow(self.dalia_label)
         form.addRow(self.voices_status)
         return page
@@ -217,22 +207,28 @@ class SettingsDialog(QDialog):
         self.speed_spin.setSuffix("×")
         form.addRow("Velocidad por defecto", self.speed_spin)
         self.spins: dict[str, QSpinBox] = {}
-        for key, label, low, high, step, suffix in _SPINS:
+        self._add_spins(form, _CHUNK_SPINS)
+        self.continuous_check = QCheckBox("Lectura continua: al terminar un capítulo, sigue "
+                                          "con el siguiente")
+        self.highlight_check = QCheckBox("Resaltar la frase que se lee")
+        form.addRow(self.continuous_check)
+        form.addRow(self.highlight_check)
+        self.restart_group = QGroupBox(RESTART_GROUP)
+        self._add_spins(QFormLayout(self.restart_group), _RESTART_SPINS)
+        form.addRow(self.restart_group)
+        note = QLabel(LATER_NOTE)
+        note.setWordWrap(True)
+        form.addRow(note)
+        return page
+
+    def _add_spins(self, form: QFormLayout, specs) -> None:
+        for key, label, low, high, step, suffix in specs:
             spin = QSpinBox()
             spin.setRange(low, high)
             spin.setSingleStep(step)
             spin.setSuffix(suffix)
             self.spins[key] = spin
             form.addRow(label, spin)
-        self.continuous_check = QCheckBox("Lectura continua: al terminar un capítulo, sigue "
-                                          "con el siguiente")
-        self.highlight_check = QCheckBox("Resaltar la frase que se lee")
-        form.addRow(self.continuous_check)
-        form.addRow(self.highlight_check)
-        note = QLabel(LATER_NOTE)
-        note.setWordWrap(True)
-        form.addRow(note)
-        return page
 
     def _build_privacy(self) -> QWidget:
         page = QWidget()
@@ -270,8 +266,7 @@ class SettingsDialog(QDialog):
         # Solo cuentan las acciones del usuario: `activated` y `clicked`; las casillas
         # numéricas se rellenan con las señales bloqueadas.
         self.language_combo.activated.connect(self._on_language)
-        self.edge_combo.activated.connect(
-            lambda i: self._change("edge_voice", self.edge_combo.itemData(i)))
+        self.edge_combo.activated.connect(self._on_edge_voice)
         self.refresh_button.clicked.connect(self._on_refresh)
         self.speed_spin.valueChanged.connect(lambda v: self._change("speed", round(v, 2)))
         for key, spin in self.spins.items():
@@ -339,9 +334,12 @@ class SettingsDialog(QDialog):
     def _fill_edge_combo(self) -> None:
         current = self._values.get("edge_voice")
         self.edge_combo.clear()
-        for text, data in _voice_items(self._edge_voices, self._language(), current):
+        items = edge_voice_items(self._edge_voices, self._language(), current, exact_locale=True)
+        for text, data in items:
             self.edge_combo.addItem(text, data)
-        self.edge_combo.setCurrentIndex(self.edge_combo.findData(current))
+        index = self.edge_combo.findData(current)
+        self.edge_combo.setCurrentIndex(index)
+        self.voice_hint.setVisible(index < 0 and bool(current))
 
     # --- cambios -----------------------------------------------------------------------
 
@@ -354,7 +352,11 @@ class SettingsDialog(QDialog):
 
     def _on_language(self, index: int) -> None:
         self._change("language", self.language_combo.itemData(index))
-        self._fill_edge_combo()
+        self._fill_edge_combo()  # marca la voz actual si es de este idioma; si no, lo avisa
+
+    def _on_edge_voice(self, index: int) -> None:
+        self._change("edge_voice", self.edge_combo.itemData(index))
+        self.voice_hint.hide()
 
     def flush(self) -> None:
         """Guarda ya los cambios pendientes (también lo hace solo, poco después de cada uno)."""
@@ -364,15 +366,24 @@ class SettingsDialog(QDialog):
         changes, self._pending = self._pending, {}
         settings, ctl = self._s.settings, self._s.controller
 
+        limits = None
+        if any(key in changes for key in _CHUNK_KEYS):
+            limits = tuple(self.spins[key].value() for key in _CHUNK_KEYS)
+
         async def save() -> None:
             for key, value in changes.items():
                 await asyncio.to_thread(settings.set, key, value)
+            # Lo que también cambia la sesión en marcha va por el controlador.
+            if "store_text" in changes:
+                await ctl.set_store_text(changes["store_text"])
             if "edge_voice" in changes:
                 await ctl.set_voice(changes["edge_voice"], None, False)
             if "speed" in changes:
                 await ctl.set_speed(changes["speed"], False)
             if "continuous" in changes:
                 await ctl.set_continuous(changes["continuous"])
+            if limits is not None:
+                await ctl.set_chunk_limits(*limits)
 
         def done(_result) -> None:
             self.status_label.setText(SAVED)
@@ -428,8 +439,16 @@ class SettingsDialog(QDialog):
 
     def _on_purge(self) -> None:
         self.purge_button.setEnabled(False)
-        job = asyncio.to_thread(self._s.chapters.purge_all_text)
-        run_job(self._s.worker, job, self._on_purged, self._on_purge_failed)
+        ctl, chapters = self._s.controller, self._s.chapters
+
+        async def purge() -> None:
+            # Primero la sesión en marcha deja de guardar texto (y termina lo que guardaba);
+            # si no, el siguiente capítulo volvería a escribirlo justo después del borrado.
+            await ctl.set_store_text(False)
+            await asyncio.to_thread(chapters.purge_all_text)
+
+        if run_job(self._s.worker, purge(), self._on_purged, self._on_purge_failed) is None:
+            self.purge_button.setEnabled(True)
 
     def _on_purged(self, _result) -> None:
         self.purge_button.setEnabled(True)
@@ -443,7 +462,8 @@ class SettingsDialog(QDialog):
     # --- cierre ------------------------------------------------------------------------
 
     def done(self, result: int) -> None:
+        # Las descargas siguen (el aviso y el indicador de Piper muestran el progreso):
+        # solo «Cancelar» las para. La muestra sí se corta.
         self.flush()
-        self.piper_panel.cancel_downloads()
         self.piper_panel.stop_sample()
         super().done(result)

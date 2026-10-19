@@ -43,7 +43,7 @@ from lector.persistence.repositories import (
     SettingsRepo,
 )
 from lector.services.document_opener import DeferredSource, SourceOpener, check_file, store_opened
-from lector.services.navigator import ChapterNavigator
+from lector.services.navigator import ChapterNavigator, TextWrites
 from lector.services.progress_writer import ProgressWriter, make_record
 from lector.tts.base import AudioClip, clamp_speed
 from lector.tts.engine_manager import EngineManager, EngineState
@@ -259,6 +259,7 @@ class ReadingController:
         self._repos = deps.repos
         self._sleep = deps.sleep
         self._lock = asyncio.Lock()
+        self._text_writes = TextWrites()  # vista previa y capítulo elegido (no del navegador)
         self._state = SessionState.IDLE
         self._closed = False
 
@@ -306,11 +307,12 @@ class ReadingController:
 
     async def open(self, locator: str) -> tuple[Document, Chapter, ProgressRecord | None]:
         """Vista previa: abre la fuente y guarda el documento, pero no reproduce."""
-        settings = await self._ensure_settings()
+        await self._ensure_settings()
         source, doc, chapter = await self._open_source(locator)
-        await asyncio.to_thread(
-            store_opened, self._repos.documents, self._repos.chapters, doc, chapter,
-            settings.store_text,
+        store = self._settings.store_text  # el valor vivo, tras la espera de la red
+        await self._text_writes.run(
+            store_opened, self._repos.documents, self._repos.chapters, doc, chapter, store,
+            with_text=store,
         )
         progress = await asyncio.to_thread(self._repos.progress.get, doc.doc_id)
         self._preview = (source, doc, chapter)
@@ -338,6 +340,8 @@ class ReadingController:
                 self._settings = await asyncio.to_thread(_read_settings, self._deps.settings)
                 progress = await asyncio.to_thread(self._repos.progress.get, doc_id)
                 session = await self._session_for(doc_id)
+                # Una sesión que sigue abierta adopta lo que diga ahora la configuración.
+                await session.nav.set_store_text(self._settings.store_text)
             except BaseException:
                 self._set_state(SessionState.IDLE)
                 raise
@@ -514,6 +518,33 @@ class ReadingController:
         """
         self._em.set_preferred(name)  # ValueError si el nombre no es válido
         await self._persist_setting("preferred_engine", name)
+
+    async def set_store_text(self, on: bool) -> None:
+        """Guardar o no el texto de los capítulos, también en la sesión en marcha.
+
+        Al desactivarlo, vuelve cuando ya no queda ninguna escritura con texto en curso
+        (navegador, vista previa o capítulo elegido): un borrado posterior es definitivo.
+        """
+        async with self._lock:  # no se cruza con un play() que relee la configuración
+            settings = await self._ensure_settings()
+            settings.store_text = on
+            await self._persist_setting("store_text", on)
+            if self._session is not None:
+                await self._session.nav.set_store_text(on)
+        if not on:
+            await self._text_writes.drain()
+
+    async def set_chunk_limits(
+        self, edge_max_chars: int, edge_max_sentences: int, piper_max_chars: int
+    ) -> None:
+        """Tamaño de los fragmentos: vale desde el siguiente capítulo (o el siguiente play)."""
+        settings = await self._ensure_settings()
+        settings.edge_max_chars = edge_max_chars
+        settings.edge_max_sentences = edge_max_sentences
+        settings.piper_max_chars = piper_max_chars
+        await self._persist_setting("edge_max_chars", edge_max_chars)
+        await self._persist_setting("edge_max_sentences", edge_max_sentences)
+        await self._persist_setting("piper_max_chars", piper_max_chars)
 
     async def locate_page(self, doc_id: str, page: int) -> Position | None:
         """Posición de la primera frase de `page` en el PDF abierto en vista previa o en lectura.
@@ -910,10 +941,11 @@ class ReadingController:
     async def _remember_next(self, chapter: Chapter, ref: ChapterRef) -> None:
         chapter.next_ref = ref  # también en memoria: el navegador ya no vuelve a preguntar
         chapter.next_candidates = []
+        store = self._settings.store_text
         try:
-            await asyncio.to_thread(
-                self._repos.chapters.save, self._session.doc.doc_id, chapter,
-                self._settings.store_text,
+            await self._text_writes.run(
+                self._repos.chapters.save, self._session.doc.doc_id, chapter, store,
+                with_text=store,
             )
         except Exception:
             log.warning("No se pudo recordar el capítulo elegido", exc_info=True)
