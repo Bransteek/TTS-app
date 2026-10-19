@@ -308,3 +308,98 @@ async def test_prefetch_gives_up_on_page_without_text(dns, fetcher, repo, site):
     assert 60 <= sum(clock.sleeps) <= 70
     assert waits == []
     await nav.close()
+
+
+# --- DNS que no contesta: el mismo tope de tiempo que la petición ------------------------
+
+DNS_TIMEOUT_S = 0.2  # tope corto e inyectado: la prueba no espera los 15 s reales
+HUNG_DNS_MAX_S = 3.0  # el hilo del resolver se suelta solo pase lo que pase
+
+
+class HungDns(Dns):
+    """`socket.getaddrinfo` que no vuelve mientras `hung` (como macOS al volver el Wi-Fi)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hung = False
+        self.release = __import__("threading").Event()
+        self.calls = 0
+
+    def __call__(self, host, port, family=0, type=0, proto=0, flags=0):
+        self.calls += 1
+        if self.hung:
+            self.release.wait(HUNG_DNS_MAX_S)
+        return super().__call__(host, port, family, type, proto, flags)
+
+
+@pytest.fixture
+def hung_dns(monkeypatch):
+    fake = HungDns()
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+    yield fake
+    fake.release.set()
+
+
+@pytest.fixture
+async def quick_fetcher(site):
+    fetcher = SafeFetcher(transport=httpx.MockTransport(site), timeout=DNS_TIMEOUT_S)
+    yield fetcher
+    await fetcher.aclose()
+
+
+async def test_dns_that_never_answers_is_a_recoverable_network_error(hung_dns, quick_fetcher):
+    hung_dns.hung = True
+    try:
+        start = asyncio.get_running_loop().time()
+        with pytest.raises(PageUnreachable) as caught:
+            await asyncio.wait_for(quick_fetcher.get(CH99), 2)
+        elapsed = asyncio.get_running_loop().time() - start
+    finally:
+        hung_dns.release.set()
+    assert caught.value.recoverable
+    assert elapsed < 1.0  # el tope de la petición, no la espera del resolver
+
+
+async def test_open_with_dns_that_never_answers_fails_recoverably(hung_dns, quick_fetcher,
+                                                                  controller_rig):
+    rig = controller_rig(fetcher=quick_fetcher, opener=open_source)
+    hung_dns.hung = True
+    try:
+        with pytest.raises(PageUnreachable) as caught:
+            await asyncio.wait_for(rig.ctl.open(CH99), 2)
+    finally:
+        hung_dns.release.set()
+    assert caught.value.recoverable  # «Leer» deja de estar en «Abriendo…» y avisa
+
+
+class UnhangClock:
+    """Espera falsa: tras la primera espera el DNS vuelve a contestar."""
+
+    def __init__(self, dns: HungDns) -> None:
+        self.dns = dns
+        self.sleeps: list[float] = []
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.dns.hung = False
+        self.dns.release.set()
+        await asyncio.sleep(0)
+
+
+async def test_next_chapter_with_dns_that_never_answers_waits_and_resumes(hung_dns, quick_fetcher,
+                                                                          repo):
+    source = MadaraSource(quick_fetcher)
+    doc, current = await source.open(CH99)
+    hung_dns.hung = True  # el resolver se cuelga justo al cambiar de capítulo
+    clock = UnhangClock(hung_dns)
+    nav = ChapterNavigator(source, doc, repo, store_text=False, sleep=clock.sleep)
+    waits: list[bool] = []
+    nav.on_waiting = waits.append
+    try:
+        nxt = await asyncio.wait_for(nav.next_of(current), 2)
+    finally:
+        hung_dns.release.set()
+
+    assert nxt.ref.locator == CH100
+    assert waits == [True, False]  # avisó de la espera (WAITING_NETWORK) en vez de callar
+    assert clock.sleeps == [1]

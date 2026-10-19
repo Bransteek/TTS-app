@@ -110,18 +110,21 @@ class SafeFetcher:
         for _ in range(self._max_redirects + 1):
             parts = urlsplit(current)
             port = parts.port or (443 if parts.scheme == "https" else 80)
-            try:
-                resolved = await self._resolver(parts.hostname, port)
-            except LectorError:
-                raise
-            except Exception:
-                raise PageUnreachable(recoverable=True) from None
-            ip = ensure_public_ip(resolved)
-            headers = {"X-Requested-With": "XMLHttpRequest"} if method == "POST" else {}
-            request = self._client.build_request(
-                method, current, data=data, headers=headers, extensions={"pinned_ip": ip}
-            )
+            # Un solo tope por salto para resolver el nombre y para la petición: un DNS que
+            # no contesta (p. ej. en macOS al volver el Wi-Fi) acaba en TimeoutError, que
+            # `_fetch` convierte en el mismo error de red recuperable que un DNS caído.
             async with asyncio.timeout(self._timeout):
+                try:
+                    resolved = await self._resolver(parts.hostname, port)
+                except LectorError:
+                    raise
+                except Exception:
+                    raise PageUnreachable(recoverable=True) from None
+                ip = ensure_public_ip(resolved)
+                headers = {"X-Requested-With": "XMLHttpRequest"} if method == "POST" else {}
+                request = self._client.build_request(
+                    method, current, data=data, headers=headers, extensions={"pinned_ip": ip}
+                )
                 response = await self._client.send(request, stream=True)
                 try:
                     location = response.headers.get("location")
