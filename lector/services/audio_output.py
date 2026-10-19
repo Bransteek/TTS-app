@@ -6,14 +6,15 @@
   `AUDIO_PROBE_TIMEOUT_S`: un PortAudio lento o colgado nunca impide arrancar ni salir
   (un hilo del executor de asyncio se esperaría sin límite al cerrar el intérprete). Si
   falla o tarda, la app abre igual con un aviso.
-- `ProbeState` sabe si hay un sondeo o una creación de salida en curso. Mientras lo hay,
-  `LazyOutput.start` no reinicia PortAudio ni vuelve a llamar a la fábrica (competiría con
-  la llamada colgada): lanza `AudioOutputError` en el acto.
+- `ProbeState` sabe si hay un sondeo, una reapertura o una parada de la salida en curso.
+  Mientras lo hay, `LazyOutput.start` no reinicia PortAudio ni vuelve a llamar a la
+  fábrica (competiría con la llamada colgada): lanza `AudioOutputError` en el acto.
 - `LazyOutput` envuelve la salida. Tras un fallo (al arrancar, al abrir el stream o con
   el stream ya sonando), el siguiente `start` reinicia PortAudio (para ver un dispositivo
-  enchufado después) y crea una salida nueva. Si sigue sin haber, lanza
-  `AudioOutputError`, que el controlador trata como cualquier fallo de la salida (un
-  reintento y luego pausa con aviso).
+  enchufado después) y crea una salida nueva, en un hilo daemon con tope: el bucle del
+  trabajador nunca espera a PortAudio. Si sigue sin haber salida o vence el tope, avisa
+  con `on_error` (`AudioOutputError`), que el controlador trata como cualquier fallo de
+  la salida (reintentos con espera creciente y luego pausa con aviso).
 """
 from __future__ import annotations
 
@@ -29,7 +30,8 @@ from lector.errors import AudioOutputError, LectorError
 
 log = logging.getLogger(__name__)
 
-AUDIO_PROBE_TIMEOUT_S = 5.0
+AUDIO_PROBE_TIMEOUT_S = 5.0  # sondeo al arrancar y cada reapertura de la salida
+OUTPUT_STOP_TIMEOUT_S = 1.0  # parar un stream: más que esto es que PortAudio se colgó
 PROBE_THREAD_NAME = "lector-audio-probe"
 
 OutputFactory = Callable[[], AudioOutput]
@@ -88,8 +90,35 @@ class ProbeState:
             self.leave()
 
 
+class _Reopen:
+    """Una reapertura en curso. Pasa una sola vez de «pending» a «ok» o a «dead»."""
+
+    __slots__ = ("lock", "state")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.state = "pending"
+
+    def settle(self, state: str) -> bool:
+        with self.lock:
+            if self.state != "pending":
+                return False
+            self.state = state
+            return True
+
+
 class LazyOutput:
-    """Salida que se rehace tras un fallo; ver el docstring del módulo."""
+    """Salida que se rehace tras un fallo; ver el docstring del módulo.
+
+    Una salida sana arranca en el acto. Reabrirla (tras un fallo, o sin salida aún)
+    reinicia PortAudio y llama a la fábrica: eso puede colgarse justo cuando se cambia
+    de dispositivo o se despierta el equipo, así que se hace en un hilo daemon y
+    `start` vuelve enseguida. Si falla, o no termina en `reopen_timeout_s`, se avisa con
+    `on_error` (desde otro hilo), como cualquier fallo de la salida. Una salida que
+    llega después del tope se para y se descarta. `stop` espera como mucho
+    `stop_timeout_s` a que se pare el stream; si no, lo abandona y la próxima vez se
+    reabre.
+    """
 
     def __init__(
         self,
@@ -99,52 +128,159 @@ class LazyOutput:
         failed: bool = False,
         reset: Callable[[], Any] | None = None,
         probe: ProbeState | None = None,
+        reopen_timeout_s: float = AUDIO_PROBE_TIMEOUT_S,
+        stop_timeout_s: float = OUTPUT_STOP_TIMEOUT_S,
     ):
         self._factory = factory
         self._output = output
         self._failed = failed
         self._reset = reset
         self._probe = probe if probe is not None else ProbeState()
+        self._reopen_timeout_s = reopen_timeout_s
+        self._stop_timeout_s = stop_timeout_s
+        self._lock = threading.Lock()  # _output, _failed y _attempt (los tocan otros hilos)
+        self._attempt: _Reopen | None = None
 
     def probe_busy(self) -> bool:
         return self._probe.busy()
 
     def start(self, callback, on_error=None) -> None:
-        if (self._failed or self._output is None) and self._probe.busy():
-            # Otra llamada a PortAudio sigue colgada: ni reiniciarlo ni llamar a la fábrica.
-            self._failed = True
-            raise AudioOutputError()
-        if self._failed:
-            if self._output is not None:
-                try:
-                    self._output.stop()
-                except Exception:
-                    log.debug("No se pudo parar la salida anterior", exc_info=True)
-            self._output = None
-            if self._reset is not None:
-                self._reset()
-        try:
-            if self._output is None:
-                with self._probe.running():
-                    self._output = self._factory()
-
-            def failed(exc: Exception) -> None:  # cualquier hilo (p. ej. el de PortAudio)
+        with self._lock:
+            output = None if self._failed else self._output
+        if output is None:
+            if self._probe.busy():
+                # Otra llamada a PortAudio sigue colgada: ni reiniciarlo ni llamar a la fábrica.
                 self._failed = True
-                if on_error is not None:
-                    on_error(exc)
-
-            self._output.start(callback, failed)
+                raise AudioOutputError()
+            self._reopen(callback, on_error)
+            return
+        try:
+            output.start(callback, self._watch(None, on_error))
         except LectorError:
             self._failed = True
             raise
         except Exception as exc:
             self._failed = True
             raise AudioOutputError() from exc
-        self._failed = False
 
     def stop(self) -> None:
-        if self._output is not None:
-            self._output.stop()
+        with self._lock:
+            attempt, self._attempt = self._attempt, None
+            output = self._output
+        if attempt is not None:
+            attempt.settle("dead")  # una reapertura en curso ya no es de nadie
+        if output is None:
+            return
+        if not self._stop_bounded(output):
+            with self._lock:
+                if self._output is output:
+                    self._output = None
+                    self._failed = True
+
+    # --- internos ---------------------------------------------------------------------
+
+    def _watch(self, attempt: _Reopen | None, on_error):
+        """Aviso de fallo del stream ya en marcha (llega desde el hilo de PortAudio)."""
+
+        def failed(exc: Exception) -> None:
+            if attempt is not None:
+                with attempt.lock:
+                    if attempt.state == "dead":
+                        return  # salida abandonada: su fallo ya no importa
+                    if attempt.state == "pending":
+                        attempt.state = "dead"  # falló antes de quedar instalada
+            self._failed = True
+            if on_error is not None:
+                on_error(exc)
+
+        return failed
+
+    def _reopen(self, callback, on_error) -> None:
+        attempt = _Reopen()
+        with self._lock:
+            old, self._output = self._output, None
+            self._failed = True  # hasta que la salida nueva arranque
+            self._attempt = attempt
+
+        def report(exc: Exception) -> None:
+            if attempt.settle("dead") and on_error is not None:
+                on_error(exc)
+
+        def on_timeout() -> None:
+            if attempt.state == "pending":
+                log.warning("Reabrir la salida de audio tardó más de %s s; se reintentará",
+                            self._reopen_timeout_s)
+            report(AudioOutputError())
+
+        def work() -> None:
+            try:
+                if old is not None:
+                    try:
+                        old.stop()
+                    except Exception:
+                        log.debug("No se pudo parar la salida anterior", exc_info=True)
+                if self._reset is not None:
+                    self._reset()
+                try:
+                    output = self._factory()
+                    output.start(callback, self._watch(attempt, on_error))
+                except Exception as exc:
+                    timer.cancel()
+                    if not isinstance(exc, LectorError):
+                        err = AudioOutputError()
+                        err.__cause__ = exc
+                        exc = err
+                    report(exc)
+                    return
+                timer.cancel()
+                if attempt.settle("ok"):
+                    with self._lock:
+                        if self._attempt is attempt:
+                            self._output = output
+                            self._failed = False
+                            return
+                log.info("La salida de audio se reabrió tarde; se descarta")
+                try:
+                    output.stop()
+                except Exception:
+                    log.debug("No se pudo parar la salida descartada", exc_info=True)
+            finally:
+                self._probe.leave()
+
+        timer = threading.Timer(self._reopen_timeout_s, on_timeout)
+        timer.daemon = True
+        self._probe.enter()
+        try:
+            timer.start()
+            threading.Thread(target=work, name=PROBE_THREAD_NAME, daemon=True).start()
+        except BaseException:
+            timer.cancel()
+            self._probe.leave()
+            raise
+
+    def _stop_bounded(self, output: AudioOutput) -> bool:
+        """Para `output` en un hilo daemon y espera como mucho `stop_timeout_s`."""
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                output.stop()
+            except Exception:
+                log.warning("No se pudo parar la salida de audio", exc_info=True)
+            finally:
+                self._probe.leave()
+                done.set()
+
+        self._probe.enter()
+        try:
+            threading.Thread(target=run, name=PROBE_THREAD_NAME, daemon=True).start()
+        except BaseException:
+            self._probe.leave()
+            raise
+        if done.wait(self._stop_timeout_s):
+            return True
+        log.warning("La salida de audio no se paró en %s s; se abandona", self._stop_timeout_s)
+        return False
 
 
 def _probe_in_daemon_thread(factory: OutputFactory, probe: ProbeState) -> asyncio.Future:

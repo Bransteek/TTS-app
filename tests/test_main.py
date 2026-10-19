@@ -207,10 +207,13 @@ def test_audio_device_failure_still_opens_window_with_notice(make_app, qtbot):
 
     assert ctx.window.isVisible()
     assert AudioOutputError.user_message in ctx.window.notice_label.text()
-    # La salida se vuelve a intentar al leer; si sigue sin haber, es un AudioOutputError
-    # que el controlador ya sabe tratar (un reintento y luego pausa con aviso).
-    with pytest.raises(AudioOutputError):
-        ctx.player._output.start(lambda block: None)
+    # La salida se vuelve a intentar al leer (en un hilo, sin bloquear el trabajador); si
+    # sigue sin haber, avisa con un AudioOutputError que el controlador ya sabe tratar
+    # (reintentos con espera creciente y luego pausa con aviso).
+    errors: list[Exception] = []
+    ctx.player._output.start(lambda block: None, on_error=errors.append)
+    qtbot.waitUntil(lambda: bool(errors), timeout=WAIT_MS)
+    assert isinstance(errors[0], AudioOutputError)
 
 
 def test_without_piper_model_the_app_opens_with_the_banner(make_app, qtbot):
