@@ -350,8 +350,12 @@ class ReadingController:
                  chapter.ref.locator, doc.doc_id, chapter.ref.index)
         return doc, chapter, progress
 
-    async def play(self, doc_id: str, start: Position | None = None) -> None:
+    async def play(self, doc_id: str, start: Position | None = None, *,
+                   keep_paused: bool = False) -> None:
         """Empieza a leer el documento.
+
+        Con `keep_paused`, una pausa del usuario se respeta: queda en pausa, ya en `start`
+        (así aterriza un capítulo elegido cuya lectura terminó mientras esperaba).
 
         `start` es la PRIMERA frase que se lee (`start.sentence_index`), no la última
         confirmada: para continuar desde un `ProgressRecord` hay que pasar `None`, o
@@ -365,9 +369,12 @@ class ReadingController:
         if self._closed:
             return
         async with self._lock:
+            if self._closed:  # shutdown() iba antes en la fila: ya no se lee nada
+                return
+            keep = keep_paused and self._paused
             await self._halt_locked()
             await self._save_now()
-            self._set_state(SessionState.LOADING)
+            self._set_state(SessionState.PAUSED if keep else SessionState.LOADING)
             try:
                 self._settings = await asyncio.to_thread(_read_settings, self._deps.settings)
                 progress = await asyncio.to_thread(self._repos.progress.get, doc_id)
@@ -379,7 +386,7 @@ class ReadingController:
                 raise
             self._em.reset()  # el productor anterior ya está cancelado
             log.info("Empieza la lectura del documento %s", doc_id)
-            if self._paused:
+            if self._paused and not keep:
                 self._paused = False
                 self._player.resume()  # quita la pausa (y reabre la salida si falló)
             self._output_retries = 0
@@ -541,8 +548,10 @@ class ReadingController:
                 return await self._jump(chapter, epoch)
             if epoch != self._epoch:
                 return False
-            # La lectura ya había terminado: se empieza de nuevo, con todo lo que hace play().
-            await self.play(doc_id, Position(number, chapter.ref.locator, 0, 0, 0, None))
+            # La lectura ya había terminado: se empieza de nuevo, con todo lo que hace play(),
+            # pero una pausa pulsada mientras esperaba se respeta.
+            await self.play(doc_id, Position(number, chapter.ref.locator, 0, 0, 0, None),
+                            keep_paused=True)
             return True
         finally:
             self._picks -= 1

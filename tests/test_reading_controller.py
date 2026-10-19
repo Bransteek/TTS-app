@@ -1329,6 +1329,52 @@ async def test_queue_draining_while_a_pick_waits_keeps_waiting_then_reads(contro
     assert rig.events.heard_at[-1] == ("Cap 3", 0)
     assert rig.edge.calls[-1][2] == 1.5  # pasó por play(): configuración releída
     assert rig.ctl.state is S.READING
+    assert S.PAUSED not in rig.events.states  # sin pausa del usuario no se inventa una
+
+
+async def test_pause_during_a_held_pick_is_kept_when_it_lands(controller_rig):
+    """Sin red, el capítulo 1 acabó y se pulsa Pausar: al volver la red, el 3 queda en pausa."""
+    rig = story_rig(controller_rig, chapters=3, sentences=4, prefetch_ahead=0)
+    pick = await drain_while_a_pick_waits(rig)
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
+    assert rig.ctl.state is S.PAUSED
+    paused_at = len(rig.events.states)
+    rig.source.failures = []  # vuelve la red
+
+    assert await asyncio.wait_for(pick, WAIT_S) is True
+    await until(lambda: rig.player.queued_count() > 0)
+    await settle()
+
+    assert rig.ctl.state is S.PAUSED
+    assert rig.events.states[paused_at:] == []  # ni un instante «Cargando» ni «Leyendo»
+    heard = len(rig.events.sentences)
+    rig.out.pull(SAMPLES_PER_SENTENCE)  # en pausa la salida solo da silencio
+    await settle()
+    assert len(rig.events.sentences) == heard
+    assert rig.stored().position.chapter_locator == story_ref(3).locator
+    assert resume_sentence(rig.stored().position) == 0
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+
+
+async def test_play_queued_behind_shutdown_does_not_start(controller_rig):
+    rig = story_rig(controller_rig, chapters=2)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    before = len(rig.events.states)
+
+    async with rig.ctl._lock:  # una orden en curso: las dos siguientes esperan en fila
+        closing = asyncio.create_task(rig.ctl.shutdown())
+        await settle()
+        playing = asyncio.create_task(rig.ctl.play(STORY_ID))
+        await settle()
+    await asyncio.wait_for(asyncio.gather(closing, playing), WAIT_S)
+    await settle()
+
+    assert rig.producers() == 0 and lector_tasks() == []
+    assert rig.events.states[before:] == []  # ni «cargando» ni «leyendo» tras cerrar
+    assert rig.ctl._active is False
 
 
 async def test_pick_failing_after_the_queue_drained_ends_the_reading(controller_rig):
