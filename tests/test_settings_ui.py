@@ -214,7 +214,10 @@ def make_chapter(locator: str) -> Chapter:
 
 
 @pytest.fixture
-def worker():
+def worker(conn):
+    # Depende de `conn`: pytest desmonta al revés, así el trabajador (y los trabajos de su
+    # executor que aún usan la base de datos, p. ej. `_read_state`) se detiene antes de
+    # cerrar la conexión. Al revés, sqlite se cierra con un hilo dentro: SIGSEGV.
     w = AsyncWorker()
     w.start()
     yield w
