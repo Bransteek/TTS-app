@@ -1,0 +1,358 @@
+from pathlib import Path
+
+import httpx
+import pytest
+
+from lector.content.base import doc_id_for_url
+from lector.content.generic_web import (
+    GenericWebSource,
+    find_next_candidates,
+    find_prev_candidates,
+    guess_work_prefix,
+)
+from lector.errors import NoExtractableText
+from lector.security.http_client import SafeFetcher
+
+FIX = Path(__file__).parent / "fixtures" / "generic"
+HOST = "https://lector.example"
+PAGE_URL = f"{HOST}/novela/x/capitulo-5/"
+PREFIX = "/novela/x/"
+HTML_HEADERS = {"content-type": "text/html; charset=utf-8"}
+
+
+def read(name: str) -> str:
+    return (FIX / name).read_text(encoding="utf-8")
+
+
+def page(nav: str = "", head: str = "") -> str:
+    return read("page.html").replace("<!--NAV-->", nav).replace("<!--HEAD-->", head)
+
+
+def nav_links(html: str) -> list[str]:
+    return find_next_candidates(html, PAGE_URL, PREFIX)
+
+
+def test_rel_next_preferred():
+    html = read("rel_next.html")
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+def test_text_link_siguiente():
+    html = read("text_next.html")
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+def test_external_next_ignored():
+    html = page('<a href="https://otro-sitio.example/novela/x/capitulo-6/">Siguiente</a>')
+    assert nav_links(html) == []
+
+
+def test_other_work_ignored():
+    html = page('<a href="/novela/y/capitulo-6/">Siguiente</a>')
+    assert nav_links(html) == []
+
+
+def test_ambiguous_two_candidates():
+    html = page(
+        '<a href="/novela/x/capitulo-7/">Siguiente</a>'
+        '<a href="/novela/x/extra-especial/">Next</a>'
+    )
+    assert nav_links(html) == [
+        f"{HOST}/novela/x/capitulo-7/",
+        f"{HOST}/novela/x/extra-especial/",
+    ]
+
+
+def test_duplicates_collapse_to_one():
+    html = page(
+        '<a href="/novela/x/capitulo-6/">Siguiente</a>'
+        '<a href="/novela/x/capitulo-6/#top">Next</a>'
+    )
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+def test_numeric_pattern_tiebreak():
+    html = page(
+        '<a href="/novela/x/extra-especial/">Siguiente</a>'
+        '<a href="/novela/x/capitulo-6/">Next chapter</a>'
+    )
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+def test_numeric_pattern_never_invents():
+    assert nav_links(page()) == []
+
+
+def test_numeric_pattern_does_not_break_real_ambiguity():
+    html = page(
+        '<a href="/novela/x/extra-especial/">Siguiente</a>'
+        '<a href="/novela/x/otro-extra/">Next</a>'
+    )
+    assert len(nav_links(html)) == 2
+
+
+def test_work_prefix_parent_path():
+    assert guess_work_prefix(PAGE_URL, page()) == PREFIX
+    assert guess_work_prefix(f"{HOST}/novela/x/capitulo-5", page()) == PREFIX
+
+
+def test_work_prefix_from_canonical():
+    assert guess_work_prefix(PAGE_URL, read("canonical.html")) == "/novela/"
+
+
+def test_work_prefix_from_index_link():
+    assert guess_work_prefix(f"{HOST}/novela/x/y/capitulo-5/", read("index_link.html")) == PREFIX
+
+
+def test_work_prefix_ignores_unrelated_index_link():
+    html = page('<a href="/otra/obra/">Índice</a>')
+    assert guess_work_prefix(PAGE_URL, html) == PREFIX
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        f"{HOST}/novela/x/../y/capitulo-6/",
+        f"{HOST}/novela/x/%2e%2e/y/capitulo-6/",
+        f"{HOST}/novela/x/%2E%2E/y/capitulo-6/",
+        f"{HOST}/novela/x/./../y/capitulo-6/",
+    ],
+)
+def test_dot_segments_cannot_escape_prefix(href):
+    assert nav_links(page(f'<a href="{href}">Siguiente</a>')) == []
+
+
+def test_dot_segments_inside_prefix_are_normalized():
+    html = page(f'<a href="{HOST}/novela/x/y/../capitulo-6/">Siguiente</a>')
+    assert nav_links(html) == [f"{HOST}/novela/x/capitulo-6/"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Siguiente capítulo »", "Next »", "SIGUIENTE   CAPITULO", "Capítulo siguiente →", "» ", "→", "Next chapter"],
+)
+def test_tolerant_next_text(text):
+    assert nav_links(page(f'<a href="/novela/x/capitulo-6/">{text}</a>')) == [
+        f"{HOST}/novela/x/capitulo-6/"
+    ]
+
+
+@pytest.mark.parametrize("text", ["Siguiente novela", "Next episode", "Ver siguiente capítulo recomendado"])
+def test_next_text_requires_exact_match(text):
+    assert nav_links(page(f'<a href="/novela/x/capitulo-6/">{text}</a>')) == []
+
+
+def prev_links(html: str) -> list[str]:
+    return find_prev_candidates(html, PAGE_URL, PREFIX)
+
+
+def test_prev_rel():
+    html = page(
+        '<link rel="prev" href="/novela/x/capitulo-4/">'
+        '<a href="/novela/x/capitulo-3/">Anterior</a>'
+    )
+    assert prev_links(html) == [f"{HOST}/novela/x/capitulo-4/"]
+
+
+@pytest.mark.parametrize("text", ["Anterior", "« Anterior", "Capítulo anterior", "Previous chapter", "←", "Prev"])
+def test_prev_text(text):
+    html = page(f'<a href="/novela/x/capitulo-4/">{text}</a>')
+    assert prev_links(html) == [f"{HOST}/novela/x/capitulo-4/"]
+
+
+def test_prev_filters_and_no_numeric_tiebreak():
+    html = page(
+        '<a href="/novela/y/capitulo-4/">Anterior</a>'
+        '<a href="/novela/x/capitulo-4/">Previous</a>'
+        '<a href="/novela/x/extra/">Prev</a>'
+    )
+    assert len(prev_links(html)) == 2
+
+
+async def test_open_sets_prev_ref():
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
+    try:
+        _, chapter = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert chapter.prev_ref.locator == f"{HOST}/novela/x/capitulo-4/"
+
+
+# --- fuente completa ---------------------------------------------------------
+
+
+def make_handler(pages: dict[str, str]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = pages.get(str(request.url))
+        if body is None:
+            return httpx.Response(404, text="no", headers=HTML_HEADERS)
+        return httpx.Response(200, text=body, headers=HTML_HEADERS)
+
+    return handler
+
+
+async def resolver(host: str, port: int) -> str:
+    return "93.184.216.34"
+
+
+async def make_source(pages, **kwargs):
+    fetcher = SafeFetcher(resolver=resolver, transport=httpx.MockTransport(make_handler(pages)))
+    return fetcher, GenericWebSource(fetcher, **kwargs)
+
+
+async def test_no_text_raises():
+    fetcher, source = await make_source({PAGE_URL: read("no_text.html")})
+    try:
+        with pytest.raises(NoExtractableText):
+            await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+
+
+@pytest.mark.parametrize("body", ["", None])
+async def test_known_chapter_without_text_is_incomplete(body):
+    """Al cargar un capítulo ya conocido, una página sin texto se reintenta un rato."""
+    from lector.errors import PageIncomplete
+    from lector.models import ChapterRef
+
+    fetcher, source = await make_source({PAGE_URL: read("no_text.html") if body is None else body})
+    try:
+        with pytest.raises(PageIncomplete) as exc:
+            await source.load_chapter(ChapterRef(4, "Capítulo 5", PAGE_URL))
+    finally:
+        await fetcher.aclose()
+    assert exc.value.recoverable is True
+    assert isinstance(exc.value.final, NoExtractableText)
+    assert exc.value.user_message == NoExtractableText.user_message
+
+
+async def test_open_extracts_chapter_and_next():
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
+    try:
+        doc, chapter = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert len(chapter.paragraphs) >= 3
+    assert chapter.paragraphs[1].text.startswith("La lluvia caía sobre el viejo puerto")
+    assert "Sitio de ejemplo" not in chapter.text
+    assert chapter.next_ref.locator == f"{HOST}/novela/x/capitulo-6/"
+    assert chapter.next_candidates == []
+    assert doc.work_prefix == HOST + PREFIX
+    assert doc.doc_id == doc_id_for_url("lector.example/novela/x/")
+    assert doc.chapters == []
+
+
+async def test_open_with_prefetched_html_skips_network():
+    fetcher, source = await make_source({})
+    try:
+        _, chapter = await source.open(PAGE_URL, prefetched_html=read("text_next.html"))
+    finally:
+        await fetcher.aclose()
+    assert chapter.next_ref is not None
+
+
+async def test_open_ambiguous_fills_candidates():
+    html = page(
+        '<a href="/novela/x/capitulo-7/">Siguiente</a>'
+        '<a href="/novela/x/extra-especial/">Next</a>'
+    )
+    fetcher, source = await make_source({PAGE_URL: html})
+    try:
+        _, chapter = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert chapter.next_ref is None
+    assert len(chapter.next_candidates) == 2
+
+
+async def test_work_prefix_override_wins():
+    html = page('<a href="/novela/x/capitulo-6/">Siguiente</a>')
+    fetcher, source = await make_source({PAGE_URL: html}, work_prefix_override="/novela/z/")
+    try:
+        doc, chapter = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert doc.work_prefix == HOST + "/novela/z/"
+    assert chapter.next_ref is None
+
+
+async def test_load_chapter_and_empty_index():
+    nxt = f"{HOST}/novela/x/capitulo-6/"
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html"), nxt: page()})
+    try:
+        _, chapter = await source.open(PAGE_URL)
+        loaded = await source.load_chapter(chapter.next_ref)
+        assert await source.list_chapters() == []
+    finally:
+        await fetcher.aclose()
+    assert loaded.ref.locator == nxt
+    assert loaded.next_ref is None
+
+
+async def test_open_reports_generic_adapter():
+    fetcher, source = await make_source({PAGE_URL: read("text_next.html")})
+    try:
+        doc, _ = await source.open(PAGE_URL)
+    finally:
+        await fetcher.aclose()
+    assert doc.adapter == "generic"
+    assert doc.index_page is False
+
+
+# --- prefijos corregidos por el usuario (§5.2), por obra dentro de un host ---------------
+
+
+def test_prefix_override_applies_only_under_its_prefix():
+    from lector.content.generic_web import prefix_override_for
+
+    overrides = {"lector.example": ["/novela/", "/novela/x/"], "otra.example": ["/a/"]}
+    assert prefix_override_for(overrides, f"{HOST}/novela/x/capitulo-5/") == "/novela/x/"  # la más larga
+    assert prefix_override_for(overrides, f"{HOST}/novela/y/capitulo-1/") == "/novela/"
+    assert prefix_override_for(overrides, f"{HOST}/otra/z/capitulo-1/") is None  # otra obra
+    assert prefix_override_for(overrides, "https://LECTOR.example/novela/x/") == "/novela/x/"
+    assert prefix_override_for({}, PAGE_URL) is None
+    assert prefix_override_for(None, PAGE_URL) is None
+
+
+def test_prefix_override_reads_old_single_string_format():
+    from lector.content.generic_web import prefix_override_for, set_prefix_override
+
+    old = {"lector.example": "/novela/x/"}
+    assert prefix_override_for(old, PAGE_URL) == "/novela/x/"
+    assert prefix_override_for(old, f"{HOST}/otra/capitulo-1/") is None
+    assert set_prefix_override(old, f"{HOST}/otra/capitulo-1/", "/otra/") == {
+        "lector.example": ["/novela/x/", "/otra/"],
+    }
+
+
+def test_set_prefix_override_replaces_the_one_for_that_work_and_clears():
+    from lector.content.generic_web import set_prefix_override
+
+    start = {"lector.example": ["/novela/", "/otra/"]}
+    changed = set_prefix_override(start, PAGE_URL, "/novela/x/")
+    assert changed == {"lector.example": ["/otra/", "/novela/x/"]}  # la de esta obra se sustituye
+    assert start == {"lector.example": ["/novela/", "/otra/"]}  # no muta la entrada
+    assert set_prefix_override(changed, PAGE_URL, "/novela/x/") == changed  # sin duplicados
+    cleared = set_prefix_override(changed, PAGE_URL, None)
+    assert cleared == {"lector.example": ["/otra/"]}
+    assert set_prefix_override(cleared, f"{HOST}/otra/c-1/", None) == {}  # host sin prefijos
+
+
+def test_set_prefix_override_stores_the_path_with_final_slash():
+    from lector.content.generic_web import prefix_override_for, set_prefix_override
+
+    stored = set_prefix_override({}, PAGE_URL, "/novela")
+    assert stored == {"lector.example": ["/novela/"]}
+    assert set_prefix_override(stored, PAGE_URL, "/novela") == stored  # mismo prefijo: igual
+    assert prefix_override_for(stored, f"{HOST}/novelas-otras/c-1/") is None  # no «/novela» a secas
+
+
+async def test_doc_id_ignores_host_case():
+    fetcher, source = await make_source({})
+    try:
+        upper = PAGE_URL.replace("lector.example", "Lector.EXAMPLE")
+        doc, _ = await source.open(upper, prefetched_html=read("text_next.html"))
+    finally:
+        await fetcher.aclose()
+    assert doc.doc_id == doc_id_for_url("lector.example/novela/x/")
+    assert doc.work_prefix == HOST + PREFIX

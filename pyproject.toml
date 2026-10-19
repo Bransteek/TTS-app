@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+qt_api = "pyside6"
+pythonpath = ["."]
+filterwarnings = [
+    # Avisos de importación de los enlaces SWIG de PyMuPDF (no son de este código).
+    "ignore:builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__ attribute:DeprecationWarning",
+]

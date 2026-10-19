@@ -1,0 +1,61 @@
+"""Selección automática del adaptador de contenido según la entrada."""
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from lector.content.base import ContentSource
+from lector.content.epub_source import EpubSource
+from lector.content.generic_web import GenericWebSource, prefix_override_for
+from lector.content.madara import MadaraSource, is_madara
+from lector.content.pdf_source import PdfSource
+from lector.errors import DamagedDocument
+from lector.models import Chapter, Document
+from lector.security.http_client import SafeFetcher
+from lector.security.url_validator import validate_url
+
+
+_HAS_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+_MISSING_FILE = "No se encontró el archivo. Comprueba que sigue en su sitio."
+
+
+def _require_file(locator: str) -> None:
+    if not Path(locator).expanduser().is_file():
+        raise DamagedDocument(_MISSING_FILE)
+
+
+async def open_source(
+    locator: str, fetcher: SafeFetcher, *, prefix_overrides: Mapping[str, Any] | None = None
+) -> tuple[ContentSource, Document, Chapter]:
+    """Abre `locator` con el adaptador que le toca.
+
+    `prefix_overrides` ({host: ["/ruta/", …]}) son los prefijos de obra corregidos por
+    el usuario para webs genéricas (§5.2): se aplica el que contiene la URL (la escrita o
+    la final tras redirecciones). Madara, PDF y EPUB los ignoran.
+    """
+    lowered = locator.strip().lower()
+    source: ContentSource
+    is_url = bool(_HAS_SCHEME.match(lowered))
+    if not is_url and lowered.endswith(".pdf"):
+        _require_file(locator.strip())
+        source = PdfSource()
+        document, chapter = await source.open(locator.strip())
+    elif not is_url and lowered.endswith(".epub"):
+        _require_file(locator.strip())
+        source = EpubSource()
+        document, chapter = await source.open(locator.strip())
+    else:
+        url = validate_url(locator)
+        result = await fetcher.get(url)
+        if is_madara(result.text):
+            source = MadaraSource(fetcher)
+        else:
+            # Tras una redirección vale la URL escrita o la final, la que esté bajo un
+            # prefijo guardado (el más largo si lo están las dos).
+            found = [prefix_override_for(prefix_overrides, u) for u in (url, result.url)]
+            override = max((p for p in found if p), key=len, default=None)
+            source = GenericWebSource(fetcher, work_prefix_override=override)
+        document, chapter = await source.open(result.url, prefetched_html=result.text)
+    return source, document, chapter

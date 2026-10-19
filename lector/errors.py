@@ -1,0 +1,169 @@
+"""Jerarquía de errores con mensajes en español para el usuario."""
+from __future__ import annotations
+
+from .models import ChapterRef
+
+
+class LectorError(Exception):
+    user_message: str = "Ocurrió un problema inesperado."
+    recoverable: bool = False
+
+    def __init__(self, message: str | None = None, *, recoverable: bool | None = None):
+        if message is not None:
+            self.user_message = message
+        if recoverable is not None:
+            self.recoverable = recoverable
+        super().__init__(self.user_message)
+
+
+class InvalidUrl(LectorError):
+    user_message = "La dirección no es válida. Revisa que empiece por http:// o https://."
+
+
+class PageUnreachable(LectorError):
+    user_message = "No se pudo abrir la página. Revisa tu conexión a internet."
+    recoverable = True
+
+
+class NoExtractableText(LectorError):
+    user_message = "No se encontró texto para leer en esta página."
+
+
+class ChapterLoopDetected(LectorError):
+    user_message = "Se detectó un ciclo de capítulos y se detuvo la lectura."
+
+
+class AmbiguousNextChapter(LectorError):
+    user_message = "Hay varios capítulos posibles como siguiente. Elige uno."
+
+    def __init__(self, candidates: list[ChapterRef], message: str | None = None, *, recoverable: bool | None = None):
+        super().__init__(message, recoverable=recoverable)
+        self.candidates = candidates
+
+
+class DamagedDocument(LectorError):
+    user_message = "El archivo está dañado y no se puede abrir."
+
+
+class ScannedPdf(LectorError):
+    user_message = "Este PDF parece ser una imagen escaneada y no contiene texto que leer."
+
+
+class EdgeUnavailable(LectorError):
+    user_message = "La voz en línea no está disponible por ahora."
+    recoverable = True
+
+
+class EdgeVoiceNotFound(LectorError):
+    user_message = "No se encontró la voz en línea elegida."
+
+
+class PiperModelMissing(LectorError):
+    user_message = "Falta la voz sin conexión. Descárgala desde la configuración."
+
+
+class SynthesisFailed(LectorError):
+    user_message = "No se pudo convertir el texto en voz. Se reintentará."
+    recoverable = True
+
+
+class AudioOutputError(LectorError):
+    user_message = "Hay un problema con la salida de audio. Revisa tus altavoces o auriculares."
+    recoverable = True
+
+
+class ResourceExhausted(LectorError):
+    user_message = "El contenido es demasiado grande para procesarlo."
+
+
+class DatabaseLocked(LectorError):
+    user_message = "La base de datos está ocupada. Inténtalo de nuevo en unos segundos."
+    recoverable = True
+
+
+class DatabaseCorrupt(LectorError):
+    user_message = "Los datos guardados están dañados."
+
+
+class FileMovedOrChanged(LectorError):
+    user_message = (
+        'No se encuentra el archivo o ha cambiado. Pulsa "Buscar el archivo…" o ábrelo otra vez '
+        'con "Abrir PDF/EPUB"; tu progreso se conserva.'
+    )
+
+    def __init__(self, doc_id: str, message: str | None = None, *, recoverable: bool | None = None):
+        super().__init__(message, recoverable=recoverable)
+        self.doc_id = doc_id
+
+
+# --- Revisión final: red y contenido ---------------------------------------------------
+
+
+class ServerBusy(PageUnreachable):
+    """El servidor pide esperar (408, 425, 429 o 5xx): se reintenta.
+
+    `retry_after`: segundos que indicó la cabecera Retry-After, o None.
+    """
+
+    user_message = "La página no responde ahora mismo. Se volverá a intentar."
+    recoverable = True
+
+    def __init__(
+        self, retry_after: float | None = None, message: str | None = None, *,
+        recoverable: bool | None = None,
+    ):
+        super().__init__(message, recoverable=recoverable)
+        self.retry_after = retry_after
+
+
+class PageIncomplete(PageUnreachable):
+    """La página de un capítulo llegó sin su texto: vacía, ilegible o sin el bloque esperado.
+
+    Puede ser pasajero (un aviso del servidor, una respuesta cortada), así que el
+    navegador lo reintenta durante `RETRY_BUDGET_S` segundos de espera en total y
+    después lanza `final`, el error definitivo (no recuperable).
+    """
+
+    recoverable = True
+    RETRY_BUDGET_S = 60.0
+
+    def __init__(self, final: LectorError | None = None, *, recoverable: bool | None = None):
+        final = final if final is not None else NoExtractableText()
+        super().__init__(final.user_message, recoverable=recoverable)
+        self.final = final
+
+
+class DocumentTooLarge(LectorError):
+    """Un PDF o EPUB supera los límites de tamaño o de páginas (protege la memoria)."""
+
+    user_message = "El archivo es demasiado grande para abrirlo."
+
+
+class EdgeNoAudio(LectorError):
+    """Edge respondió sin audio para este fragmento (p. ej. «***»): es el texto, no la red."""
+
+    user_message = "La voz en línea no pudo leer este fragmento; se salta."
+    recoverable = True
+
+
+# Aviso (una sola vez) cuando la voz de Edge elegida no existe (§5.5).
+EDGE_VOICE_MISSING = (
+    "No se encontró la voz en línea elegida. Elige otra en la configuración; "
+    "mientras tanto se lee con la voz sin conexión."
+)
+
+
+# La salida de audio no volvió tras unos 2 minutos de reintentos: la lectura queda en pausa.
+AUDIO_OUTPUT_LOST = (
+    "No se pudo recuperar la salida de audio y la lectura quedó en pausa. Revisa tus "
+    "altavoces o auriculares y pulsa «Reanudar»."
+)
+
+
+class EdgeVoiceUnavailable(LectorError):
+    """La voz de Edge no existe (o se retiró) y no hay voz local: la lectura se pausa."""
+
+    user_message = (
+        "La voz en línea elegida no está disponible. Elige otra voz en Configuración "
+        "o instala una voz local."
+    )
