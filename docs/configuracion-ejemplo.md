@@ -1,8 +1,7 @@
 # Ajustes de ejemplo
 
 Estos son todos los ajustes del programa con su **valor por defecto**. Los valores por defecto sirven bien: solo cambia algo si tienes un motivo.
-<!-- revisar tras T18/T19 -->
-Los ajustes se cambian desde la ventana de configuración. Los que no aparezcan allí se guardan en la base de datos del programa y tienen estos valores mientras no los cambies.
+Los ajustes de voz, idioma, velocidad, tamaño de fragmentos, reintentos de Edge, lectura continua, resaltado y guardado del texto se cambian desde «Configuración…». La voz de respaldo se elige en la pestaña «Voces locales (Piper)», y la voz preferida (Edge o Piper) en el indicador de motor de la ventana principal. Los que no aparezcan allí (por ejemplo `edge_backoff_s`, `wait_max_s`, `prefetch_ahead`, `queue_ahead_chunks`, `queue_max_seconds`, `http_max_bytes`, `http_max_redirects` y `work_prefix_overrides`) se guardan en la base de datos del programa y tienen estos valores mientras no los cambies.
 
 ## Voz y velocidad
 
@@ -54,7 +53,6 @@ El texto se manda a la voz en trozos pequeños.
 | `continuous` | `true` | Pasa solo al capítulo siguiente al terminar. |
 | `store_text` | `true` | Guarda el texto leído para poder retomar y mostrar el historial. |
 | `first_run_done` | `false` | Indica si ya se mostró el aviso de primera vez (voz de respaldo). Se pone en `true` solo. |
-<!-- revisar tras T18/T19 -->
 
 ## Descargas de páginas web
 
@@ -68,3 +66,6 @@ El texto se manda a la voz en trozos pequeños.
 
 - Windows: `%APPDATA%\LectorTTS\`
 - macOS: `~/Library/Application Support/LectorTTS/`
+- Otra carpeta, si defines la variable de entorno `LECTOR_DATA_DIR`.
+
+Ahí también está el registro de errores, `lector.log`.

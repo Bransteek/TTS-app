@@ -36,7 +36,6 @@ Lo más importante para este programa es que **la lectura no se corte**.
    .venv\Scripts\python main.py
    ```
 
-<!-- revisar tras T18/T19 -->
 Aún no se ha podido comprobar la instalación en Windows (ver «Limitaciones reales»).
 
 ## Instalación en macOS
@@ -76,8 +75,7 @@ Piper funciona en tu propio equipo. Nada de lo que lee sale de él. Necesita un 
 | `es_MX-ald-medium` (México, masculina) | 63 MB |
 | `es_ES-davefx-medium` (España, masculina) | 63 MB |
 
-**Instalar una voz desde la app:** en la primera apertura, si no hay ninguna voz local, la ventana te ofrece descargar la de respaldo. También se pueden descargar desde la configuración.
-<!-- revisar tras T18/T19 -->
+**Instalar una voz desde la app:** en la primera apertura, si no hay ninguna voz local, arriba de la ventana aparece un aviso que ofrece descargar la voz de respaldo (unos 76 MB), con los botones «Descargar» y «Ahora no». También puedes descargar cualquiera de las voces en «Configuración…», en la pestaña «Voces locales (Piper)»: elige la voz, pulsa «Descargar», y con «Usar» la dejas como voz de respaldo. «Escuchar muestra» te deja oírla antes.
 
 **Instalar una voz a mano:** descarga los dos archivos de la voz (`NOMBRE.onnx` y `NOMBRE.onnx.json`) desde <https://huggingface.co/rhasspy/piper-voices> y ponlos juntos en la carpeta de modelos:
 
@@ -89,10 +87,12 @@ Piper funciona en tu propio equipo. Nada de lo que lee sale de él. Necesita un 
 ## Uso
 
 1. Abre el programa.
-2. Pega la dirección de un capítulo, o abre un EPUB o un PDF.
-3. Antes de leer, la ventana te muestra el título, el capítulo detectado y los primeros párrafos. Pulsa para leer.
+2. Pega la dirección de un capítulo, o pulsa «Abrir PDF/EPUB…» para elegir un archivo.
+3. Antes de leer, la ventana te muestra el título, el capítulo detectado y los primeros párrafos. Pulsa «Leer».
 4. Puedes pausar, cambiar la velocidad, saltar de frase o de capítulo. La frase que suena se resalta.
-5. Si ya habías leído ese documento, te pregunta si quieres continuar donde lo dejaste, empezar de nuevo o elegir capítulo o página.
+5. Si ya habías leído ese documento, te pregunta si quieres «Continuar desde donde lo dejé», «Empezar desde el principio» o «Elegir capítulo o página».
+6. Si moviste o renombraste un PDF o EPUB que ya habías leído, el programa te ofrece «Buscar el archivo…»: lo eliges de nuevo y se conserva el progreso.
+7. Solo se abre una copia del programa. Si lo abres otra vez (por ejemplo, con el acceso directo), se trae al frente la ventana que ya estaba abierta.
 
 ### En la bandeja del sistema
 
@@ -100,7 +100,7 @@ Al cerrar o minimizar la ventana, el programa **sigue leyendo** desde la bandeja
 
 Con clic derecho en el icono tienes:
 
-- Pausar / Reanudar
+- Pausar / Reanudar (el mismo elemento cambia de nombre)
 - Frase siguiente
 - Capítulo siguiente
 - Detener
@@ -125,7 +125,7 @@ El programa guarda **lo que ya has oído**, no lo que ya está preparado. Esto i
 
 ## Configuración
 
-Los ajustes (velocidad, voz, tamaños de fragmento, tiempos de reintento, etc.) se cambian desde la ventana de configuración. <!-- revisar tras T18/T19 -->
+Los ajustes (velocidad, voz, tamaños de fragmento, tiempos de reintento, etc.) se cambian desde «Configuración…» (menú de la ventana principal). Tiene cuatro pestañas: «Voces», «Voces locales (Piper)», «Lectura» y «Privacidad». No hay botón «Guardar»: cada cambio se guarda solo. Los reintentos de Edge, la espera máxima de Edge, cuándo volver a probar Edge y el tiempo mínimo con Piper solo se aplican al volver a abrir el programa.
 
 La lista completa de ajustes, con su valor por defecto y lo que hace cada uno, está en [docs/configuracion-ejemplo.md](docs/configuracion-ejemplo.md).
 
@@ -133,6 +133,8 @@ Tus datos (progreso, historial y ajustes) están en:
 
 - Windows: `%APPDATA%\LectorTTS\`
 - macOS: `~/Library/Application Support/LectorTTS/`
+
+Si defines la variable de entorno `LECTOR_DATA_DIR`, el programa usa esa carpeta en su lugar.
 
 ## Problemas frecuentes
 
@@ -152,10 +154,10 @@ Si el PDF es una foto de las páginas, no tiene texto que leer y el programa te 
 Si una web rediseña sus páginas, el programa puede no entender la estructura. Prueba abrir otro capítulo; si tampoco funciona, el lector de ese sitio necesita una actualización.
 
 **La base de datos está dañada.**
-Si el programa no arranca o no recuerda tu progreso, cierra el programa y renombra el archivo `lector.db` de la carpeta de datos (por ejemplo a `lector.db.viejo`). Al abrir de nuevo se crea uno limpio. Perderás el historial y los ajustes, pero no tus voces descargadas.
+Si el programa no arranca o no recuerda tu progreso, cierra el programa y mira el log (ver más abajo). Normalmente no tienes que hacer nada: si el programa detecta que la base de datos está dañada, la aparta solo como copia (`lector.db.corrupt-FECHA` en la carpeta de datos), crea una nueva y te avisa. Perderás el historial y los ajustes, pero no tus voces descargadas. Si no se puede ni abrir la base, puedes seguir leyendo, pero esa vez no se guarda el progreso.
 
 **¿Dónde está el log?**
-El programa guarda un registro de errores (un archivo `.log` que se va rotando) para poder investigar fallos. <!-- revisar tras T18/T19 --> Se espera en la carpeta de datos, pero el nombre exacto se confirmará cuando exista `main.py`.
+El programa guarda un registro en `lector.log`, dentro de la carpeta de datos (ver «Configuración»). Cuando pesa 2 MB pasa a un archivo de respaldo; se conservan 3 respaldos (`lector.log.1`, `.2` y `.3`). Si algo falla, ahí está la explicación.
 
 ## Limitaciones reales
 
