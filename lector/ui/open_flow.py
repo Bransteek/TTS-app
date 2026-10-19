@@ -340,6 +340,40 @@ class OpenFlowMixin:
         self._play(self._session_doc, None)
         return True
 
+    def _jump_to_chapter(self, index: int) -> None:
+        """El usuario eligió el capítulo `index` en el desplegable: lee desde su principio.
+
+        El controlador decide según la sesión (en pausa sigue en pausa; detenida, empieza a
+        leer). Con un play() o una apertura en vuelo, o si la lista era de otra lectura, no
+        se manda nada y el desplegable vuelve al capítulo que suena.
+        """
+        picker = self.chapter_picker
+        doc_id = self._session_doc
+        if doc_id is None or picker.doc_id != doc_id:
+            log.info("Se ignora un capítulo elegido de otra lectura")
+            picker.show_current()
+            return
+        if self._opening or self._play_pending:
+            busy = "se está abriendo otra dirección" if self._opening else "ya se está empezando a leer"
+            log.info("Se ignora el capítulo %s elegido: %s", index, busy)
+            picker.show_current()
+            return
+        if self._state not in PLAYING_STATES and self._state is not SessionState.PAUSED:
+            # Sin lectura en marcha: si no llega a cargar, «Leer» vuelve a este capítulo.
+            self._pending_start = (doc_id, _chapter_start(index, picker.chapters[index]))
+        self._clear_choice()  # una elección de «siguiente» pendiente ya no vale
+
+        def done(jumped: bool) -> None:
+            self._play_pending = False
+            if not jumped:
+                picker.show_current()
+
+        def failed(exc: BaseException) -> None:
+            done(False)
+            self._on_error(exc)
+
+        self._play_pending = self._run(self._ctl.go_to_chapter(index), done, failed)
+
     # --- reanudación y presencia del usuario ----------------------------------------------------
 
     def user_present(self) -> bool:

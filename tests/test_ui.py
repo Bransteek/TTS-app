@@ -12,7 +12,8 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from lector.content.base import doc_id_for_url
@@ -109,6 +110,8 @@ class FakeController:
         self.play_error: BaseException | None = None
         self.play_gate: threading.Event | None = None  # si se da, play() espera a que se abra
         self.page_position: Position | None = None
+        self.jump_gate: threading.Event | None = None  # si se da, go_to_chapter() espera
+        self.jump_result = True
 
     def _record(self, *call) -> None:
         self.threads.add(threading.current_thread())
@@ -133,6 +136,12 @@ class FakeController:
     async def locate_page(self, doc_id, page):
         self._record("locate_page", doc_id, page)
         return self.page_position
+
+    async def go_to_chapter(self, index):
+        self._record("go_to_chapter", index)
+        if self.jump_gate is not None:
+            await asyncio.to_thread(self.jump_gate.wait, 2)
+        return self.jump_result
 
 
 def _recorder(name: str):
@@ -1975,3 +1984,354 @@ def test_resume_dialog_not_repeated_nor_shown_during_own_dialog(qtbot, make_wind
     QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))
     qtbot.wait(50)
     assert window.resume_dialog is first and ctl.calls == []
+
+
+# --- desplegable «Capítulo:» ------------------------------------------------------------------
+
+
+def numbered_chapters(count: int, title=lambda n: f"Capítulo {n}") -> list[ChapterRef]:
+    return [ChapterRef(n - 1, title(n), f"https://example.com/novela/capitulo-{n}/")
+            for n in range(1, count + 1)]
+
+
+def picker_items(window: MainWindow) -> list[str]:
+    picker = window.chapter_picker
+    return [picker.itemText(i) for i in range(picker.count())]
+
+
+def jumps(ctl: FakeController) -> list[tuple]:
+    return [c for c in ctl.calls if c[0] in ("go_to_chapter", "play")]
+
+
+def reading_session(window: MainWindow, doc: Document | None = None, locator: str = URL,
+                    title: str = "Capítulo 1", state: str = "reading") -> None:
+    """La lectura ya va por `locator`: así lo cuenta el controlador a la ventana."""
+    window.test_bridge.session_state_sig.emit(state)
+    window.test_bridge.document_sig.emit(doc or make_doc(), make_chapter(locator, title))
+
+
+def type_in_picker(qtbot, window: MainWindow, text: str, *, enter: bool = True) -> None:
+    """Escribe en el desplegable; Intro va adonde iría de verdad (las sugerencias, si se ven)."""
+    edit = window.chapter_picker.lineEdit()
+    edit.setFocus()
+    qtbot.waitUntil(edit.hasFocus, timeout=WAIT_MS)
+    edit.selectAll()
+    if text.isascii():
+        qtbot.keyClicks(edit, text)
+    else:  # QTest solo sabe teclear ASCII
+        edit.insert(text)
+    if enter:
+        popup = window.chapter_picker.completer().popup()
+        qtbot.keyClick(popup if popup.isVisible() else edit, Qt.Key.Key_Return)
+        activate(qtbot, window)  # offscreen no devuelve el foco al cerrar las sugerencias
+
+
+def leave_picker(qtbot, window: MainWindow) -> None:
+    """El usuario hace clic fuera: se cierra la lista de sugerencias y el foco va a otro sitio."""
+    window.chapter_picker.completer().popup().hide()
+    activate(qtbot, window)
+    window.url_edit.setFocus()
+    qtbot.waitUntil(window.url_edit.hasFocus, timeout=WAIT_MS)
+
+
+def test_chapter_dropdown_lists_the_document_chapters(qtbot, make_window):
+    window = make_window(show=True)
+    picker = window.chapter_picker
+    assert window.chapter_picker_label.text() == "Capítulo:"
+    assert window.chapter_picker_label.buddy() is picker
+    assert not picker.isEnabled()  # aún no hay nada abierto
+
+    reading_session(window, locator=URL2, title="Capítulo 2")
+
+    assert picker_items(window) == ["Capítulo 1", "Capítulo 2", "Capítulo 3"]
+    assert picker.currentIndex() == 1 and picker.currentText() == "Capítulo 2"
+    assert picker.isEnabled() and picker.isEditable()
+
+
+def test_chapter_dropdown_numbers_chapters_without_title(qtbot, make_window):
+    window = make_window()
+    doc = make_doc(numbered_chapters(3, title=lambda n: "  " if n == 2 else ""))
+    reading_session(window, doc)
+    assert picker_items(window) == ["Capítulo 1", "Capítulo 2", "Capítulo 3"]
+
+
+def test_chapter_dropdown_lists_pdf_sections(qtbot, make_window):
+    window = make_window()
+    doc = pdf_doc()
+    window.test_bridge.document_sig.emit(doc, make_chapter("pages:5-9", "Dos"))
+    assert picker_items(window) == ["Uno", "Dos"]
+    assert window.chapter_picker.currentIndex() == 1
+
+
+def test_chapter_dropdown_follows_reading_without_jumping(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+
+    reading_session(window, locator=URL2, title="Capítulo 2")  # pasó solo al siguiente
+    assert picker.currentIndex() == 1
+    reading_session(window, locator=URL3, title="Capítulo 3", state="paused")
+    assert picker.currentIndex() == 2 and picker.currentText() == "Capítulo 3"
+    qtbot.wait(100)
+    assert jumps(ctl) == []
+
+
+def test_chapter_dropdown_shows_title_of_a_chapter_outside_the_list(qtbot, make_window, ctl):
+    window = make_window()
+    extra = make_chapter("https://example.com/novela/extra/", "Capítulo extra")
+    extra.ref = ChapterRef(None, "Capítulo extra", extra.ref.locator)
+    window.test_bridge.document_sig.emit(make_doc(), extra)
+    picker = window.chapter_picker
+    assert picker.currentIndex() == -1 and picker.currentText() == "Capítulo extra"
+    assert picker_items(window) == ["Capítulo 1", "Capítulo 2", "Capítulo 3"]
+
+
+def test_chapter_dropdown_finds_the_current_chapter_by_its_number(qtbot, make_window):
+    """La web dio otra dirección para el mismo capítulo (sin «/» final, otra variante)."""
+    window = make_window()
+    chapter = make_chapter("https://example.com/novela/capitulo-2", "Capítulo 2")
+    window.test_bridge.document_sig.emit(make_doc(), chapter)
+    assert window.chapter_picker.currentIndex() == 1
+    chapter = make_chapter("https://example.com/novela/capitulo-3/?estilo=lista", "Capítulo 3")
+    chapter.ref = ChapterRef(2, "Capítulo 3", chapter.ref.locator)
+    window.test_bridge.document_sig.emit(make_doc(), chapter)
+    assert window.chapter_picker.currentIndex() == 2
+
+
+def test_wheel_and_arrow_keys_never_jump(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+    picker.setFocus()
+    qtbot.waitUntil(picker.hasFocus, timeout=WAIT_MS)
+
+    for _ in range(3):
+        wheel = QWheelEvent(QPointF(5, 5), QPointF(picker.mapToGlobal(QPoint(5, 5))), QPoint(),
+                            QPoint(0, -120), Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(picker, wheel)
+    qtbot.keyClick(picker.lineEdit(), Qt.Key.Key_Down)  # abre la lista, no cambia de capítulo
+
+    assert picker.view().isVisible()
+    picker.hidePopup()
+    qtbot.wait(100)
+    assert picker.currentIndex() == 0 and jumps(ctl) == []
+
+
+def test_chapter_dropdown_refreshes_when_the_list_grows(qtbot, make_window):
+    window = make_window()
+    reading_session(window, make_doc(numbered_chapters(3)))
+    reading_session(window, make_doc(numbered_chapters(5)))  # se publicaron capítulos nuevos
+    assert picker_items(window)[-1] == "Capítulo 5" and window.chapter_picker.count() == 5
+
+
+@pytest.mark.parametrize("state", ["reading", "paused", "stopped", "completed", "error", "idle"])
+def test_picking_a_chapter_jumps_to_it(qtbot, make_window, ctl, state):
+    window = make_window(show=True)
+    reading_session(window, state=state)
+
+    window.chapter_picker.activated.emit(2)  # el usuario elige «Capítulo 3»
+
+    assert wait_call(qtbot, ctl, "go_to_chapter") == ("go_to_chapter", 2)
+    qtbot.wait(50)
+    assert jumps(ctl) == [("go_to_chapter", 2)]
+    # Sin lectura en marcha, un reintento de «Leer» vuelve al capítulo elegido si no cargó.
+    expected = None if state in ("reading", "paused") else ("doc-1", Position(2, URL3, 0, 0, 0, None))
+    assert window._pending_start == expected
+
+
+def test_double_pick_sends_a_single_jump(qtbot, make_window, ctl):
+    ctl.jump_gate = threading.Event()
+    window = make_window(show=True)
+    reading_session(window)
+    try:
+        window.chapter_picker.activated.emit(1)
+        window.chapter_picker.activated.emit(2)
+        wait_call(qtbot, ctl, "go_to_chapter")
+        qtbot.wait(100)
+        assert jumps(ctl) == [("go_to_chapter", 1)]
+    finally:
+        ctl.jump_gate.set()
+    qtbot.waitUntil(lambda: not window._play_pending, timeout=WAIT_MS)
+
+    window.chapter_picker.activated.emit(2)  # terminado el salto, se puede elegir otro
+    wait_call(qtbot, ctl, "go_to_chapter", 2)
+
+
+def test_pick_ignored_while_reading_is_starting(qtbot, make_window, ctl):
+    ctl.play_gate = threading.Event()
+    window = make_window(show=True)
+    reading_session(window, state="stopped")
+    try:
+        window.controls.play_pause_button.click()  # «Leer» tras detener: play() en vuelo
+        wait_call(qtbot, ctl, "play")
+        window.chapter_picker.activated.emit(2)
+        qtbot.wait(100)
+        assert [c[0] for c in jumps(ctl)] == ["play"]
+        assert window.chapter_picker.currentIndex() == 0  # vuelve al capítulo que suena
+    finally:
+        ctl.play_gate.set()
+
+
+def test_pick_ignored_while_opening(qtbot, make_window, ctl):
+    ctl.open_result = (make_doc(doc_id="otro"), make_chapter(), None)
+    ctl.open_block_s = 0.3
+    window = make_window(show=True)
+    reading_session(window)
+    read(qtbot, window, URL2)
+    window.chapter_picker.activated.emit(2)
+    qtbot.wait(50)
+    assert jumps(ctl) == []
+    qtbot.waitUntil(lambda: not window._opening, timeout=WAIT_MS)
+
+
+def test_pick_from_the_list_of_a_previous_document_is_ignored(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window)
+    ctl.open_result = (make_doc(doc_id="otro"), make_chapter(), None)
+    read(qtbot, window, URL2)
+    wait_call(qtbot, ctl, "play", "otro", None)
+    qtbot.waitUntil(lambda: not window._play_pending, timeout=WAIT_MS)
+
+    window.chapter_picker.activated.emit(2)  # la lista aún es la de doc-1
+
+    qtbot.wait(100)
+    assert [c[0] for c in jumps(ctl)] == ["play"]
+
+
+def test_failed_jump_shows_the_current_chapter_again(qtbot, make_window, ctl):
+    ctl.jump_result = False
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+    picker.setCurrentIndex(2)  # lo que hace Qt al elegir en la lista
+    picker.activated.emit(2)
+    wait_call(qtbot, ctl, "go_to_chapter", 2)
+    qtbot.waitUntil(lambda: picker.currentIndex() == 0, timeout=WAIT_MS)
+    assert picker.currentText() == "Capítulo 1"
+
+
+def test_typing_a_chapter_number_jumps_to_it(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window, make_doc(numbered_chapters(150)))
+    picker = window.chapter_picker
+    completer = picker.completer()
+    assert completer.caseSensitivity() == Qt.CaseSensitivity.CaseInsensitive
+    assert completer.filterMode() == Qt.MatchFlag.MatchContains
+
+    type_in_picker(qtbot, window, "99")
+    assert wait_call(qtbot, ctl, "go_to_chapter") == ("go_to_chapter", 98)
+    assert picker.currentText() == "Capítulo 99"
+    qtbot.waitUntil(lambda: not window._play_pending, timeout=WAIT_MS)
+
+    type_in_picker(qtbot, window, "capitulo 120")  # sin tilde también vale
+    wait_call(qtbot, ctl, "go_to_chapter", 119)
+    qtbot.waitUntil(lambda: not window._play_pending, timeout=WAIT_MS)
+
+    type_in_picker(qtbot, window, "PÍTULO 7")  # sin mayúsculas exactas y a medias
+    wait_call(qtbot, ctl, "go_to_chapter", 6)
+    qtbot.wait(50)
+    assert [c[1] for c in jumps(ctl)] == [98, 119, 6]
+
+
+def test_choosing_a_suggestion_with_the_keyboard_jumps_once(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window, make_doc(numbered_chapters(30)))
+    picker = window.chapter_picker
+    type_in_picker(qtbot, window, "2", enter=False)  # sugiere 2, 12, 20…29
+    popup = picker.completer().popup()
+    assert popup.isVisible()
+    emitted: list[int] = []
+    picker.picked.connect(emitted.append)
+
+    qtbot.keyClick(popup, Qt.Key.Key_Down)
+    qtbot.keyClick(popup, Qt.Key.Key_Down)  # la segunda sugerencia: «Capítulo 12»
+    qtbot.keyClick(popup, Qt.Key.Key_Return)
+
+    assert wait_call(qtbot, ctl, "go_to_chapter") == ("go_to_chapter", 11)
+    qtbot.wait(100)
+    assert emitted == [11]  # una sola elección, aunque Intro llegue también a la línea de texto
+    assert jumps(ctl) == [("go_to_chapter", 11)]
+    assert picker.currentText() == "Capítulo 12"
+
+
+def test_typed_number_means_that_chapter_number(qtbot, make_window):
+    window = make_window()
+    titles = ["Volumen 2: Capítulo 1", "Volumen 2: Capítulo 12", "Volumen 2: Capítulo 2",
+              "Epílogo 3", "Capítulo 120"]
+    doc = make_doc([ChapterRef(i, t, f"https://example.com/novela/c{i}/")
+                    for i, t in enumerate(titles)])
+    reading_session(window, doc)
+    match = window.chapter_picker.match
+
+    assert match("2") == 2  # el capítulo 2, no el volumen 2 ni el 12
+    assert match("12") == 1 and match("012") == 1
+    assert match("3") == 3  # sin la palabra «capítulo», vale el número suelto
+    assert match("20") is None  # 20 no es el 120
+
+
+def test_completer_suggests_chapters_containing_the_typed_text(qtbot, make_window):
+    window = make_window(show=True)
+    reading_session(window, make_doc(numbered_chapters(150)))
+    completer = window.chapter_picker.completer()
+    completer.setCompletionPrefix("99")
+    found = [completer.completionModel().index(i, 0).data()
+             for i in range(completer.completionCount())]
+    assert found == ["Capítulo 99"]
+
+
+def test_typed_text_matching_no_chapter_does_nothing(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window, make_doc(numbered_chapters(20)))
+    picker = window.chapter_picker
+
+    for text in ("zzz", "999", "0"):
+        type_in_picker(qtbot, window, text)
+    qtbot.wait(100)
+    assert jumps(ctl) == []
+
+    leave_picker(qtbot, window)  # al salir del desplegable vuelve el capítulo que suena
+    qtbot.waitUntil(lambda: picker.currentText() == "Capítulo 1", timeout=WAIT_MS)
+    assert picker.currentIndex() == 0 and jumps(ctl) == []
+
+
+def test_typed_text_is_dropped_on_focus_out_without_jumping(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+
+    type_in_picker(qtbot, window, "Capítulo 3", enter=False)
+    leave_picker(qtbot, window)
+
+    qtbot.waitUntil(lambda: picker.currentText() == "Capítulo 1", timeout=WAIT_MS)
+    qtbot.wait(50)
+    assert jumps(ctl) == []
+
+
+def test_reading_moving_on_while_typing_keeps_what_is_typed(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+    type_in_picker(qtbot, window, "Capí", enter=False)
+
+    reading_session(window, locator=URL2, title="Capítulo 2")  # avanza mientras escribe
+
+    assert picker.lineEdit().text() == "Capí"
+    leave_picker(qtbot, window)
+    qtbot.waitUntil(lambda: picker.currentText() == "Capítulo 2", timeout=WAIT_MS)
+    assert jumps(ctl) == []
+
+
+def test_empty_chapter_list_disables_the_dropdown(qtbot, make_window):
+    window = make_window(show=True)
+    reading_session(window)
+    picker = window.chapter_picker
+
+    window.test_bridge.document_sig.emit(generic_doc(), make_chapter(URL, "Un capítulo suelto"))
+
+    assert not picker.isEnabled()
+    assert picker.toolTip() == "Esta web no ofrece la lista de capítulos"
+    assert picker.currentText() == "Un capítulo suelto"
+
+    reading_session(window)  # otra vez un documento con lista
+    assert picker.isEnabled() and picker.toolTip() != "Esta web no ofrece la lista de capítulos"

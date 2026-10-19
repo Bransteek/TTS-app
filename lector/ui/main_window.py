@@ -41,6 +41,7 @@ from lector.services.reading_controller import SessionState
 from lector.services.sample_player import SamplePlayer
 from lector.services.worker import AsyncWorker, QtEventBridge, call_ui
 from lector.tts.piper_engine import PiperModelManager
+from lector.ui.chapter_picker import ChapterPicker
 from lector.ui.history_dialog import HistoryDialog
 from lector.ui.open_flow import PLAYING_STATES, OpenFlowMixin
 from lector.ui.piper_setup import FirstRunBanner, PiperDownloads
@@ -183,6 +184,13 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%v / %m")
 
+        self.chapter_picker = ChapterPicker()
+        self.chapter_picker_label = QLabel("Capítulo:")
+        self.chapter_picker_label.setBuddy(self.chapter_picker)
+        chapter_row = QHBoxLayout()
+        chapter_row.addWidget(self.chapter_picker_label)
+        chapter_row.addWidget(self.chapter_picker, 1)
+
         self.controls = PlaybackControls()
         self.voice = VoicePanel()
 
@@ -200,6 +208,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         layout.addWidget(self.chapter_label)
         layout.addWidget(self.sentence_label)
         layout.addWidget(self.progress_bar)
+        layout.addLayout(chapter_row)
         layout.addWidget(self.controls)
         layout.addWidget(self.voice)
         layout.addStretch(1)
@@ -228,6 +237,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.history_action.triggered.connect(self._show_history)
         self.settings_action.triggered.connect(self.settings_requested.emit)
         self.choice_panel.chosen.connect(self._on_choice_chosen)
+        self.chapter_picker.picked.connect(self._on_chapter_picked)
         app = QApplication.instance()
         if app is not None:
             app.applicationStateChanged.connect(self._on_app_state)
@@ -415,7 +425,13 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
             self._clear_choice()  # los candidatos eran de otro documento o capítulo
         self.doc_title_label.setText(doc.title)
         self.chapter_label.setText(chapter.title)
+        # Cada vez que llega el documento: la lista puede traer capítulos nuevos.
+        self.chapter_picker.set_chapters(doc.doc_id, doc.chapters, chapter.ref, chapter.title)
         self.preview.hide()
+
+    @Slot(int)
+    def _on_chapter_picked(self, index: int) -> None:
+        self._jump_to_chapter(index)
 
     @Slot(str, str, int, int)
     def _on_sentence(self, chapter_title: str, text: str, index: int, total: int) -> None:

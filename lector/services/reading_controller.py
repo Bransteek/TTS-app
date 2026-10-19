@@ -496,6 +496,37 @@ class ReadingController:
         self._chapter_index(previous, hint=self._chapter_index(current) - 1)
         await self._jump(previous, epoch)
 
+    async def go_to_chapter(self, index: int) -> bool:
+        """Salta al principio del capítulo `index` de la lista del documento (el desplegable).
+
+        Como «Capítulo anterior»: en pausa sigue en pausa, ya en el capítulo elegido, y la
+        posición nueva queda guardada. Sin lectura en marcha (detenida) empieza a leerlo.
+        Devuelve False si no saltó: fuera de la lista, sin sesión, o el capítulo no cargó
+        (con aviso).
+        """
+        session = self._session
+        if self._closed or session is None:
+            return False
+        chapters = session.doc.chapters
+        if not 0 <= index < len(chapters):
+            log.warning("Capítulo %s fuera de la lista (%s capítulos)", index, len(chapters))
+            return False
+        ref = chapters[index]
+        if not self._controllable():
+            number = ref.index if ref.index is not None else index
+            await self.play(session.doc.doc_id, Position(number, ref.locator, 0, 0, 0, None))
+            return True
+        epoch = self._epoch
+        try:
+            chapter = await self._navigate(session.nav.get(ref))
+        except LectorError as exc:
+            self._notice("warn", exc.user_message)
+            return False
+        if chapter is _ABORTED:
+            return False
+        self._chapter_index(chapter, hint=index)
+        return await self._jump(chapter, epoch)
+
     async def choose_next(self, ref: ChapterRef) -> None:
         """Sigue por `ref` y lo recuerda como «siguiente» del capítulo actual (§7.4)."""
         if not self._controllable():
@@ -1009,10 +1040,13 @@ class ReadingController:
             if self._controllable():
                 await self._restart_locked(target_fn)
 
-    async def _jump(self, chapter: Chapter, epoch: int) -> None:
+    async def _jump(self, chapter: Chapter, epoch: int) -> bool:
+        """Salta al principio de `chapter` si nada más nuevo lo dejó caduco; True si saltó."""
         async with self._lock:
             if epoch == self._epoch and self._controllable():
                 await self._restart_locked(lambda base: (chapter, 0))
+                return True
+            return False
 
     async def _restart_locked(self, target_fn) -> None:
         """Corta el audio y vuelve a empezar en la frase que devuelve `target_fn(base)`.
@@ -1168,6 +1202,11 @@ class ReadingController:
 
     async def _session_for(self, doc_id: str) -> _Session:
         if self._session is not None and self._session.doc.doc_id == doc_id:
+            if self._preview is not None and self._preview[1].doc_id == doc_id:
+                # Se volvió a abrir: la lista de capítulos puede traer capítulos nuevos. Una
+                # lista vacía (la web no la dio esta vez) no borra la que ya se tenía.
+                fresh, old = self._preview[1], self._session.doc
+                self._session.doc = fresh if fresh.chapters else replace(fresh, chapters=old.chapters)
             return self._session
         first: Chapter | None = None
         if self._preview is not None and self._preview[1].doc_id == doc_id:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -21,9 +22,10 @@ from lector.services.reading_controller import (
 )
 from lector.tts.engine_manager import EngineState
 from tests.controller_rig import (
-    STORY_ID, WAIT_S, Outage, lector_tasks, settle, story_chapter, story_ref, story_rig, until,
+    STORY_ID, WAIT_S, Outage, lector_tasks, settle, story, story_chapter, story_document,
+    story_ref, story_rig, until,
 )
-from tests.fakes import SAMPLES_PER_SENTENCE
+from tests.fakes import SAMPLES_PER_SENTENCE, FakeSource
 from tests.test_madara import WORK, handler, resolver
 
 S = SessionState
@@ -1061,3 +1063,130 @@ async def test_output_that_stalls_again_after_a_restart_is_restarted_again(contr
     rig.out.pull(SAMPLES_PER_SENTENCE)  # la frase 1 otra vez desde su inicio
     await rig.hear(1)
     assert rig.events.heard == [0, 1, 2] and rig.ctl.state is S.READING
+
+
+# --- desplegable de capítulos: saltar al principio de un capítulo de la lista ------------
+
+
+async def test_go_to_chapter_jumps_to_its_start_and_saves(controller_rig):
+    rig = story_rig(controller_rig, chapters=3)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(3)
+
+    jumped = await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S)  # el tercero de la lista
+
+    assert jumped is True
+    record = rig.stored()  # ya guardado al volver
+    assert (record.position.chapter_locator, record.position.chapter_index) == (story_ref(3).locator, 3)
+    assert resume_sentence(record.position) == 0
+    await rig.hear(2)
+    assert rig.events.heard_at[-2:] == [("Cap 3", 0), ("Cap 3", 1)]
+    assert rig.events.documents[-1][1].ref.locator == story_ref(3).locator
+    assert rig.ctl.state is S.READING
+
+
+async def test_go_to_chapter_while_paused_stays_paused(controller_rig):
+    rig = story_rig(controller_rig, chapters=3)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
+    paused_at = len(rig.events.states)
+
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(1), WAIT_S) is True
+    await settle()
+
+    assert rig.ctl.state is S.PAUSED  # elegir capítulo no quita la pausa
+    assert rig.events.states[paused_at:] == []
+    await until(lambda: rig.player.queued_count() > 0)
+    heard = len(rig.events.sentences)
+    rig.out.pull(SAMPLES_PER_SENTENCE)  # en pausa la salida solo da silencio
+    await settle()
+    assert len(rig.events.sentences) == heard
+    assert rig.stored().position.chapter_locator == story_ref(2).locator
+    assert resume_sentence(rig.stored().position) == 0
+    await asyncio.wait_for(rig.ctl.resume(), WAIT_S)
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+
+
+async def test_go_to_chapter_after_stop_starts_reading_it(controller_rig):
+    rig = story_rig(controller_rig, chapters=3)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await rig.stop()
+
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S) is True
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+    assert rig.ctl.state is S.READING
+
+
+async def test_go_to_chapter_after_the_end_starts_reading_it(controller_rig):
+    rig = story_rig(controller_rig, chapters=2, sentences=2)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(4)
+    await until(lambda: rig.ctl.state is S.COMPLETED)
+
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(0), WAIT_S) is True
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 1", 0)
+    assert rig.ctl.state is S.READING
+
+
+@pytest.mark.parametrize("index", [-1, 3, 99])
+async def test_go_to_chapter_outside_the_list_does_nothing(controller_rig, index):
+    rig = story_rig(controller_rig, chapters=3)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(index), WAIT_S) is False
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 1", 2)  # sigue donde iba
+
+
+async def test_go_to_chapter_without_session_does_nothing(controller_rig):
+    rig = story_rig(controller_rig, chapters=3)
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(0), WAIT_S) is False
+    assert rig.ctl.state is S.IDLE
+
+
+async def test_go_to_chapter_that_cannot_load_keeps_reading_and_warns(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.source.failures = [DamagedDocument()]
+
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S) is False
+    await rig.hear(1)
+
+    assert rig.events.notices[-1][0] == "warn"
+    assert rig.events.heard_at[-1] == ("Cap 1", 1)
+
+
+async def test_reopening_the_document_refreshes_its_chapter_list(controller_rig):
+    """La obra publicó capítulos nuevos desde que se abrió: la sesión usa la lista nueva."""
+    content = story(chapters=4)
+    source = FakeSource(content)
+    refs = [c.ref for c in content.values()]
+    published = {"doc": replace(story_document(content), chapters=refs[:3])}
+
+    async def opener(locator, fetcher, **kwargs):
+        return source, published["doc"], source.chapters[locator]
+
+    rig = controller_rig(opener=opener)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    assert len(rig.events.documents[-1][0].chapters) == 3
+    await rig.stop()
+
+    published["doc"] = replace(published["doc"], chapters=refs)  # ya hay un capítulo 4
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+
+    assert rig.events.documents[-1][0].chapters == refs
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(3), WAIT_S) is True
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 4", 0)

@@ -90,9 +90,10 @@ Piper funciona en tu propio equipo. Nada de lo que lee sale de él. Necesita un 
 2. Pega la dirección de un capítulo, o pulsa «Abrir PDF/EPUB…» para elegir un archivo.
 3. Antes de leer, la ventana te muestra el título, el capítulo detectado y los primeros párrafos. Pulsa «Leer».
 4. Puedes pausar, cambiar la velocidad, saltar de frase o de capítulo. La frase que suena se resalta.
-5. Si ya habías leído ese documento, te pregunta si quieres «Continuar desde donde lo dejé», «Empezar desde el principio» o «Elegir capítulo o página».
-6. Si moviste o renombraste un PDF o EPUB que ya habías leído, el programa te ofrece «Buscar el archivo…»: lo eliges de nuevo y se conserva el progreso.
-7. Solo se abre una copia del programa. Si lo abres otra vez (por ejemplo, con el acceso directo), se trae al frente la ventana que ya estaba abierta.
+5. En «Capítulo:» ves el capítulo que suena y puedes elegir otro de la lista, o escribir su número (por ejemplo, «99») y pulsar Intro. La lectura sigue desde el principio de ese capítulo; si estaba en pausa, sigue en pausa. Si la web no ofrece la lista de capítulos, este desplegable aparece desactivado.
+6. Si ya habías leído ese documento, te pregunta si quieres «Continuar desde donde lo dejé», «Empezar desde el principio» o «Elegir capítulo o página».
+7. Si moviste o renombraste un PDF o EPUB que ya habías leído, el programa te ofrece «Buscar el archivo…»: lo eliges de nuevo y se conserva el progreso.
+8. Solo se abre una copia del programa. Si lo abres otra vez (por ejemplo, con el acceso directo), se trae al frente la ventana que ya estaba abierta.
 
 ### En la bandeja del sistema
 
