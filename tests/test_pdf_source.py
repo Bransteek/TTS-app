@@ -158,3 +158,47 @@ async def test_open_reports_pdf_adapter(make_pdf):
     path = make_pdf(pages=[[(prose("Uno"), BODY)]])
     doc, _ = await PdfSource().open(str(path))
     assert doc.adapter == "pdf" and doc.index_page is False
+
+
+# --- Límites de tamaño y de páginas (revisión final, menor 1) ---
+
+
+async def test_file_size_cap(make_pdf, monkeypatch):
+    import lector.content.pdf_source as mod
+    from lector.errors import DocumentTooLarge
+
+    path = make_pdf(pages=[[(prose("Uno"), BODY)]])
+    monkeypatch.setattr(mod, "_MAX_FILE_BYTES", path.stat().st_size - 1)
+    monkeypatch.setattr(mod, "file_doc_id", lambda p: pytest.fail("no debe leer el archivo"))
+    with pytest.raises(DocumentTooLarge) as exc:
+        await PdfSource().open(str(path))
+    assert "demasiado grande" in exc.value.user_message
+    assert exc.value.recoverable is False
+
+
+async def test_page_count_cap(make_pdf, monkeypatch):
+    import lector.content.pdf_source as mod
+    from lector.errors import DocumentTooLarge
+
+    path = make_pdf(pages=[[(prose("Uno"), BODY)], [(prose("Dos"), BODY)], [(prose("Tres"), BODY)]])
+    monkeypatch.setattr(mod, "_MAX_PAGES", 2)
+    with pytest.raises(DocumentTooLarge) as exc:
+        await PdfSource().open(str(path))
+    assert "páginas" in exc.value.user_message
+
+
+async def test_at_the_caps_still_opens(make_pdf, monkeypatch):
+    import lector.content.pdf_source as mod
+
+    path = make_pdf(pages=[[(prose("Uno"), BODY)], [(prose("Dos"), BODY)]])
+    monkeypatch.setattr(mod, "_MAX_FILE_BYTES", path.stat().st_size)
+    monkeypatch.setattr(mod, "_MAX_PAGES", 2)
+    doc, _ = await PdfSource().open(str(path))
+    assert doc.chapters
+
+
+def test_default_caps():
+    import lector.content.pdf_source as mod
+
+    assert mod._MAX_FILE_BYTES == 500 * 1024 * 1024
+    assert mod._MAX_PAGES == 5000

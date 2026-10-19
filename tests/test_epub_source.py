@@ -179,3 +179,66 @@ async def test_open_reports_epub_adapter(make_epub):
     path = make_epub(chapters=[("a.xhtml", para("Primero"))])
     doc, _ = await EpubSource().open(str(path))
     assert doc.adapter == "epub" and doc.index_page is False
+
+
+# --- Texto suelto en <body> (revisión final, menor 5 / T7) ---
+
+
+async def test_text_directly_in_body_is_read(make_epub):
+    path = make_epub(chapters=[("a.xhtml", f"Suelto {LONG}"), ("b.xhtml", para("Dos"))])
+    doc, first = await EpubSource().open(str(path))
+    assert len(doc.chapters) == 2  # no se salta como «ilustración»
+    assert [p.text for p in first.paragraphs] == [f"Suelto {LONG}"]
+
+
+async def test_loose_text_around_blocks_keeps_order(make_epub):
+    body = (
+        f"Antes <em>con</em> énfasis {LONG}<p>Medio {LONG}</p>Después {LONG}<br/>"
+        f"<div>Fuera {LONG}<div>Dentro {LONG}</div>Cola {LONG}</div>"
+        f"<section>Sección {LONG}</section><section>Otra {LONG}</section>"
+    )
+    _, chapter = await EpubSource().open(str(make_epub(chapters=[("a.xhtml", body)])))
+    texts = [p.text for p in chapter.paragraphs]
+    assert [t.split()[0] for t in texts] == [
+        "Antes", "Medio", "Después", "Fuera", "Dentro", "Cola", "Sección", "Otra",
+    ]
+    assert texts[0] == f"Antes con énfasis {LONG}"
+    assert all(t.count(LONG) == 1 for t in texts)  # sin duplicados
+
+
+async def test_loose_body_text_skips_scripts_and_ruby(make_epub):
+    body = f"<script>var x=1;</script><ruby>漢<rt>kan</rt></ruby> {LONG}"
+    _, chapter = await EpubSource().open(str(make_epub(chapters=[("a.xhtml", body)])))
+    assert [p.text for p in chapter.paragraphs] == [f"漢 {LONG}"]
+
+
+# --- Límite total de texto descomprimido (revisión final, menor 1) ---
+
+
+async def test_total_decompressed_text_is_capped(make_epub, monkeypatch):
+    import lector.content.epub_source as mod
+    from lector.errors import DocumentTooLarge
+
+    path = make_epub(chapters=[(f"c{i}.xhtml", para(f"C{i}") * 4) for i in range(20)])
+    monkeypatch.setattr(mod, "_MAX_TOTAL_BYTES", 3000)
+    with pytest.raises(DocumentTooLarge) as exc:
+        await EpubSource().open(str(path))
+    assert "demasiado grande" in exc.value.user_message
+    assert exc.value.recoverable is False
+
+
+async def test_total_cap_ignores_images(make_epub, monkeypatch):
+    import lector.content.epub_source as mod
+
+    path = make_epub(
+        chapters=[("a.xhtml", para("Uno"))], extra={"OEBPS/big.jpg": "x" * 50_000}
+    )
+    monkeypatch.setattr(mod, "_MAX_TOTAL_BYTES", 5000)
+    doc, _ = await EpubSource().open(str(path))
+    assert len(doc.chapters) == 1
+
+
+def test_default_total_cap_is_200_mb():
+    import lector.content.epub_source as mod
+
+    assert mod._MAX_TOTAL_BYTES == 200 * 1024 * 1024

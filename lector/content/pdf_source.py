@@ -12,7 +12,7 @@ import pymupdf
 
 from lector.content.base import ContentSource
 from lector.content.segmenter import build_chapter_text
-from lector.errors import DamagedDocument, ScannedPdf
+from lector.errors import DamagedDocument, DocumentTooLarge, ScannedPdf
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 
 _HEADING = re.compile(
@@ -28,6 +28,10 @@ _REPEAT_RATIO = 0.30
 _SCAN_MIN_CHARS = 20
 _SCAN_MIN_PAGE_RATIO = 0.10
 _WHOLE_DOCUMENT = "Documento completo"
+# Límites (§5.10, el PDF no es de confianza): todo el texto se guarda en memoria.
+# Una novela larga en PDF ronda las 1000 páginas y pocas decenas de MB.
+_MAX_FILE_BYTES = 500 * 1024 * 1024
+_MAX_PAGES = 5000
 
 
 def file_doc_id(path: Path) -> tuple[str, str]:
@@ -77,6 +81,10 @@ def _read_pdf(path: Path) -> _Extracted:
             raise DamagedDocument("El PDF está protegido con contraseña y no se puede abrir.")
         if doc.page_count == 0:
             raise DamagedDocument()
+        if doc.page_count > _MAX_PAGES:
+            raise DocumentTooLarge(
+                f"El PDF tiene demasiadas páginas (más de {_MAX_PAGES}) y no se puede abrir."
+            )
         try:
             pages = [_read_page(page) for page in doc]
             toc = [(t.strip(), p) for lvl, t, p, *_ in doc.get_toc() if lvl == 1 and t.strip()]
@@ -226,6 +234,12 @@ class PdfSource(ContentSource):
     ) -> tuple[Document, Chapter]:
         path = Path(locator).expanduser().resolve()
         try:
+            size = (await asyncio.to_thread(path.stat)).st_size
+            if size > _MAX_FILE_BYTES:
+                raise DocumentTooLarge(
+                    f"El PDF es demasiado grande (más de {_MAX_FILE_BYTES // (1024 * 1024)} MB) "
+                    "y no se puede abrir."
+                )
             doc_id, file_hash = await asyncio.to_thread(file_doc_id, path)
         except OSError as exc:
             raise DamagedDocument() from exc

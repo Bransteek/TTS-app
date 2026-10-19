@@ -171,6 +171,7 @@ El programa guarda un registro en `lector.log`, dentro de la carpeta de datos (v
 - Al cambiar de motor puede haber una pausa de unos segundos.
 - Las marcas de frase de Edge son aproximadas: la frase resaltada puede ir un poco desfasada.
 - No hay OCR: los PDF escaneados no se leen.
+- Límites de tamaño, para no agotar la memoria: un PDF de más de 500 MB o de más de 5000 páginas, o un EPUB cuyo texto descomprimido pase de 200 MB, no se abre y el programa lo avisa. Las imágenes del EPUB no cuentan.
 
 ## Licencias de terceros
 

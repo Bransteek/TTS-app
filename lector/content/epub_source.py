@@ -16,14 +16,25 @@ from lxml import etree
 from lector.content.base import ContentSource
 from lector.content.pdf_source import file_doc_id
 from lector.content.segmenter import build_chapter_text
-from lector.errors import DamagedDocument
+from lector.errors import DamagedDocument, DocumentTooLarge
 from lector.models import Chapter, ChapterRef, Document, SourceKind
 
 _MAX_MEMBER_BYTES = 20 * 1024 * 1024
+# Tope de todo lo que se descomprime de un EPUB (§5.10): solo cuentan los miembros que se
+# leen (XHTML, OPF, índice), nunca las imágenes. Una novela entera ocupa pocos MB de
+# XHTML; 200 MB deja margen de sobra y evita que un archivo hostil agote la memoria.
+_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 _MIN_TEXT_CHARS = 20
 _LOCATOR_PREFIX = "spine:"
 _DROPPED = {"script", "style", "rt", "rp"}
 _BLOCKS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote"}
+# Elementos que separan párrafos: los bloques de texto y la estructura que los contiene.
+# El texto suelto entre ellos (p. ej. directamente en <body>) forma su propio párrafo.
+_BREAKS = _BLOCKS | {
+    "body", "section", "article", "main", "header", "footer", "aside", "nav", "figure",
+    "figcaption", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "ul", "ol", "dl",
+    "dt", "dd", "pre", "hr", "hgroup", "details", "summary",
+}
 _HEADINGS = ("h1", "h2", "h3")
 _CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 _HTML_TYPES = {"application/xhtml+xml", "text/html"}
@@ -48,7 +59,22 @@ def _check_name(name: str) -> None:
         raise DamagedDocument()
 
 
-def _read_member(archive: zipfile.ZipFile, name: str) -> bytes:
+class _Budget:
+    """Bytes descomprimidos que aún se pueden leer de este EPUB."""
+
+    def __init__(self) -> None:
+        self.left = _MAX_TOTAL_BYTES
+
+    def take(self, size: int) -> None:
+        self.left -= size
+        if self.left < 0:
+            raise DocumentTooLarge(
+                f"El EPUB es demasiado grande (su texto ocupa más de "
+                f"{_MAX_TOTAL_BYTES // (1024 * 1024)} MB) y no se puede abrir."
+            )
+
+
+def _read_member(archive: zipfile.ZipFile, name: str, budget: _Budget) -> bytes:
     _check_name(name)
     try:
         info = archive.getinfo(name)
@@ -60,6 +86,7 @@ def _read_member(archive: zipfile.ZipFile, name: str) -> bytes:
         raise DamagedDocument() from exc
     if len(data) > _MAX_MEMBER_BYTES:
         raise DamagedDocument()
+    budget.take(len(data))
     return data
 
 
@@ -85,43 +112,79 @@ def _entity_text(raw: str | None) -> str:
     return chr(code) if code is not None else " "
 
 
-def _own_text(element) -> str:
-    """Texto del elemento sin rt/rp/script/style ni entidades sin resolver."""
-    parts: list[str] = []
+def _text_parts(node, parts: list[str]) -> None:
+    """Añade a `parts` el texto de `node` (sin su cola), sin rt/rp/script/style."""
+    if _local(node) in _DROPPED:
+        return
+    if node.text:
+        parts.append(node.text)
+    for child in node:
+        if isinstance(child.tag, str):
+            if _local(child) == "br":
+                parts.append(" ")
+            _text_parts(child, parts)
+        elif child.tag is etree.Entity:
+            parts.append(_entity_text(child.text))
+        if child.tail:
+            parts.append(child.tail)
 
-    def walk(node) -> None:
-        if _local(node) in _DROPPED:
-            return
-        if node.text:
-            parts.append(node.text)
-        for child in node:
-            if isinstance(child.tag, str):
-                if _local(child) == "br":
-                    parts.append(" ")
-                walk(child)
-            elif child.tag is etree.Entity:
-                parts.append(_entity_text(child.text))
-            if child.tail:
-                parts.append(child.tail)
 
-    walk(element)
+def _clean(parts: list[str]) -> str:
     return re.sub(r"\s+", " ", "".join(parts)).strip()
 
 
+def _own_text(element) -> str:
+    """Texto del elemento sin rt/rp/script/style ni entidades sin resolver."""
+    parts: list[str] = []
+    _text_parts(element, parts)
+    return _clean(parts)
+
+
+def _is_break(node) -> bool:
+    return isinstance(node.tag, str) and _local(node) in _BREAKS
+
+
 def _paragraphs(root) -> list[str]:
-    result = []
-    for element in root.iter():
-        if not isinstance(element.tag, str) or _local(element) not in _BLOCKS:
-            continue
-        nested = any(
-            isinstance(d.tag, str) and _local(d) in _BLOCKS for d in element.iterdescendants()
-        )
-        if nested:
-            continue
-        text = _own_text(element)
-        if text:
-            result.append(text)
+    """Párrafos del <body> en orden: cada bloque final y cada tramo de texto suelto."""
+    body = next(
+        (e for e in root.iter() if isinstance(e.tag, str) and _local(e) == "body"), root
+    )
+    result: list[str] = []
+    _collect(body, result)
     return result
+
+
+def _collect(container, out: list[str]) -> None:
+    """Recorre un contenedor de bloques; el texto entre bloques es un párrafo más."""
+    run: list[str] = []
+
+    def flush() -> None:
+        text = _clean(run)
+        if text:
+            out.append(text)
+        run.clear()
+
+    if container.text:
+        run.append(container.text)
+    for child in container:
+        if isinstance(child.tag, str) and _local(child) not in _DROPPED:
+            if any(_is_break(d) for d in child.iterdescendants()):
+                flush()
+                _collect(child, out)
+            elif _is_break(child):
+                flush()
+                text = _own_text(child)
+                if text:
+                    out.append(text)
+            else:  # en línea (span, em, a, br…): sigue el tramo de texto suelto
+                if _local(child) == "br":
+                    run.append(" ")
+                _text_parts(child, run)
+        elif child.tag is etree.Entity:
+            run.append(_entity_text(child.text))
+        if child.tail:
+            run.append(child.tail)
+    flush()
 
 
 def _first_heading(root) -> str:
@@ -133,12 +196,14 @@ def _first_heading(root) -> str:
     return ""
 
 
-def _toc_titles(archive: zipfile.ZipFile, opf_dir: str, manifest: dict[str, dict]) -> dict[str, str]:
+def _toc_titles(
+    archive: zipfile.ZipFile, opf_dir: str, manifest: dict[str, dict], budget: _Budget
+) -> dict[str, str]:
     """Ruta del miembro -> título, desde nav.xhtml (EPUB 3) o toc.ncx (EPUB 2)."""
     titles: dict[str, str] = {}
     nav = next((m for m in manifest.values() if "nav" in m["properties"].split()), None)
     if nav:
-        root = _parse_xml(_read_member(archive, nav["path"]))
+        root = _parse_xml(_read_member(archive, nav["path"], budget))
         nav_dir = posixpath.dirname(nav["path"])
         navs = [e for e in root.iter() if isinstance(e.tag, str) and _local(e) == "nav"]
         toc = next(
@@ -152,7 +217,7 @@ def _toc_titles(archive: zipfile.ZipFile, opf_dir: str, manifest: dict[str, dict
                     titles.setdefault(_resolve(nav_dir, a.get("href")), text)
     ncx = next((m for m in manifest.values() if m["type"] == _NCX_MIME), None)
     if ncx and not titles:
-        root = _parse_xml(_read_member(archive, ncx["path"]))
+        root = _parse_xml(_read_member(archive, ncx["path"], budget))
         ncx_dir = posixpath.dirname(ncx["path"])
         for point in root.iter():
             if not isinstance(point.tag, str) or _local(point) != "navpoint":
@@ -171,17 +236,18 @@ def _read_epub(path: Path) -> tuple[str, list[_Section]]:
         archive = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as exc:
         raise DamagedDocument() from exc
+    budget = _Budget()
     with archive:
         for name in archive.namelist():
             _check_name(name)
-        container = _parse_xml(_read_member(archive, "META-INF/container.xml"))
+        container = _parse_xml(_read_member(archive, "META-INF/container.xml", budget))
         rootfile = next(
             (e for e in container.iter() if isinstance(e.tag, str) and _local(e) == "rootfile"), None
         )
         if rootfile is None or not rootfile.get("full-path"):
             raise DamagedDocument()
         opf_path = posixpath.normpath(rootfile.get("full-path"))
-        opf = _parse_xml(_read_member(archive, opf_path))
+        opf = _parse_xml(_read_member(archive, opf_path, budget))
         opf_dir = posixpath.dirname(opf_path)
 
         manifest: dict[str, dict] = {}
@@ -203,7 +269,7 @@ def _read_epub(path: Path) -> tuple[str, list[_Section]]:
                 title = _own_text(element)
 
         names = set(archive.namelist())
-        titles = _toc_titles(archive, opf_dir, manifest)
+        titles = _toc_titles(archive, opf_dir, manifest, budget)
         sections: list[_Section] = []
         for idref in spine:
             item = manifest.get(idref)
@@ -213,7 +279,7 @@ def _read_epub(path: Path) -> tuple[str, list[_Section]]:
                 log.warning("EPUB: falta el miembro %s del spine; se omite", item["path"])
                 continue
             try:
-                root = _parse_xml(_read_member(archive, item["path"]))
+                root = _parse_xml(_read_member(archive, item["path"], budget))
             except DamagedDocument:
                 log.warning("EPUB: no se pudo leer %s; se omite", item["path"])
                 continue
