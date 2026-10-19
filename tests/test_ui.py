@@ -1694,3 +1694,172 @@ def test_history_pick_ignores_the_old_chosen_chapter(qtbot, make_window, ctl):
     window._open_from_history(doc, None, None)
 
     assert wait_call(qtbot, ctl, "play") == ("play", "doc-1", None)
+
+
+# --- volver a localizar un archivo movido ------------------------------------------------------
+
+RELOCATE_TEXT = "Buscar el archivo…"
+MISMATCH_TEXT = "Ese archivo no es el mismo documento. Elige el original."
+
+
+class SpyDocuments(DocumentRepo):
+    """DocumentRepo que anota en qué hilo se lee o escribe."""
+
+    def __init__(self, conn):
+        super().__init__(conn)
+        self.threads: set[threading.Thread] = set()
+
+    def get(self, doc_id):
+        self.threads.add(threading.current_thread())
+        return super().get(doc_id)
+
+    def update_origin(self, *args, **kwargs):
+        self.threads.add(threading.current_thread())
+        return super().update_origin(*args, **kwargs)
+
+
+def moved_book(tmp_path, conn):
+    """Un PDF guardado con su hash y la copia nueva, idéntica, en otro sitio."""
+    import dataclasses
+    import hashlib
+
+    data = b"%PDF-1.4 contenido del libro"
+    new = tmp_path / "nuevo" / "libro.pdf"
+    new.parent.mkdir()
+    new.write_bytes(data)
+    doc = dataclasses.replace(pdf_doc(), file_hash=hashlib.sha256(data).hexdigest())
+    spy = SpyDocuments(conn)
+    spy.upsert(doc, "/tmp/viejo/libro.pdf", 1, 1.0)
+    return doc, new, spy
+
+
+def pick_file(monkeypatch, window, paths):
+    """getOpenFileName falso: devuelve cada ruta por turno y anota si iba envuelto."""
+    from lector.ui import open_flow as mw
+
+    inside: list[int] = []
+    queue = list(paths)
+
+    def dialog(*_a, **_k):
+        inside.append(window._own_dialogs)
+        return queue.pop(0), ""
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(dialog))
+    return inside
+
+
+def fail_moved(qtbot, window, ctl):
+    ctl.play_error = FileMovedOrChanged("doc-1")
+    window._play("doc-1", None)
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    qtbot.waitUntil(lambda: window.notice_label.isVisible(), timeout=WAIT_MS)
+    ctl.play_error = None
+    ctl.calls.clear()
+
+
+def test_moved_file_message_says_how_to_fix_it():
+    text = FileMovedOrChanged.user_message
+    assert "Buscar el archivo" in text and "Abrir PDF/EPUB" in text and "progreso" in text
+
+
+def test_moved_file_offers_relocate_button_and_resumes(qtbot, make_window, ctl, conn, tmp_path,
+                                                       monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    inside = pick_file(monkeypatch, window, [str(new)])
+    assert not window.relocate_button.isVisible()
+
+    fail_moved(qtbot, window, ctl)
+    assert window.relocate_button.isVisible() and window.relocate_button.text() == RELOCATE_TEXT
+    window.relocate_button.click()
+
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert inside == [1]  # el diálogo iba dentro de own_native_dialog()
+    assert spy.get("doc-1").origin == str(new)
+    assert not window.relocate_button.isVisible()
+    assert "localizado" in window.notice_label.text()
+
+
+def test_relocate_io_runs_off_the_ui_thread(qtbot, make_window, ctl, conn, tmp_path, monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [str(new)])
+    fail_moved(qtbot, window, ctl)
+    spy.threads.clear()
+
+    window.relocate_button.click()
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+
+    assert spy.threads and threading.main_thread() not in spy.threads
+
+
+def test_relocate_wrong_file_then_retry(qtbot, make_window, ctl, conn, tmp_path, monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    other = tmp_path / "otro.pdf"
+    other.write_bytes(b"otro libro")
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [str(other), str(new)])
+    fail_moved(qtbot, window, ctl)
+
+    window.relocate_button.click()
+    qtbot.waitUntil(lambda: window.notice_label.text() == MISMATCH_TEXT, timeout=WAIT_MS)
+    assert window.relocate_button.isVisible() and window.relocate_button.isEnabled()
+    assert ctl.calls == [] and spy.get("doc-1").origin == "/tmp/viejo/libro.pdf"
+
+    window.relocate_button.click()
+    wait_call(qtbot, ctl, "play", "doc-1", None)
+    assert spy.get("doc-1").origin == str(new)
+
+
+def test_relocate_cancelled_dialog_does_nothing(qtbot, make_window, ctl, conn, tmp_path,
+                                                monkeypatch):
+    doc, new, spy = moved_book(tmp_path, conn)
+    window = make_window(show=True)
+    window._documents = spy
+    pick_file(monkeypatch, window, [""])
+    fail_moved(qtbot, window, ctl)
+
+    window.relocate_button.click()
+
+    qtbot.wait(100)
+    assert ctl.calls == [] and window.relocate_button.isVisible()
+
+
+def test_relocate_offer_waits_until_user_is_present(qtbot, make_window, ctl, monkeypatch):
+    window = make_window(show=True)
+    with monkeypatch.context() as away:
+        away.setattr(window, "isActiveWindow", lambda: False)
+        away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        fail_moved(qtbot, window, ctl)
+        assert not window.relocate_button.isVisible()  # nada sobre el juego
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))  # vuelve
+    assert window.relocate_button.isVisible()
+
+
+def test_relocate_offer_shows_on_next_show(qtbot, make_window, ctl):
+    window = make_window(show=True)
+    fail_moved(qtbot, window, ctl)
+    window.hide()
+    assert not window.relocate_button.isVisible()
+    with qtbot.waitExposed(window):
+        window.show()
+    assert window.relocate_button.isVisible()
+
+
+def test_focusing_window_shows_pending_startup_resume_dialog(qtbot, make_window, ctl,
+                                                             monkeypatch):
+    doc = make_doc()
+    window = make_window(show=True)
+    with monkeypatch.context() as away:
+        away.setattr(window, "isActiveWindow", lambda: False)
+        away.setattr(QApplication, "activeWindow", staticmethod(lambda: None))
+        window.offer_resume(doc, make_progress(doc), auto_continue_when_hidden=False)
+        qtbot.wait(50)
+        assert window.resume_dialog is None
+    QApplication.sendEvent(window, QEvent(QEvent.Type.ActivationChange))  # enfoca la ventana
+    wait_dialog(qtbot, window)
+    qtbot.wait(100)
+    assert ctl.calls == []  # nunca lee solo

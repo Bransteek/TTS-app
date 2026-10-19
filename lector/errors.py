@@ -90,7 +90,10 @@ class DatabaseCorrupt(LectorError):
 
 
 class FileMovedOrChanged(LectorError):
-    user_message = "El archivo cambió de lugar o fue modificado. Búscalo de nuevo."
+    user_message = (
+        'No se encuentra el archivo o ha cambiado. Pulsa "Buscar el archivo…" o ábrelo otra vez '
+        'con "Abrir PDF/EPUB"; tu progreso se conserva.'
+    )
 
     def __init__(self, doc_id: str, message: str | None = None, *, recoverable: bool | None = None):
         super().__init__(message, recoverable=recoverable)

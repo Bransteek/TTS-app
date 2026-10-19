@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from lector.errors import LectorError
+from lector.errors import FileMovedOrChanged, LectorError
 from lector.models import ChapterRef
 from lector.persistence.repositories import (
     ChapterRepo,
@@ -137,6 +137,11 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.notice_label.setFrameShape(QFrame.Shape.StyledPanel)
         self.notice_label.setMargin(6)
         self.notice_label.hide()
+        self.relocate_button = QPushButton("Buscar el archivo…")
+        self.relocate_button.hide()
+        notice_row = QHBoxLayout()
+        notice_row.addWidget(self.notice_label, 1)
+        notice_row.addWidget(self.relocate_button)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("Pega la URL de un capítulo o de la novela")
@@ -187,7 +192,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self._banner_layout = QVBoxLayout()
         self._banner_layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(self._banner_layout)
-        layout.addWidget(self.notice_label)
+        layout.addLayout(notice_row)
         layout.addLayout(input_row)
         layout.addWidget(self.preview)
         layout.addWidget(self.choice_panel)
@@ -219,6 +224,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.read_button.clicked.connect(self._on_read_clicked)
         self.url_edit.returnPressed.connect(self._on_read_clicked)
         self.open_file_button.clicked.connect(self._on_open_file_clicked)
+        self.relocate_button.clicked.connect(self._on_relocate_clicked)
         self.history_action.triggered.connect(self._show_history)
         self.settings_action.triggered.connect(self.settings_requested.emit)
         self.choice_panel.chosen.connect(self._on_choice_chosen)
@@ -338,6 +344,8 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
             return
         if isinstance(exc, LectorError):
             self.show_notice(exc.user_message, "error")
+            if isinstance(exc, FileMovedOrChanged):
+                self._offer_relocate(exc.doc_id)
             return
         log.error("Error inesperado en una orden de la interfaz",
                   exc_info=(type(exc), exc, exc.__traceback__))
@@ -356,6 +364,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         self.notice_label.clear()
         self.notice_label.hide()
         self._notice_level = None
+        self._hide_relocate()
 
     # --- historial --------------------------------------------------------------------------------
 
@@ -456,6 +465,7 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
         if self.pending_choice:
             self._show_choice(self.pending_choice)
         self._resume.window_shown()
+        self._show_relocate_if_present()
 
     def hideEvent(self, event: QHideEvent) -> None:
         super().hideEvent(event)
@@ -468,10 +478,14 @@ class MainWindow(OpenFlowMixin, VoiceStatusMixin, QMainWindow):
                 self._user_left(hidden=True)
             elif self.isVisible():
                 self._resume.window_shown()
+                self._show_relocate_if_present()
         elif event.type() == QEvent.Type.ActivationChange:
             # Igual que la app sin foco: un diálogo propio con el foco no cuenta (user_present).
             if self.isActiveWindow():
                 self._leave_timer.stop()
+                # Lo que esperaba al usuario (oferta de reanudar, «Buscar el archivo…») sale ya.
+                self._resume.window_shown()
+                self._show_relocate_if_present()
             elif self.isVisible():
                 self._leave_timer.start()
 

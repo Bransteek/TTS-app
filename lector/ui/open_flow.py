@@ -12,14 +12,17 @@ import logging
 from collections.abc import Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from lector.content.generic_web import set_prefix_override
+from lector.errors import FileMovedOrChanged
 from lector.models import Chapter, ChapterRef, Document, Position
 from lector.persistence.repositories import ProgressRecord, SettingsRepo
+from lector.services.recovery import relocate_and_store
 from lector.services.reading_controller import SessionState
 from lector.ui.preview_panel import validate_prefix
 from lector.ui.resume_dialog import ResumeChoice, chapter_with_page
@@ -27,6 +30,8 @@ from lector.ui.resume_dialog import ResumeChoice, chapter_with_page
 log = logging.getLogger(__name__)
 
 NOTHING_TO_READ = "Pega la dirección de un capítulo o abre un archivo PDF o EPUB."
+RELOCATE_MISMATCH = "Ese archivo no es el mismo documento. Elige el original."
+RELOCATED_TEXT = "Archivo localizado. Se sigue leyendo donde lo dejaste."
 STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
 LEAVE_CHECK_MS = 300  # la app sin foco tanto tiempo: el usuario se fue (no es un parpadeo)
 PLAYING_STATES = frozenset({SessionState.READING, SessionState.LOADING,
@@ -64,6 +69,7 @@ class OpenFlowMixin:
         self._confirm_after_leer = False  # «Leer» pidió leer y la vista previa espera confirmar
         # Posición elegida (capítulo, «empezar», …) que aún no cargó: un reintento vuelve a ella.
         self._pending_start: tuple[str, Position] | None = None
+        self._relocate_doc: str | None = None  # documento cuyo archivo hay que volver a localizar
         self._own_dialogs = 0  # diálogos nativos propios abiertos (no cuentan como irse)
         self._leave_timer = QTimer(self)
         self._leave_timer.setSingleShot(True)
@@ -111,6 +117,57 @@ class OpenFlowMixin:
         if path:
             self.url_edit.setText(path)
             self._open(path, autoplay=False)
+
+    # --- archivo movido: volver a localizarlo -------------------------------------------------
+
+    def _offer_relocate(self, doc_id: str) -> None:
+        """Ofrece «Buscar el archivo…» (no modal); sin el usuario delante espera a que vuelva."""
+        self._relocate_doc = doc_id
+        self._show_relocate_if_present()
+
+    def _show_relocate_if_present(self) -> None:
+        if self._relocate_doc is not None and self.user_present():
+            self.relocate_button.setEnabled(True)
+            self.relocate_button.show()
+
+    def _hide_relocate(self) -> None:
+        self._relocate_doc = None
+        self.relocate_button.hide()
+
+    def _on_relocate_clicked(self) -> None:
+        doc_id = self._relocate_doc
+        if doc_id is None:
+            return
+        with self.own_native_dialog():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Buscar el archivo", "", "Libros PDF o EPUB (*.pdf *.epub)"
+            )
+        if not path:
+            return
+        self.relocate_button.setEnabled(False)
+        documents = self._documents
+
+        async def relocate():
+            doc = await asyncio.to_thread(documents.get, doc_id)
+            if doc is None:
+                raise LookupError(doc_id)
+            repos = SimpleNamespace(documents=documents)
+            await asyncio.to_thread(relocate_and_store, repos, doc, path)
+
+        def relocated(_result) -> None:
+            self._hide_relocate()
+            self._play(doc_id, None)  # retoma del progreso guardado
+            self.show_notice(RELOCATED_TEXT)
+
+        def failed(exc: BaseException) -> None:
+            self.relocate_button.setEnabled(True)
+            if isinstance(exc, FileMovedOrChanged):
+                self.show_notice(RELOCATE_MISMATCH, "warn")  # puede elegir otro
+            else:
+                self._on_error(exc)
+
+        if not self._run(relocate(), relocated, failed):
+            self.relocate_button.setEnabled(True)
 
     def _open(self, locator: str, autoplay: bool) -> None:
         self._start_open(locator, self._ctl.open(locator), autoplay, confirmed=False)
