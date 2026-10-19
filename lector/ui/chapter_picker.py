@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QModelIndex, QPersistentModelIndex, Qt, Signal
 from PySide6.QtGui import QFocusEvent, QKeyEvent, QWheelEvent
 from PySide6.QtWidgets import QComboBox, QCompleter, QWidget
 
@@ -22,6 +22,7 @@ NO_LIST_TIP = "Esta web no ofrece la lista de capítulos"
 PICK_TIP = "Elige el capítulo que quieres oír. También puedes escribir su número y pulsar Intro."
 _CHAPTER_WORD = r"(?:cap[ií]tulo|cap|chapter|ch|episodio|ep)\.?\s*0*"
 _OPEN_KEYS = (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
+FOLDED_ROLE = Qt.ItemDataRole.UserRole + 1  # el nombre sin mayúsculas ni tildes (sugerencias)
 
 
 def chapter_label(position: int, ref: ChapterRef) -> str:
@@ -39,6 +40,17 @@ def _same_locator(a: str, b: str) -> bool:
     return a.rstrip("/") == b.rstrip("/")
 
 
+class _FoldingCompleter(QCompleter):
+    """Sugerencias sin mayúsculas ni tildes: busca en el nombre plegado (FOLDED_ROLE) y
+    escribe en la línea el nombre tal cual."""
+
+    def splitPath(self, path: str) -> list[str]:
+        return [_fold(path)]
+
+    def pathFromIndex(self, index: QModelIndex | QPersistentModelIndex) -> str:
+        return index.data(Qt.ItemDataRole.DisplayRole) or ""
+
+
 class ChapterPicker(QComboBox):
     picked = Signal(int)  # posición en `chapters`; solo por una acción del usuario
 
@@ -49,6 +61,7 @@ class ChapterPicker(QComboBox):
         self._labels: list[str] = []
         self._current: ChapterRef | None = None  # el capítulo que suena
         self._current_title = ""
+        self._pending: ChapterRef | None = None  # el elegido, mientras el salto está en vuelo
         # Intro sobre una sugerencia llega por dos caminos de Qt (la línea de texto y el
         # autocompletado): la misma elección solo se emite una vez por gesto.
         self._just_picked: int | None = None
@@ -57,7 +70,8 @@ class ChapterPicker(QComboBox):
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.setMinimumContentsLength(24)
         self.setMaxVisibleItems(15)
-        completer = QCompleter(self.model(), self)
+        completer = _FoldingCompleter(self.model(), self)
+        completer.setCompletionRole(FOLDED_ROLE)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
@@ -74,8 +88,21 @@ class ChapterPicker(QComboBox):
     def set_chapters(self, doc_id: str, chapters: list[ChapterRef], current: ChapterRef,
                      title: str) -> None:
         """La lista de `doc_id` y el capítulo que suena; rehace la lista solo si cambió."""
+        if doc_id != self.doc_id:
+            self._pending = None  # lo elegido era de otra lectura
         self.doc_id = doc_id
         self._current, self._current_title = current, title
+        self._fill(chapters)
+
+    def update_chapters(self, doc_id: str, chapters: list[ChapterRef]) -> None:
+        """Lista nueva del mismo documento (se volvió a abrir), sin cambiar el que suena.
+
+        Otro documento, o una lista vacía (la web no la dio esta vez), no cambian nada.
+        """
+        if doc_id == self.doc_id and chapters:
+            self._fill(chapters)
+
+    def _fill(self, chapters: list[ChapterRef]) -> None:
         chapters = list(chapters)
         labels = [chapter_label(i, ref) for i, ref in enumerate(chapters)]
         if chapters != self.chapters or labels != self._labels:
@@ -86,6 +113,8 @@ class ChapterPicker(QComboBox):
             try:
                 self.clear()
                 self.addItems(labels)
+                for i, label in enumerate(labels):
+                    self.setItemData(i, _fold(label), FOLDED_ROLE)
             finally:
                 self.blockSignals(False)
             self.chapters, self._labels = chapters, labels
@@ -99,15 +128,35 @@ class ChapterPicker(QComboBox):
             self.show_current()
 
     def show_current(self) -> None:
-        """Vuelve a mostrar el capítulo que suena (deja lo escrito sin efecto)."""
+        """Vuelve a mostrar el capítulo que suena, o el elegido mientras se cambia a él
+        (deja lo escrito sin efecto)."""
         self._forget_pick()
-        index = self._index_of(self._current)
+        self._show()
+
+    def _show(self) -> None:
+        shown = self._pending or self._current
+        index = self._index_of(shown)
         self.blockSignals(True)
         try:
             self.setCurrentIndex(index)
             self.setEditText(self._labels[index] if index >= 0 else self._current_title)
         finally:
             self.blockSignals(False)
+
+    def begin_pick(self, index: int) -> None:
+        """Se manda el salto a `index`: se sigue viendo ese capítulo hasta que llegue."""
+        self._pending = self.chapters[index]
+        self._show()  # aún dentro del gesto: no olvida la elección (Intro llega dos veces)
+
+    def end_pick(self, jumped: bool) -> None:
+        """Terminó el salto: si se hizo, ya suena el elegido; si no, vuelve el que sonaba."""
+        pending, self._pending = self._pending, None
+        if jumped and pending is not None:
+            index = self._index_of(pending)
+            self._current = pending
+            self._current_title = self._labels[index] if index >= 0 else pending.title
+        if not self._typing():
+            self.show_current()
 
     def _index_of(self, ref: ChapterRef | None) -> int:
         if ref is None:

@@ -1068,12 +1068,18 @@ async def test_output_that_stalls_again_after_a_restart_is_restarted_again(contr
 # --- desplegable de capítulos: saltar al principio de un capítulo de la lista ------------
 
 
+def go_to(rig, chapter: int, index: int | None = None):
+    """Lo que manda el desplegable: documento, dirección del capítulo y su posición en la lista."""
+    position = chapter - 1 if index is None else index
+    return rig.ctl.go_to_chapter(STORY_ID, story_ref(chapter).locator, position)
+
+
 async def test_go_to_chapter_jumps_to_its_start_and_saves(controller_rig):
     rig = story_rig(controller_rig, chapters=3)
     await rig.start(story_ref(1).locator)
     await rig.hear(3)
 
-    jumped = await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S)  # el tercero de la lista
+    jumped = await asyncio.wait_for(go_to(rig, 3), WAIT_S)
 
     assert jumped is True
     record = rig.stored()  # ya guardado al volver
@@ -1092,7 +1098,7 @@ async def test_go_to_chapter_while_paused_stays_paused(controller_rig):
     await asyncio.wait_for(rig.ctl.pause(), WAIT_S)
     paused_at = len(rig.events.states)
 
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(1), WAIT_S) is True
+    assert await asyncio.wait_for(go_to(rig, 2), WAIT_S) is True
     await settle()
 
     assert rig.ctl.state is S.PAUSED  # elegir capítulo no quita la pausa
@@ -1115,7 +1121,7 @@ async def test_go_to_chapter_after_stop_starts_reading_it(controller_rig):
     await rig.hear(2)
     await rig.stop()
 
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S) is True
+    assert await asyncio.wait_for(go_to(rig, 3), WAIT_S) is True
     await rig.hear(1)
 
     assert rig.events.heard_at[-1] == ("Cap 3", 0)
@@ -1128,20 +1134,67 @@ async def test_go_to_chapter_after_the_end_starts_reading_it(controller_rig):
     await rig.hear(4)
     await until(lambda: rig.ctl.state is S.COMPLETED)
 
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(0), WAIT_S) is True
+    assert await asyncio.wait_for(go_to(rig, 1), WAIT_S) is True
     await rig.hear(1)
 
     assert rig.events.heard_at[-1] == ("Cap 1", 0)
     assert rig.ctl.state is S.READING
 
 
-@pytest.mark.parametrize("index", [-1, 3, 99])
-async def test_go_to_chapter_outside_the_list_does_nothing(controller_rig, index):
+async def test_go_to_chapter_after_an_error_starts_reading_it(controller_rig):
+    rig = story_rig(controller_rig, chapters=2)
+    synthesize = rig.manager.synthesize
+
+    async def broken(*args):
+        raise RuntimeError("fallo interno")
+
+    rig.manager.synthesize = broken
+    await rig.start(story_ref(1).locator)
+    await until(lambda: rig.ctl.state is S.ERROR)
+    rig.manager.synthesize = synthesize
+
+    assert await asyncio.wait_for(go_to(rig, 2), WAIT_S) is True
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 2", 0)
+    assert rig.ctl.state is S.READING
+
+
+async def test_go_to_chapter_while_waiting_for_the_network(controller_rig):
+    """Sin red para el capítulo siguiente: elegir uno ya guardado lee sin esperar."""
+    rig = story_rig(controller_rig, chapters=3, sentences=2, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    rig.source.failures = Outage(PageUnreachable())  # el capítulo 2 no llega
+    await rig.hear(2)
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    assert await asyncio.wait_for(go_to(rig, 1), WAIT_S) is True
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 1", 0)  # (luego vuelve a esperar al capítulo 2)
+
+
+async def test_go_to_chapter_follows_the_address_not_the_position(controller_rig):
+    """La lista pudo cambiar (un capítulo insertado): manda la dirección elegida."""
+    rig = story_rig(controller_rig, chapters=3)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+
+    assert await asyncio.wait_for(go_to(rig, 3, index=0), WAIT_S) is True
+    await rig.hear(1)
+
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+    assert rig.stored().position.chapter_index == 3
+
+
+async def test_go_to_chapter_of_another_document_does_nothing(controller_rig):
     rig = story_rig(controller_rig, chapters=3)
     await rig.start(story_ref(1).locator)
     await rig.hear(2)
 
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(index), WAIT_S) is False
+    assert await asyncio.wait_for(
+        rig.ctl.go_to_chapter("otro", story_ref(3).locator, 2), WAIT_S) is False
+    assert await asyncio.wait_for(rig.ctl.go_to_chapter(STORY_ID, "", 2), WAIT_S) is False
     await rig.hear(1)
 
     assert rig.events.heard_at[-1] == ("Cap 1", 2)  # sigue donde iba
@@ -1149,7 +1202,7 @@ async def test_go_to_chapter_outside_the_list_does_nothing(controller_rig, index
 
 async def test_go_to_chapter_without_session_does_nothing(controller_rig):
     rig = story_rig(controller_rig, chapters=3)
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(0), WAIT_S) is False
+    assert await asyncio.wait_for(go_to(rig, 1), WAIT_S) is False
     assert rig.ctl.state is S.IDLE
 
 
@@ -1159,15 +1212,98 @@ async def test_go_to_chapter_that_cannot_load_keeps_reading_and_warns(controller
     await rig.hear(1)
     rig.source.failures = [DamagedDocument()]
 
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(2), WAIT_S) is False
+    assert await asyncio.wait_for(go_to(rig, 3), WAIT_S) is False
     await rig.hear(1)
 
     assert rig.events.notices[-1][0] == "warn"
     assert rig.events.heard_at[-1] == ("Cap 1", 1)
 
 
-async def test_reopening_the_document_refreshes_its_chapter_list(controller_rig):
-    """La obra publicó capítulos nuevos desde que se abrió: la sesión usa la lista nueva."""
+# --- elegir capítulo sin red ----------------------------------------------------------------
+
+
+async def test_pick_during_outage_while_reading_waits_visibly_then_jumps(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=20, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+    rig.source.failures = Outage(PageUnreachable())
+
+    pick = asyncio.create_task(go_to(rig, 3))
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)  # se ve «Esperando conexión…»
+    assert not pick.done()
+    rig.source.failures = []  # vuelve la red
+
+    assert await asyncio.wait_for(pick, WAIT_S) is True
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+    assert rig.ctl.state is S.READING
+
+
+@pytest.mark.parametrize("command", ["stop", "play"])
+async def test_stop_or_play_cancel_a_pick_waiting_for_the_network(controller_rig, command):
+    rig = story_rig(controller_rig, chapters=3, sentences=20, prefetch_ahead=0)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    rig.source.failures = Outage(PageUnreachable())
+    pick = asyncio.create_task(go_to(rig, 3))
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    if command == "stop":
+        await rig.stop()
+    else:
+        await rig.play(STORY_ID)  # «Seguir leyendo» desde la última frase oída
+
+    assert await asyncio.wait_for(pick, WAIT_S) is False
+    if command == "stop":
+        assert rig.ctl.state is S.STOPPED and lector_tasks() == []
+    else:
+        await rig.hear(1)
+        assert rig.events.heard_at[-1][0] == "Cap 1"
+    assert rig.stored().position.chapter_locator == story_ref(1).locator
+
+
+async def completed_after_first_chapter(rig) -> None:
+    await asyncio.wait_for(rig.ctl.set_continuous(False), WAIT_S)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(2)
+    await until(lambda: rig.ctl.state is S.COMPLETED)
+
+
+async def test_pick_during_outage_after_the_end_waits_visibly_then_reads(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=2, prefetch_ahead=0)
+    await completed_after_first_chapter(rig)
+    rig.source.failures = Outage(PageUnreachable())
+
+    # Empieza a leer en el acto: no se queda colgado esperando el capítulo.
+    assert await asyncio.wait_for(go_to(rig, 3), WAIT_S) is True
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+    rig.source.failures = []
+
+    await until(lambda: rig.ctl.state is S.READING)
+    await rig.hear(1)
+    assert rig.events.heard_at[-1] == ("Cap 3", 0)
+
+
+async def test_stop_and_continue_after_a_pick_waiting_for_the_network(controller_rig):
+    rig = story_rig(controller_rig, chapters=3, sentences=2, prefetch_ahead=0)
+    await completed_after_first_chapter(rig)
+    rig.source.failures = Outage(PageUnreachable())
+    assert await asyncio.wait_for(go_to(rig, 3), WAIT_S) is True
+    await until(lambda: rig.ctl.state is S.WAITING_NETWORK)
+
+    await rig.stop()
+
+    assert rig.ctl.state is S.STOPPED and lector_tasks() == []
+    assert rig.stored().position.chapter_locator == story_ref(1).locator  # lo último oído
+    rig.source.failures = []
+    await rig.play(STORY_ID)  # «Seguir leyendo»
+    await until(lambda: rig.ctl.state in (S.READING, S.COMPLETED))
+
+
+# --- la lista de capítulos se renueva al volver a abrir ---------------------------------------
+
+
+def growing_story(controller_rig):
     content = story(chapters=4)
     source = FakeSource(content)
     refs = [c.ref for c in content.values()]
@@ -1176,7 +1312,12 @@ async def test_reopening_the_document_refreshes_its_chapter_list(controller_rig)
     async def opener(locator, fetcher, **kwargs):
         return source, published["doc"], source.chapters[locator]
 
-    rig = controller_rig(opener=opener)
+    return controller_rig(opener=opener), published, refs
+
+
+async def test_reopening_the_document_refreshes_its_chapter_list(controller_rig):
+    """La obra publicó capítulos nuevos desde que se abrió: la sesión usa la lista nueva."""
+    rig, published, refs = growing_story(controller_rig)
     await rig.start(story_ref(1).locator)
     await rig.hear(1)
     assert len(rig.events.documents[-1][0].chapters) == 3
@@ -1187,6 +1328,30 @@ async def test_reopening_the_document_refreshes_its_chapter_list(controller_rig)
     await rig.hear(1)
 
     assert rig.events.documents[-1][0].chapters == refs
-    assert await asyncio.wait_for(rig.ctl.go_to_chapter(3), WAIT_S) is True
+    assert await asyncio.wait_for(go_to(rig, 4), WAIT_S) is True
     await rig.hear(1)
     assert rig.events.heard_at[-1] == ("Cap 4", 0)
+
+
+async def test_reopening_while_reading_refreshes_the_list_at_once(controller_rig):
+    rig, published, refs = growing_story(controller_rig)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+
+    published["doc"] = replace(published["doc"], chapters=refs)
+    await asyncio.wait_for(rig.ctl.open(story_ref(1).locator), WAIT_S)  # sin volver a leer
+    await asyncio.wait_for(rig.ctl.next_chapter(), WAIT_S)
+
+    assert rig.events.documents[-1][0].chapters == refs
+
+
+async def test_reopening_without_a_list_keeps_the_known_one(controller_rig):
+    rig, published, refs = growing_story(controller_rig)
+    await rig.start(story_ref(1).locator)
+    await rig.hear(1)
+
+    published["doc"] = replace(published["doc"], chapters=[])  # esta vez la web no la dio
+    await asyncio.wait_for(rig.ctl.open(story_ref(1).locator), WAIT_S)
+    await asyncio.wait_for(rig.ctl.next_chapter(), WAIT_S)
+
+    assert rig.events.documents[-1][0].chapters == refs[:3]

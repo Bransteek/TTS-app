@@ -232,6 +232,10 @@ def _queued_clip(chunk: Chunk, clip: AudioClip, engine: str) -> QueuedClip | Non
 _PAGES_LOCATOR = re.compile(r"^pages:(\d+)-(\d+)$")
 
 
+def _same_locator(a: str, b: str) -> bool:
+    return a.rstrip("/") == b.rstrip("/")
+
+
 def _page_range_has(locator: str, page: int) -> bool:
     """¿El capítulo de PDF «pages:<inicio>-<fin>» contiene `page`?"""
     match = _PAGES_LOCATOR.match(locator)
@@ -338,6 +342,7 @@ class ReadingController:
         )
         progress = await asyncio.to_thread(self._repos.progress.get, doc.doc_id)
         self._preview = (source, doc, chapter)
+        self._refresh_session_doc(doc)
         log.info("Abierto %s (documento %s, capítulo índice %s)",
                  chapter.ref.locator, doc.doc_id, chapter.ref.index)
         return doc, chapter, progress
@@ -496,25 +501,25 @@ class ReadingController:
         self._chapter_index(previous, hint=self._chapter_index(current) - 1)
         await self._jump(previous, epoch)
 
-    async def go_to_chapter(self, index: int) -> bool:
-        """Salta al principio del capítulo `index` de la lista del documento (el desplegable).
+    async def go_to_chapter(self, doc_id: str, locator: str, index: int | None = None) -> bool:
+        """Salta al principio del capítulo `locator` de `doc_id` (el desplegable).
 
-        Como «Capítulo anterior»: en pausa sigue en pausa, ya en el capítulo elegido, y la
-        posición nueva queda guardada. Sin lectura en marcha (detenida) empieza a leerlo.
-        Devuelve False si no saltó: fuera de la lista, sin sesión, o el capítulo no cargó
-        (con aviso).
+        Manda la dirección: `index` (su posición en la lista que vio el usuario) solo sirve
+        de número de capítulo si la lista de la sesión ya no la tiene. Con lectura en
+        marcha es como «Capítulo anterior»: en pausa sigue en pausa, una espera de red se
+        ve (WAITING_NETWORK) y stop() o play() la cancelan. Sin lectura en marcha
+        (detenida, terminada, con error o esperando una elección) es un play() desde ese
+        capítulo. Devuelve False si no saltó: otro documento, sin sesión, cancelado, o el
+        capítulo no cargó (con aviso).
         """
         session = self._session
-        if self._closed or session is None:
+        if self._closed or session is None or session.doc.doc_id != doc_id or not locator:
             return False
-        chapters = session.doc.chapters
-        if not 0 <= index < len(chapters):
-            log.warning("Capítulo %s fuera de la lista (%s capítulos)", index, len(chapters))
-            return False
-        ref = chapters[index]
-        if not self._controllable():
-            number = ref.index if ref.index is not None else index
-            await self.play(session.doc.doc_id, Position(number, ref.locator, 0, 0, 0, None))
+        ref = next((r for r in session.doc.chapters if _same_locator(r.locator, locator)),
+                   None) or ChapterRef(index, "", locator)
+        number = ref.index if ref.index is not None else index
+        if not self._active:
+            await self.play(doc_id, Position(number or 0, ref.locator, 0, 0, 0, None))
             return True
         epoch = self._epoch
         try:
@@ -524,7 +529,7 @@ class ReadingController:
             return False
         if chapter is _ABORTED:
             return False
-        self._chapter_index(chapter, hint=index)
+        self._chapter_index(chapter, hint=number)
         return await self._jump(chapter, epoch)
 
     async def choose_next(self, ref: ChapterRef) -> None:
@@ -1202,11 +1207,6 @@ class ReadingController:
 
     async def _session_for(self, doc_id: str) -> _Session:
         if self._session is not None and self._session.doc.doc_id == doc_id:
-            if self._preview is not None and self._preview[1].doc_id == doc_id:
-                # Se volvió a abrir: la lista de capítulos puede traer capítulos nuevos. Una
-                # lista vacía (la web no la dio esta vez) no borra la que ya se tenía.
-                fresh, old = self._preview[1], self._session.doc
-                self._session.doc = fresh if fresh.chapters else replace(fresh, chapters=old.chapters)
             return self._session
         first: Chapter | None = None
         if self._preview is not None and self._preview[1].doc_id == doc_id:
@@ -1236,6 +1236,19 @@ class ReadingController:
         self._preview = None
         self._session = _Session(doc, source, nav, first)
         return self._session
+
+    def _refresh_session_doc(self, fresh: Document) -> None:
+        """Se volvió a abrir el documento de la sesión: toma su lista de capítulos nueva.
+
+        Vale aunque se esté leyendo (la lista del desplegable se renueva ya). Una lista
+        vacía (la web no la dio esta vez) no borra la que ya se tenía.
+        """
+        session = self._session
+        if session is None or session.doc.doc_id != fresh.doc_id:
+            return
+        if not fresh.chapters:
+            fresh = replace(fresh, chapters=session.doc.chapters)
+        session.doc = fresh
 
     async def _open_source(self, locator: str):
         """Abre la fuente aplicando el prefijo de obra que el usuario corrigió para ese host."""

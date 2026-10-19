@@ -34,6 +34,10 @@ RELOCATE_MISMATCH = "Ese archivo no es el mismo documento. Elige el original."
 DOCUMENT_GONE = ('Ese documento ya no está en tu historial. Ábrelo otra vez con "Abrir PDF/EPUB".')
 RELOCATED_TEXT = "Archivo localizado. Se sigue leyendo donde lo dejaste."
 STARTED_TEXT = "Se empezó a leer con el prefijo y el capítulo detectados."
+JUMPING_TEXT = "Cambiando a «{title}»…"
+BUSY_JUMPING = "Espera: aún se está cambiando de capítulo."
+BUSY_STARTING = "Espera: aún se está empezando a leer."
+BUSY_MESSAGE_MS = 4000
 LEAVE_CHECK_MS = 300  # la app sin foco tanto tiempo: el usuario se fue (no es un parpadeo)
 PLAYING_STATES = frozenset({SessionState.READING, SessionState.LOADING,
                             SessionState.WAITING_NETWORK})
@@ -67,6 +71,7 @@ class OpenFlowMixin:
         self._opening = False
         self._open_gen = 0  # cada apertura nueva deja caducas las respuestas de las anteriores
         self._play_pending = False  # un play() en vuelo: no se manda otro
+        self._jump_pending = False  # un salto del desplegable en vuelo: no se manda otro
         self._confirm_after_leer = False  # «Leer» pidió leer y la vista previa espera confirmar
         # Posición elegida (capítulo, «empezar», …) que aún no cargó: un reintento vuelve a ella.
         self._pending_start: tuple[str, Position] | None = None
@@ -253,6 +258,9 @@ class OpenFlowMixin:
             self._set_opening(False)
             doc, chapter, progress = result
             self._preview = _Preview(locator, doc, chapter)
+            # Se volvió a abrir lo que se lee: el desplegable toma ya la lista nueva (el
+            # controlador también la tomó al abrir).
+            self.chapter_picker.update_chapters(doc.doc_id, doc.chapters)
             fresh = progress is None
             self.preview.show_preview(
                 doc, chapter,
@@ -343,9 +351,12 @@ class OpenFlowMixin:
     def _jump_to_chapter(self, index: int) -> None:
         """El usuario eligió el capítulo `index` en el desplegable: lee desde su principio.
 
-        El controlador decide según la sesión (en pausa sigue en pausa; detenida, empieza a
-        leer). Con un play() o una apertura en vuelo, o si la lista era de otra lectura, no
-        se manda nada y el desplegable vuelve al capítulo que suena.
+        El controlador decide según la sesión: con lectura en marcha salta (en pausa sigue
+        en pausa); sin ella, empieza a leer ese capítulo, y entonces cuenta como un play()
+        en vuelo. Un salto en vuelo solo impide otra elección: Pausar, «Leer» y «Seguir
+        leyendo» siguen valiendo (y lo cancelan en el controlador). Mientras, el
+        desplegable muestra lo elegido y la barra de estado lo dice. Lo que no se manda
+        (otra elección o una apertura en vuelo) se explica en la barra de estado.
         """
         picker = self.chapter_picker
         doc_id = self._session_doc
@@ -353,26 +364,40 @@ class OpenFlowMixin:
             log.info("Se ignora un capítulo elegido de otra lectura")
             picker.show_current()
             return
-        if self._opening or self._play_pending:
-            busy = "se está abriendo otra dirección" if self._opening else "ya se está empezando a leer"
+        if self._jump_pending or self._opening or self._play_pending:
+            busy = BUSY_JUMPING if self._jump_pending else BUSY_STARTING
             log.info("Se ignora el capítulo %s elegido: %s", index, busy)
+            self.statusBar().showMessage(busy, BUSY_MESSAGE_MS)
             picker.show_current()
             return
-        if self._state not in PLAYING_STATES and self._state is not SessionState.PAUSED:
-            # Sin lectura en marcha: si no llega a cargar, «Leer» vuelve a este capítulo.
-            self._pending_start = (doc_id, _chapter_start(index, picker.chapters[index]))
+        ref = picker.chapters[index]
+        starts = self._state not in PLAYING_STATES and self._state is not SessionState.PAUSED
         self._clear_choice()  # una elección de «siguiente» pendiente ya no vale
+        picker.begin_pick(index)
+        message = JUMPING_TEXT.format(title=picker.itemText(index))
+        self.statusBar().showMessage(message)
 
         def done(jumped: bool) -> None:
-            self._play_pending = False
+            self._jump_pending = False
+            if starts:
+                self._play_pending = False
             if not jumped:
-                picker.show_current()
+                self._pending_start = None  # «Seguir leyendo» vuelve a lo último oído
+            picker.end_pick(jumped)
+            if self.statusBar().currentMessage() == message:
+                self.statusBar().clearMessage()
 
         def failed(exc: BaseException) -> None:
             done(False)
             self._on_error(exc)
 
-        self._play_pending = self._run(self._ctl.go_to_chapter(index), done, failed)
+        sent = self._run(self._ctl.go_to_chapter(doc_id, ref.locator, index), done, failed)
+        if not sent:
+            done(False)
+            return
+        self._jump_pending = True
+        if starts:
+            self._play_pending = True  # empieza a leer: un «Leer» seguido no manda otro play()
 
     # --- reanudación y presencia del usuario ----------------------------------------------------
 
